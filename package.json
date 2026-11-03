@@ -1,0 +1,56 @@
+{
+  "name": "10and2",
+  "type": "module",
+  "version": "0.3.0",
+  "description": "The connector for 10 & 2: lets you talk to the coding agents on your computer (T3 Code, Claude Code) from the 10 & 2 iPhone app.",
+  "keywords": [
+    "10and2",
+    "coding agents",
+    "claude code",
+    "t3 code",
+    "voice"
+  ],
+  "homepage": "https://10and2.app",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/self-deprecated/10and2.git"
+  },
+  "bugs": {
+    "url": "https://github.com/self-deprecated/10and2/issues"
+  },
+  "author": "Self-Deprecated ApS",
+  "license": "SEE LICENSE IN LICENSE",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "bin": {
+    "10and2": "bin/10and2.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "THIRD_PARTY_NOTICES"
+  ],
+  "scripts": {
+    "start": "node src/main.ts run",
+    "build": "esbuild src/main.ts --bundle --platform=node --target=node22.13 --format=esm --outfile=dist/10and2.js --external:bufferutil --external:utf-8-validate --banner:js=\"import { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);\" --legal-comments=none",
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "tsc --noEmit && node --test test/*.test.ts && npm run build && node test/smoke.mjs",
+    "prepublishOnly": "npm run check"
+  },
+  "allowScripts": {
+    "esbuild": true
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "@types/ws": "^8.18.2",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2",
+    "ws": "8.22.0"
+  }
+}
