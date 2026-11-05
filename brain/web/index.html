@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Driver</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; line-height: 1.45; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  #talk { width: 100%; padding: 28px; font-size: 22px; border-radius: 16px; border: 0; cursor: pointer; background: #2563eb; color: white; }
+  #talk.live { background: #dc2626; }
+  #talk:disabled { opacity: .6; cursor: wait; }
+  #status { margin: 10px 0 0; min-height: 1.4em; opacity: .8; }
+  #captions { margin: 16px 0; padding: 12px; border-radius: 12px; background: color-mix(in srgb, currentColor 6%, transparent); min-height: 120px; max-height: 320px; overflow-y: auto; white-space: pre-wrap; }
+  .you { opacity: .65; }
+  h2 { font-size: 15px; margin: 24px 0 8px; }
+  .card { padding: 8px 0; border-bottom: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
+  .state { font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  .row button { padding: 6px 10px; }
+  small { opacity: .7; }
+</style>
+</head>
+<body>
+<h1>Driver</h1>
+<button id="talk">Start talking</button>
+<div id="status"></div>
+<div class="row"><button id="newconv">New conversation</button><button id="refresh">Refresh briefing</button></div>
+<div id="captions"></div>
+<h2>Opener</h2><div id="opener"><small>loading…</small></div>
+<h2>Recent changes</h2><div id="proposals"></div>
+<h2>Briefing</h2><div id="cards"></div>
+<h2>Remembered</h2><div id="memory"></div>
+<script>
+const $ = (id) => document.getElementById(id);
+// Every API call goes through here: JSON (the server refuses other POSTs) plus the access code,
+// which the server asks for only when it listens beyond loopback. Opened as /?demo, every call is in demo mode.
+const demoMode = new URLSearchParams(location.search).has("demo");
+async function api(path, body) {
+  const headers = { "x-driver-access": localStorage.getItem("driverAccess") ?? "" };
+  if (demoMode) headers["x-driver-mode"] = "demo";
+  if (body !== undefined) headers["content-type"] = "application/json";
+  const res = await fetch(path, body === undefined ? { headers } : { method: "POST", headers, body: JSON.stringify(body) });
+  if (res.status === 401) {
+    const code = prompt("Driver access code");
+    if (code) { localStorage.setItem("driverAccess", code); return api(path, body); }
+  }
+  return res;
+}
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+let pc = null, mic = null, lastRole = null;
+/** "New conversation" was pressed: the next session is explicitly fresh (`mode: "new"`). */
+let fresh = false;
+const conversation = () => sessionStorage.getItem("conversation");
+
+function status(text) { $("status").textContent = text; }
+function caption(role, delta) {
+  const box = $("captions");
+  if (role !== lastRole) { box.append(document.createElement("div")); box.lastChild.className = role === "user" ? "you" : ""; box.lastChild.textContent = role === "user" ? "You: " : "Driver: "; lastRole = role; }
+  box.lastChild.textContent += delta;
+  box.scrollTop = box.scrollHeight;
+}
+
+async function start() {
+  $("talk").disabled = true;
+  status("Connecting…");
+  try {
+    mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    pc = new RTCPeerConnection();
+    pc.addTrack(mic.getAudioTracks()[0], mic);
+    const audio = new Audio();
+    audio.autoplay = true;
+    pc.ontrack = (e) => { audio.srcObject = e.streams[0]; };
+    // Must exist before the offer, or session.closed never reaches the page.
+    const dc = pc.createDataChannel("oai-events");
+    dc.onmessage = (e) => {
+      const ev = JSON.parse(e.data);
+      if (ev.type === "session.input_transcript.delta") caption("user", ev.delta);
+      else if (ev.type === "session.output_transcript.delta") caption("assistant", ev.delta);
+      else if (ev.type === "session.closed") stop(`Session ended (${ev.reason ?? "closed"}).`);
+      else if (ev.type === "error") status(`Voice error: ${ev.error?.message ?? "unknown"}`);
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc?.connectionState === "connected") { status("Listening. Say \"bye\" to finish."); $("talk").disabled = false; }
+      if (pc?.connectionState === "failed") stop("Connection lost. Tap to resume the same conversation.");
+    };
+    await pc.setLocalDescription(await pc.createOffer());
+    // No trickle ICE: the offer goes in one request, so wait for gathering (or 5 s).
+    await new Promise((resolve) => {
+      if (pc.iceGatheringState === "complete") return resolve();
+      const t = setTimeout(resolve, 5000);
+      pc.addEventListener("icegatheringstatechange", () => { if (pc.iceGatheringState === "complete") { clearTimeout(t); resolve(); } });
+    });
+    if (!/a=candidate/.test(pc.localDescription.sdp)) throw new Error("No network candidates were found for the call.");
+    // After "New conversation", ask for a fresh one: the brain then never joins a conversation with a call-back waiting.
+    const res = await api("/api/session", { sdp: pc.localDescription.sdp, conversationId: conversation(), ...(fresh ? { mode: "new" } : {}) });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+    fresh = false;
+    sessionStorage.setItem("conversation", body.conversationId);
+    await pc.setRemoteDescription({ type: "answer", sdp: body.sdp });
+    $("talk").classList.add("live");
+    $("talk").textContent = "Stop";
+  } catch (e) {
+    stop(`Couldn't start: ${e.message}`);
+  }
+}
+
+// Only the Stop button calls off waits and call-back news (`cancelWaits`); a dropped or failed call keeps them.
+function stop(message, cancelWaits = false) {
+  if (pc) { pc.close(); pc = null; api("/api/session/stop", { cancelWaits }).catch(() => {}); }
+  mic?.getTracks().forEach((t) => t.stop());
+  mic = null;
+  $("talk").classList.remove("live");
+  $("talk").textContent = "Start talking";
+  $("talk").disabled = false;
+  status(message ?? "Stopped.");
+  lastRole = null;
+}
+
+$("talk").onclick = () => (pc ? stop(undefined, true) : start());
+$("newconv").onclick = () => { fresh = true; sessionStorage.removeItem("conversation"); $("captions").textContent = ""; status("Next session starts a new conversation."); };
+$("refresh").onclick = () => (status("Checking your threads…"), api("/api/refresh", {}).then(() => (status("Briefing is up to date."), poll())));
+
+async function poll() {
+  try {
+    const s = await (await api("/api/state")).json();
+    $("opener").innerHTML = s.opener ? esc(s.opener) + ` <small>(${esc(s.updatedAt ?? "")})</small>` : "<small>Briefing not ready yet.</small>";
+    $("cards").innerHTML = s.cards.map((c) => `<div class="card"><div class="state">${esc(c.state.replace(/_/g, " "))} · ${esc(c.group)}</div><b>${esc(c.handle)}</b> — ${esc(c.summary)}${c.ask ? `<br><small>Asks: ${esc(c.ask)}</small>` : ""}</div>`).join("")
+      + `<p><small>${s.clutter.total} finished subagent threads could be settled.</small></p>`;
+    $("proposals").innerHTML = s.proposals.length ? s.proposals.map((p) => `<div class="card"><div class="state">${esc(p.state)}</div>${esc(p.readback)}${p.result ? `<br><small>${esc(p.result)}</small>` : ""}</div>`).join("") : "<small>None yet.</small>";
+    $("memory").innerHTML = s.memory.length ? s.memory.map((m) => `<div class="card">${esc(m.note)}</div>`).join("") : "<small>Nothing yet.</small>";
+  } catch {}
+}
+poll();
+setInterval(poll, 5000);
+</script>
+</body>
+</html>

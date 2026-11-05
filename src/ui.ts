@@ -70,6 +70,28 @@ export async function ask(q: string, fallback: string): Promise<string> {
   return (await question(`  ${accent("?")} ${q} ${dim(`(${fallback})`)} `)).trim() || fallback;
 }
 
+/** A secret, typed or pasted without being shown. Off a terminal, empty. */
+export function secret(q: string): Promise<string> {
+  const input = process.stdin;
+  if (!input.isTTY) return Promise.resolve("");
+  process.stdout.write(`  ${accent("?")} ${q} `);
+  input.setRawMode(true);
+  input.resume();
+  return new Promise((resolve, reject) => {
+    let s = "";
+    const done = (f: () => void) => { input.off("data", onData); input.setRawMode(false); input.pause(); say(); f(); };
+    const onData = (b: Buffer) => {
+      for (const ch of b.toString("utf8")) {
+        if (ch === "\u0003") return done(() => reject(new Cancelled()));
+        if (ch === "\r" || ch === "\n") return done(() => resolve(s.trim()));
+        if (ch === "\u007f" || ch === "\b") s = s.slice(0, -1);
+        else if (ch >= " ") s += ch;
+      }
+    };
+    input.on("data", onData);
+  });
+}
+
 /**
  * While waiting on something else: Enter calls `onEnter`, Ctrl-C calls `onCancel`. Returns a function that stops
  * listening. Does nothing off a terminal (Ctrl-C is then the usual SIGINT).
