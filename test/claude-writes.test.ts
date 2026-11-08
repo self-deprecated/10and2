@@ -220,6 +220,13 @@ test("synchronous spawn failure releases its reservation and removes private log
 });
 
 
+test("a start with no title has Claude Code name the session itself: no --name", async (t) => {
+  const h = harness(t); h.completed(); await h.adapter.start();
+  assert.equal((await h.adapter.execute({ kind: "start_work", placeId: h.adapter.places()[0]!.id, message: "Words stay on stdin", profile }, "untitled")).ok, true);
+  const args: string[] = calls(h.config)[0].args;
+  assert.ok(!args.some((a) => a.startsWith("--name")), args.join(" "));
+});
+
 test("titles are one named argv value, and option-shaped titles are refused", async (t) => {
   const h = harness(t); h.completed(); await h.adapter.start();
   const action: Extract<Action, { kind: "start_work" }> = { kind: "start_work", placeId: h.adapter.places()[0]!.id,

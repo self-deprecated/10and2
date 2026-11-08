@@ -4,7 +4,7 @@
 import { createHash } from "node:crypto";
 import type { Adapter, ReplyRef, WorkItem } from "./adapter.ts";
 import { spokenTitle, uniqueHandles } from "./handles.ts";
-import type { Card, Store } from "./store.ts";
+import type { Briefed, Card, Store } from "./store.ts";
 import { mapLimit, describe } from "./util.ts";
 
 export type ClassifyInput = {
@@ -23,9 +23,9 @@ export type OpenerWriter = (view: BriefingView, now: Date) => Promise<string>;
 
 /**
  * A card with its thread: `handle` is the thread's title as said aloud, made unique; `starred` if the user picked it;
- * `unread` while its reply is new to the user (`isNew`).
+ * `unread` while its reply is new to the user (`isNew`); `heard` once they've heard this card's news (`summaryHeard`).
  */
-export type BriefCard = Card & { handle: string; title: string; group: string; status: string; updatedAt: string; starred: boolean; unread: boolean };
+export type BriefCard = Card & { handle: string; title: string; group: string; status: string; updatedAt: string; starred: boolean; unread: boolean; heard: boolean };
 export type ClutterGroup = { parentId: string; parent: string; group: string; count: number; ids: string[]; parentIds?: Record<string, string> };
 export type BriefingView = {
   cards: BriefCard[];
@@ -61,6 +61,21 @@ export function isNew(reply: ReplyRef | null | undefined, readAt: string | undef
   if (!reply) return false;
   const at = Date.parse(reply.at);
   return !(readAt && Date.parse(readAt) >= at) && !(visitedAt && Date.parse(visitedAt) >= at);
+}
+
+/** What hearing a card's summary marks (`Store.markBriefed`): its reply, or with none yet, what it was read from. */
+export const briefedMark = (c: Pick<Card, "reply" | "contentKey">): Briefed =>
+  c.reply ? { replyAt: Date.parse(c.reply.at), contentKey: c.contentKey } : { replyAt: 0, contentKey: c.contentKey };
+
+/**
+ * The user has heard this card's news in Driver, so a briefing or rundown needn't tell it again until the thread
+ * replies: a summary of this reply or a later one (`briefed`), or the reply itself read out in full (`readAt`). Opening
+ * the thread in the system doesn't count: what the user read at their desk can still be news in the car. A thread with
+ * no reply yet: this very card's summary.
+ */
+export function summaryHeard(c: Pick<Card, "reply" | "contentKey">, briefed: Briefed | undefined, readAt: string | undefined): boolean {
+  if (!c.reply) return briefed?.contentKey === c.contentKey;
+  return (!!briefed && briefed.replyAt >= Date.parse(c.reply.at)) || !isNew(c.reply, readAt, null);
 }
 
 /** Top-level items worth briefing: not settled, not snoozed. */
@@ -280,6 +295,7 @@ export class Briefing {
     const visited = new Map((live ?? this.items).map((i) => [i.id, i.visitedAt]));
     const reads = this.deps.store.reads();
     const stars = this.deps.store.stars();
+    const briefed = this.deps.store.briefedAll();
     const raw = this.deps.store.cards().filter((c) => items.has(c.itemId) && briefable(items.get(c.itemId)!));
     const handles = this.names();
     const cards = raw
@@ -288,6 +304,7 @@ export class Briefing {
         return {
           ...c, handle: handles.get(c.itemId)!, title: i.title, group: i.group, status: i.status, updatedAt: i.updatedAt, starred: stars.has(c.itemId),
           unread: isNew(c.reply, reads.get(c.itemId), visited.get(c.itemId)),
+          heard: summaryHeard(c, briefed.get(c.itemId), reads.get(c.itemId)),
         };
       })
       .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));

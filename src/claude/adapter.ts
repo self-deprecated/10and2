@@ -296,7 +296,7 @@ export class ClaudeAdapter implements Adapter {
     if (!this.opts.policy.claude) return "Claude sessions are disabled on this machine.";
     if (!allows(this.opts.policy, action.kind)) return "This machine's local policy doesn't allow that action.";
     if (action.kind === "start_work") {
-      if (action.title.trimStart().startsWith("-")) return "A session title must not start with a dash.";
+      if (action.title?.trimStart().startsWith("-")) return "A session title must not start with a dash.";
       if (!this.roots.has(action.placeId)) return "That project isn't visible to Driver.";
       if (!withinCeiling(this.opts.policy, action.profile)) return "That launch profile exceeds this machine's permission ceiling.";
       if (action.profile.workspace === "worktree" && !this.worktrees) return "Driver hasn't verified headless Claude worktrees with this Claude version. Choose the project checkout profile.";
@@ -370,7 +370,8 @@ export class ClaudeAdapter implements Adapter {
     const mode = action.kind === "start_work" ? action.profile.interactionMode === "plan" ? "plan" : permissionMode(action.profile.runtimeMode) : resumeMode(this.row(id).transcript.permissionMode, this.opts.policy.maxRuntimeMode)!;
     const args = ["-p", action.kind === "start_work" ? "--session-id" : "--resume", id, "--permission-mode", mode,
       "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--replay-user-messages"];
-    if (action.kind === "start_work") args.push(`--name=${action.title}`);
+    // With no title, Claude Code names the session itself.
+    if (action.kind === "start_work" && action.title) args.push(`--name=${action.title}`);
     const worktreeName = action.kind === "start_work" && action.profile.workspace === "worktree" ? `driver-${id.slice(0, 13)}` : null;
     if (worktreeName) args.push("--worktree", worktreeName);
     // Driver's own headless records follow in this transcript; the session stays listed as Driver's whatever they say.

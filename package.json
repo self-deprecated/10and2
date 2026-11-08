@@ -1,7 +1,7 @@
 {
   "name": "10and2",
   "type": "module",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "The connector for 10 & 2: lets you talk to the coding agents on your computer (T3 Code, Claude Code) from the 10 & 2 iPhone app.",
   "keywords": [
     "10and2",

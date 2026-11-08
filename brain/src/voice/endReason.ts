@@ -1,7 +1,9 @@
 /** Session endings stay typed until they reach a log, the ledger or a public result. */
 export type EndReason =
   | { kind: "goodbye" }
-  | { kind: "paused" }
+  /** Hold: hung up with the phone listening for the wake word. `handOff`: the `hold` tool, which says nothing more, so the
+   * brain hangs up as soon as it has answered (a pause the phrase check heard leaves a moment to talk over it). */
+  | { kind: "paused"; handOff?: true }
   | { kind: "waiting"; handle: string }
   /** Hung up so the phone can read a reply out in full (`read_aloud`). */
   | { kind: "reading"; handle: string }
@@ -32,7 +34,8 @@ export function reasonText(reason: EndReason): string {
     case "paused": return "paused";
     case "waiting": return `waiting for ${reason.handle}`;
     case "reading": return `reading ${reason.handle} aloud`;
-    case "dictating": return `dictating a reply to ${reason.handle}`;
+    // A new thread's prompt is "your new thread (in <project>)" (drafts.ts `newThreadName`).
+    case "dictating": return reason.handle.startsWith("your new thread") ? `dictating ${reason.handle.replace(/^your /, "a ")}` : `dictating a reply to ${reason.handle}`;
     case "idle": return "idle";
     case "max_duration": return "max duration";
     case "rollover": return "rolled over to a new session";
@@ -48,6 +51,16 @@ export function reasonText(reason: EndReason): string {
     case "out_of_credits": return "out of credits";
     case "demo_over": return "the demo's time was up";
   }
+}
+
+/**
+ * A hand-off: the call goes on as a mode on the phone (reading a reply, recording one), with nothing more said. The brain
+ * hangs up the moment its tool has answered, and tells a phone in the call at once (`GET /api/wait` with `handoff=1`),
+ * which closes the call and starts the mode itself (docs/launch/voice-speed.md). A new mode handed to the phone (Hold,
+ * say) is one more kind here and one more state in that answer.
+ */
+export function handsOff(reason: EndReason): boolean {
+  return reason.kind === "reading" || reason.kind === "dictating" || (reason.kind === "paused" && reason.handOff === true);
 }
 
 /** A pause, or starred threads working when the conversation ends, can arrange a call-back. */

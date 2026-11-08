@@ -10,6 +10,7 @@ import type { LaunchProfile, ReplyRef } from "./adapter.ts";
 import type { Segment } from "./reading.ts";
 import type { Wait } from "./waits.ts";
 import { reasonText, type EndReason } from "./voice/endReason.ts";
+import type { CostRow } from "./spend.ts";
 
 export type Card = {
   itemId: string;
@@ -62,6 +63,12 @@ export type Proposal = {
   result: string | null;
 };
 
+/**
+ * Which of a thread's summaries the user has heard: its reply that finished at `replyAt` (ms; 0 for none), or for a
+ * thread with no reply yet, the card read from `contentKey`. A later reply makes it news again.
+ */
+export type Briefed = { replyAt: number; contentKey: string | null };
+
 /** What the user has heard from a thread: the reply from the run that finished at `runAt`, and question `question`. */
 export type Seen = { runAt: number; question: string | null };
 
@@ -77,7 +84,9 @@ export type Handoff =
   | { handle: string; reply: { itemId: string; messageId: string } }
   | { handle: string; dictate: { itemId: string } }
   /** The session reached its cap: the phone carries the call on in a new one, at once. */
-  | { handle: string; rollover: true };
+  | { handle: string; rollover: true }
+  /** Hold: the phone listens for the wake word to come back, calling back if a wait started after it is ready. */
+  | { handle: string; hold: true };
 
 /**
  * A reply kept for later in a call (`keep`), unsent: what the phone's Not sent lists, until it's sent or discarded.
@@ -109,6 +118,7 @@ CREATE TABLE IF NOT EXISTS memory (
 CREATE TABLE IF NOT EXISTS stars (item_id TEXT PRIMARY KEY, at INTEGER NOT NULL, seen_run_at INTEGER NOT NULL, seen_question TEXT);
 CREATE TABLE IF NOT EXISTS heard (
   conversation_id TEXT NOT NULL, item_id TEXT NOT NULL, run_at INTEGER NOT NULL, question TEXT, at INTEGER NOT NULL, PRIMARY KEY (conversation_id, item_id));
+CREATE TABLE IF NOT EXISTS briefed (item_id TEXT PRIMARY KEY, reply_at INTEGER NOT NULL, content_key TEXT, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS aliases (conversation_id TEXT NOT NULL, name TEXT NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY (conversation_id, name));
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER,
@@ -125,7 +135,15 @@ CREATE TABLE IF NOT EXISTS readings (
 CREATE TABLE IF NOT EXISTS kept (
   id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, thread_name TEXT NOT NULL, project TEXT NOT NULL, text TEXT NOT NULL, note TEXT,
   draft_id TEXT UNIQUE, conversation_id TEXT NOT NULL, kept_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS costs (
+  ref TEXT PRIMARY KEY, day TEXT NOT NULL, op TEXT NOT NULL, model TEXT NOT NULL, tier TEXT NOT NULL, own INTEGER NOT NULL,
+  requests INTEGER NOT NULL, input INTEGER NOT NULL, cached INTEGER NOT NULL, cache_write INTEGER NOT NULL, output INTEGER NOT NULL,
+  reasoning INTEGER NOT NULL, seconds REAL NOT NULL, chars INTEGER NOT NULL, retries INTEGER NOT NULL, usd REAL NOT NULL, at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS costs_by_day ON costs (day);
 `;
+
+/** One day's spend on one operation, on Driver's key or the account's own (`own`). */
+export type CostDay = { day: string; op: string; own: boolean; usd: number; requests: number; seconds: number };
 
 export class Store {
   readonly db: SqlDb;
@@ -199,6 +217,38 @@ export class Store {
   }
   set(key: string, value: string) {
     this.db.prepare("INSERT INTO kv VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(key, value);
+  }
+
+  // --- what model calls cost (spend.ts) ---
+  /**
+   * Adds a call's usage to row `ref`. `raise`: the row holds a cumulative count (a voice session's billed seconds), so
+   * it's raised to the new one when that's higher instead. The row keeps the day and key it was first written with.
+   */
+  addCost(ref: string, r: CostRow, raise: boolean, now = Date.now()) {
+    const vals = [r.input, r.cached, r.cacheWrite, r.output, r.reasoning, r.seconds, r.chars, r.retries, r.usd];
+    this.db.prepare(
+      `INSERT INTO costs (ref, day, op, model, tier, own, requests, input, cached, cache_write, output, reasoning, seconds, chars, retries, usd, at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(ref) DO UPDATE SET ${raise
+         ? "seconds = MAX(seconds, excluded.seconds), usd = MAX(usd, excluded.usd), at = excluded.at"
+         : `requests = requests + 1, input = input + excluded.input, cached = cached + excluded.cached, cache_write = cache_write + excluded.cache_write,
+            output = output + excluded.output, reasoning = reasoning + excluded.reasoning, seconds = seconds + excluded.seconds,
+            chars = chars + excluded.chars, retries = retries + excluded.retries, usd = usd + excluded.usd, at = excluded.at`}`,
+    ).run(ref, r.day, r.op, r.model, r.tier, r.own ? 1 : 0, ...vals, now);
+  }
+  /** Dollars spent on Driver's key on `day` on any of `ops`. */
+  costOn(day: string, ops: readonly string[]): number {
+    if (!ops.length) return 0;
+    return Number((this.db.prepare(`SELECT COALESCE(SUM(usd), 0) AS usd FROM costs WHERE day = ? AND own = 0 AND op IN (${ops.map(() => "?").join(", ")})`).get(day, ...ops) as any).usd);
+  }
+  /** Spend per day, operation and key since `from` (a UTC day). */
+  costDays(from: string): CostDay[] {
+    return (this.db.prepare("SELECT day, op, own, SUM(usd) AS usd, SUM(requests) AS requests, SUM(seconds) AS seconds FROM costs WHERE day >= ? GROUP BY day, op, own ORDER BY day").all(from) as any[])
+      .map((r) => ({ day: String(r.day), op: String(r.op), own: Number(r.own) === 1, usd: Number(r.usd), requests: Number(r.requests), seconds: Number(r.seconds) }));
+  }
+  /** Rows older than `before` (a UTC day) go. */
+  pruneCosts(before: string) {
+    this.db.prepare("DELETE FROM costs WHERE day < ?").run(before);
   }
 
   // --- conversations ---
@@ -435,6 +485,35 @@ export class Store {
     return r ? { itemId: r.item_id, at: r.at } : null;
   }
 
+  // --- briefed: which summary of each thread the user has heard, in any call or the phone's briefing ---
+  /**
+   * The user heard a summary of `itemId` as of `b`. Only moves forward: an older reply's summary heard after a newer
+   * one's (a list fetched before the newer reply came) changes nothing.
+   */
+  markBriefed(itemId: string, b: Briefed, now = Date.now()) {
+    this.db
+      .prepare(
+        `INSERT INTO briefed VALUES (?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET
+         reply_at = MAX(reply_at, excluded.reply_at), content_key = excluded.content_key, at = excluded.at
+         WHERE excluded.reply_at >= briefed.reply_at`,
+      )
+      .run(itemId, b.replyAt, b.contentKey, now);
+  }
+  /**
+   * The latest summary of each thread the user has heard: as marked here, or as any conversation told the thread's news
+   * (`heard`, by when the run it told finished), whichever is later.
+   */
+  briefedAll(): Map<string, Briefed> {
+    const out = new Map<string, Briefed>();
+    for (const r of this.db.prepare("SELECT item_id, reply_at, content_key FROM briefed").all() as any[]) out.set(r.item_id, { replyAt: r.reply_at, contentKey: r.content_key });
+    for (const r of this.db.prepare("SELECT item_id, MAX(run_at) AS run_at FROM heard GROUP BY item_id").all() as any[]) {
+      const b = out.get(r.item_id);
+      if (!b) out.set(r.item_id, { replyAt: r.run_at, contentKey: null });
+      else if (r.run_at > b.replyAt) b.replyAt = r.run_at;
+    }
+    return out;
+  }
+
   // --- reads: the latest reply of each item the user has heard read out in full ---
   /**
    * The user heard `reply` in full. Only ever moves forward: an older reply heard again changes nothing. A newer one,
@@ -482,6 +561,10 @@ export class Store {
   putReading(id: string, itemId: string, messageId: string, style: string, segments: Segment[], now = Date.now()) {
     this.db.prepare("INSERT OR IGNORE INTO readings VALUES (?, ?, ?, ?, ?, ?)").run(id, itemId, messageId, style, JSON.stringify(segments), now);
   }
+  /** What a reading was made with (`style`, as `putReading` was given it), or null for none kept. */
+  readingStyle(id: string): string | null {
+    return (this.db.prepare("SELECT style FROM readings WHERE id = ?").get(id) as any)?.style ?? null;
+  }
   readingSegments(id: string): Segment[] | null {
     const r = this.db.prepare("SELECT segments FROM readings WHERE id = ?").get(id) as any;
     // Readings kept before segments had paragraphs were plain strings: each one its own paragraph.
@@ -498,6 +581,13 @@ export class Store {
    */
   saveHandoff(conversationId: string, handoff: Handoff, now = Date.now()) {
     this.db.prepare("INSERT INTO handoffs VALUES (?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET handoff = excluded.handoff, at = excluded.at").run(conversationId, JSON.stringify(handoff), now);
+    for (const listener of [...this.handoffListeners]) listener(conversationId);
+  }
+  private handoffListeners = new Set<(conversationId: string) => void>();
+  /** Called with the conversation each time one hands off, so a phone in the call hears at once; returns the unsubscribe. */
+  onHandoff(listener: (conversationId: string) => void): () => void {
+    this.handoffListeners.add(listener);
+    return () => this.handoffListeners.delete(listener);
   }
   handoff(conversationId: string, now = Date.now()): Handoff | null {
     return this.handoffAt(conversationId, now)?.handoff ?? null;
@@ -506,6 +596,17 @@ export class Store {
   handoffAt(conversationId: string, now = Date.now()): { handoff: Handoff; at: number } | null {
     const r = this.db.prepare("SELECT handoff, at FROM handoffs WHERE conversation_id = ?").get(conversationId) as any;
     return r && now - r.at <= 3600_000 ? { handoff: JSON.parse(r.handoff), at: r.at } : null;
+  }
+  /**
+   * A phone on hold asked again (`onhold=1`): the conversation's hand-off becomes a hold as of now, so a reading or
+   * dictation it was put on hold from isn't handed over again, and the hold lasts while the phone asks rather than the
+   * hour a hand-off keeps, whatever its age (an hour out of signal, a reading paused for longer). Only a hand-off still
+   * there: without one, the brain has let go. No call is told: there's none while on hold.
+   */
+  keepHold(conversationId: string, now = Date.now()) {
+    const r = this.db.prepare("SELECT handoff FROM handoffs WHERE conversation_id = ?").get(conversationId) as any;
+    if (!r || "rollover" in JSON.parse(r.handoff)) return;
+    this.db.prepare("UPDATE handoffs SET handoff = ?, at = ? WHERE conversation_id = ?").run(JSON.stringify({ handle: "", hold: true }), now, conversationId);
   }
   /** One conversation's hand-off, or (without one) every conversation's. */
   dropHandoff(conversationId?: string) {

@@ -4,7 +4,7 @@
 // only outside call is `write`, given by whoever builds it, for replies the script doesn't have.
 //
 // Runtime-neutral (no Node imports, time and timers through a `Clock`), so it runs on Lattice and in a Durable Object.
-import type { Action, Adapter, PastReply, Place, Receipt, Report, WorkItem } from "../adapter.ts";
+import { titleFrom, type Action, type Adapter, type PastReply, type Place, type Receipt, type Report, type WorkItem } from "../adapter.ts";
 import type { Clock, Timer } from "../util.ts";
 import { DEMO_MACHINE, FOLLOW_UP_SECONDS, NEW_WORK_SECONDS, THREADS, type DemoCard, type DemoThread, type Scripted } from "./workspace.ts";
 
@@ -144,13 +144,13 @@ export class DemoAdapter implements Adapter {
       const place = this.places().find((p) => p.id === action.placeId);
       const id = `demo-new-${++this.seq}`;
       const item: WorkItem = {
-        id, title: action.title, group: place?.name ?? action.placeId.replace(/^demo-place-/, ""), status: "running", updatedAt: now, settled: false, snoozedUntil: null,
+        id, title: action.title ?? titleFrom(action.message), group: place?.name ?? action.placeId.replace(/^demo-place-/, ""), status: "running", updatedAt: now, settled: false, snoozedUntil: null,
         parentId: null, pendingQuestion: false, lastRunAt: null, questionId: null, visitedAt: null, wroteAt: now,
       };
       const thread: Thread = { item, replies: [], question: null, next: [], run: null, queue: [], archived: false };
       this.threads.set(id, thread);
       this.begin(thread, action.message, this.planned(thread, action.message, true));
-      this.log(`demo: started ${action.title} in ${item.group}`);
+      this.log(`demo: started ${item.title} in ${item.group}`);
       this.emit([id]);
       return { ok: true, itemId: id };
     }

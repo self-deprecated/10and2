@@ -85,9 +85,11 @@ export function receiptOf(name: string, args: any, result: Record<string, unknow
     case "remember":
       return { kind: "change", state: "executed", text: "Noted for your next drives", threads: [] };
     case "dictate":
-      return result.dictating ? { kind: "call", text: typeof args?.project === "string" && args.project.trim() ? "Hung up to take your prompt" : "Hung up to take your reply", threads } : null;
+      return result.dictating ? { kind: "call", text: typeof args?.handle === "string" && args.handle.trim() && !(typeof args?.project === "string" && args.project.trim()) ? "Hung up to take your reply" : "Hung up to take your prompt", threads } : null;
     case "end_session":
       return result.ending ? { kind: "call", text: "Ended the call", threads: [] } : null;
+    case "hold":
+      return result.holding ? { kind: "call", text: "Put the call on hold", threads: [] } : null;
   }
   return null;
 }
@@ -96,7 +98,7 @@ export function receiptOf(name: string, args: any, result: Record<string, unknow
 export function glance(p: Proposal): string {
   const quote = p.fields.message ? `: “${cut(p.fields.message.replace(/\s+/g, " ").trim(), 80)}”` : "";
   if (p.action === "follow_up") return `Send your reply to ${p.targets[0]?.handle ?? "the thread"}${quote}`;
-  if (p.action === "start_work") return `Start ${p.fields.title} in ${p.fields.place}${quote}`;
+  if (p.action === "start_work") return p.fields.title ? `Start ${p.fields.title} in ${p.fields.place}${quote}` : `Start a new thread in ${p.fields.place}${quote}`;
   return p.readback.replace(/\.$/, "");
 }
 
@@ -255,7 +257,7 @@ export class CallView {
         const state = stateOf(p, now);
         const done = p.state === "executed" || p.state === "partial";
         for (const t of p.targets) if (!this.known.has(t.itemId)) this.known.set(t.itemId, { name: t.handle, project: t.group ?? "" });
-        if (p.fields.itemId && !this.known.has(p.fields.itemId)) this.known.set(p.fields.itemId, { name: p.fields.title ?? "", project: p.fields.place ?? "" });
+        if (p.fields.itemId && !this.known.has(p.fields.itemId)) this.known.set(p.fields.itemId, { name: p.fields.title ?? "New thread", project: p.fields.place ?? "" });
         // A reply kept for later: nothing was sent, but the thread is dealt with for now.
         if (p.state === "cancelled" && p.result === KEPT) {
           return { id: p.id, at: p.createdAt, kind: "change", text: `Kept your reply to ${p.targets[0]?.handle ?? "the thread"}`, state: "kept", threads: threadsOf(p), done: { at: p.createdAt, outcome: "Reply kept", threads: threadsOf(p) } };

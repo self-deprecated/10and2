@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import { Readable } from "node:stream";
 import type { Files } from "./files.ts";
 import { dirname, join } from "node:path";
-import { randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { attachConnectors, type ConnectorMachine } from "./connectors.ts";
 import type { Config } from "./config.ts";
 import { defaults, MAX_MINUTES_CAP, type Settings } from "./settings.ts";
@@ -16,9 +16,11 @@ import { TAP, type Proposal, type Seen, type Store } from "./store.ts";
 import { markRead, newReplies, syncVisits } from "./reads.ts";
 import { WatchedReplies } from "./updates.ts";
 import { masked, pastReplies, prepare, prepareReply, type ReadingStyle } from "./reading.ts";
-import { prepareBriefing, type BriefingWriter } from "./briefing-reading.ts";
+import { briefingHeard, prepareBriefing, type BriefingWriter } from "./briefing-reading.ts";
 import { CONVERSATION_VOICES, READING_VOICES } from "./voice/voices.ts";
+import type { Speech } from "./voice/speech.ts";
 import { holdAfter, namedItems, recordNames, setStar, type ToolDeps, type Watched } from "./voice/tools.ts";
+import { wakeWordOf } from "./voice/wakeWord.ts";
 import { attachSession, createWebRtcSession, type LiveConn, type OpenSocket } from "./voice/live.ts";
 import { ROLL_LATE } from "./voice/endPolicy.ts";
 import type { Hangups } from "./voice/hangups.ts";
@@ -29,9 +31,11 @@ import { CallView, type CallRecord } from "./voice/callview.ts";
 import { describe, spokenHost } from "./util.ts";
 import type { ConsentHolder, Props } from "./analytics.ts";
 import { recentDrives, summarize, summaryText } from "./drives.ts";
-import { assemble, DRAFT_MAX, draftStateOf, parseDraft, newThreadTarget, parseNewThread, tappedReply, tappedWords, wordCount, type Draft, type NewThread } from "./drafts.ts";
+import { assemble, dictatedParts, DRAFT_MAX, draftStateOf, isNewThread, mentionedPlaces, newThreadName, parseDraft, parseNewThread, tappedReply, tappedWords, wordCount, type Draft, type NewThread } from "./drafts.ts";
 import { confirmOf, parseUntil, READBACK_ALL, tapVia, trackChange, type ConfirmLevels, type KeepReplies, type TapAction } from "./proposals.ts";
 import { SHOWN, timeline, timelineQuery } from "./timeline.ts";
+import { merge, ownOf, parseOwn, STORE_KEY as VOCABULARY_KEY } from "./vocabulary.ts";
+import type { RecordSpend } from "./spend.ts";
 
 /** A session request that can't go ahead, for a reason the phone shows the user. */
 class Refused extends Error {}
@@ -71,18 +75,26 @@ export type ServerDeps = ToolDeps & {
   /** A demo world (demo/world.ts): the machine its threads are on, as the phone shows it. */
   demo?: { machine: string };
   /**
-   * The cloud's credit meter (contracts §4): each session's cumulative billed seconds, debited once each under the
-   * allowance in the call's settings; `out` ends the call with a goodbye. Lattice and demo worlds have none.
+   * The cloud's minutes meter (contracts §4): each session's cumulative billed seconds, debited once each under the
+   * allowance and rates in the call's settings, faster in fast mode (`fast`: the backend in the priority tier); `out`
+   * ends the call with a goodbye. Lattice and demo worlds have none.
    */
-  meter?: { voice(sessionId: string, seconds: number, settings: Settings): { out: boolean } | Promise<{ out: boolean }> };
+  meter?: { voice(sessionId: string, seconds: number, settings: Settings, fast: boolean): { out: boolean } | Promise<{ out: boolean }> };
   /** A hard cap on every session (the cloud's anonymous demo drive): Driver says goodbye before it and the call ends at it. */
   capMs?: number;
+  /** Records what each session costs (spend.ts): its billed seconds and its backend's tokens, in the account's store. */
+  spent?: RecordSpend;
   /** 10 & 2 Ops' registry of calls (calls.ts): the cloud's; Lattice has none. */
   calls?: Calls;
   /** The settings anything starting now goes by: the cloud's, from Ops (docs/launch/ops-app.md §4.3); else git's. */
   settings?: () => Settings;
   /** Writes the spoken briefing's script (`POST /api/briefing`); without it, or when it fails, it's put together from the cards. */
   writeBriefing?: BriefingWriter;
+  /**
+   * Each reading voice's sample (`GET /api/voices/sample`), free to the user: the cloud's is on Driver's key, kept once
+   * for every account. Without it, `speech` makes them (Lattice: its own key, its own cache).
+   */
+  samples?: Pick<Speech, "audio">;
 };
 
 /** Makes a fresh demo world: each demo starts from the same workspace. */
@@ -408,6 +420,12 @@ function api(cfg: Config, deps: ServerDeps): Api {
    * back. A reply heard to its end counts as heard in this conversation, once the session exists. `base` is the opening
    * the conversation would otherwise get: its call-back news is told too.
    */
+  /** `heldSeconds`: the phone was on hold that long before coming back (up to a day). */
+  const heldOf = (body: any): { held?: number } => {
+    const s = Math.floor(Number(body.heldSeconds));
+    return Number.isFinite(s) && s >= 0 && body.heldSeconds !== undefined && body.heldSeconds !== "" ? { held: Math.min(s, 86_400) } : {};
+  };
+
   async function readingOpening(conversationId: string, body: any, base: Opening): Promise<{ open: Opening; heard: () => void }> {
     // A hand-off holds a few readings; more is a phone gone wrong, and each costs T3 a projection.
     const ids = String(body.readingIds ?? "").split(",").map((s) => s.trim()).filter((id) => /^[0-9a-f]{24}$/.test(id)).slice(0, 20);
@@ -430,7 +448,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
       ? { handle: names.get(body.keptItemId) ?? "a thread", parts: Math.min(keptParts, 99) }
       : undefined;
     return {
-      open: { kind: "reading", read, said: typeof body.said === "string" ? body.said.slice(0, 500) : "", news: base.kind === "callback" ? base.replies : [], kept },
+      open: { kind: "reading", read, said: typeof body.said === "string" ? body.said.slice(0, 500) : "", news: base.kind === "callback" ? base.replies : [], kept, ...heldOf(body) },
       heard: () => marks.forEach((m) => m()),
     };
   }
@@ -438,8 +456,8 @@ function api(cfg: Config, deps: ServerDeps): Api {
   /**
    * A dictated reply, put together and proposed in conversation `conversationId`, for Driver to ask the user to send, or
    * (`keep`, the user's setting) to ask whether to send it now or keep it for later, or kept for later at once. A new
-   * thread's prompt is always asked about: there's no thread to keep it for. `reading` is what the phone read before it,
-   * if anything. Refused (409) when it can't be sent: already sent, its thread gone, or too long.
+   * thread's prompt is `newThreadOpening`'s. `reading` is what the phone read before it, if anything. Refused (409) when
+   * it can't be sent: already sent, its thread gone, or too long.
    */
   async function dictatedOpening(conversationId: string, draft: Draft, reading: Extract<Opening, { kind: "reading" }>, keep: KeepReplies, confirm: ConfirmLevels): Promise<Opening> {
     const message = assemble(draft, (readingId) => {
@@ -448,22 +466,48 @@ function api(cfg: Config, deps: ServerDeps): Api {
       return r && segments ? { itemId: r.itemId, segments } : null;
     });
     if (message.length > DRAFT_MAX + 2000) throw new Refused("That reply is too long to send in one go.");
-    // A new thread's prompt carries where to start it in its target; it's checked again as it's proposed.
     const start = parseNewThread(draft.itemId);
+    if (isNewThread(draft.itemId)) {
+      if (!start) throw new Refused("That prompt couldn't be read.");
+      return newThreadOpening(conversationId, draft, message, start, reading);
+    }
     const size = { draftId: draft.id, message, words: wordCount(draft), parts: draft.parts.length };
-    const mode = start ? "send" : keep;
-    const made = start ? await deps.proposals.proposeDraftStart(conversationId, { ...size, ...start }, confirm.start)
-      : mode === "keep" ? deps.proposals.keepDraft(conversationId, { ...size, itemId: draft.itemId })
+    const made = keep === "keep" ? deps.proposals.keepDraft(conversationId, { ...size, itemId: draft.itemId })
       : await deps.proposals.proposeDraft(conversationId, { ...size, itemId: draft.itemId }, confirm.reply);
     if ("error" in made) throw new Refused(made.error);
     const { proposal } = made;
     // The same draft kept before, back from the phone to be sent: it's this proposal now, and no longer kept.
-    const old = mode !== "keep" ? deps.store.keptByDraft(draft.id) : null;
+    const old = keep !== "keep" ? deps.store.keptByDraft(draft.id) : null;
     if (old) deps.store.dropKept(old.id);
-    const handle = start ? proposal.fields.title! : proposal.targets[0].handle;
-    deps.log(`voice ${conversationId}: dictated ${start ? "prompt for a new thread" : "reply to"} ${handle}, ${draft.id}, is ${proposal.id}${mode === "keep" ? ", kept for later" : ""}`);
-    const after = mode === "keep" ? { keep: "kept" as const } : mode === "ask" ? { keep: "ask" as const } : {};
-    return { kind: "draft", draft: { handle, proposalId: proposal.id, readback: proposal.readback, ...(start ? { newThread: true } : {}), ...after }, read: reading.read, news: reading.news };
+    const handle = proposal.targets[0].handle;
+    deps.log(`voice ${conversationId}: dictated reply to ${handle}, ${draft.id}, is ${proposal.id}${keep === "keep" ? ", kept for later" : ""}`);
+    const after = keep === "keep" ? { keep: "kept" as const } : keep === "ask" ? { keep: "ask" as const } : {};
+    return { kind: "draft", draft: { handle, proposalId: proposal.id, readback: proposal.readback, ...after }, read: reading.read, news: reading.news };
+  }
+
+  /**
+   * A new thread's opening prompt, dictated and brought back to the call (Dictate ends in Talk): kept for later at once,
+   * so nothing is lost whatever happens in the call (it's in Not sent), and Driver asks whether to start it or keep it,
+   * and which project only if it doesn't know: the one named before dictating, or else one named in it, to confirm. The
+   * phone drops its own copy once the call has it. `send_kept` starts it.
+   */
+  function newThreadOpening(conversationId: string, draft: Draft, message: string, start: NewThread, reading: Extract<Opening, { kind: "reading" }>): Opening {
+    if (draftStateOf(deps.store, draft.id).state === "sent") throw new Refused("That prompt has already been sent.");
+    const places = deps.adapter.places?.() ?? [];
+    const place = places.find((p) => p.id === start.placeId) ?? null;
+    const { note, text } = dictatedParts(message);
+    const kept = deps.store.keepReply({
+      id: `K-${randomUUID().slice(0, 8)}`, threadId: draft.itemId, threadName: place?.name ?? "", project: place?.name ?? "", text, note,
+      draftId: draft.id, conversationId, keptAt: Date.now(),
+    });
+    const suggested = place ? [] : mentionedPlaces(text, places);
+    deps.log(`voice ${conversationId}: dictated prompt for a new thread${place ? ` in ${place.name}` : ""}, ${draft.id}, kept as ${kept.id}${suggested.length ? `; it mentions ${suggested.join(", ")}` : ""}`);
+    return {
+      kind: "draft",
+      draft: { handle: newThreadName(place?.name), proposalId: null, readback: "", newThread: { keptId: kept.id, words: wordCount(draft), place: place?.name ?? null, suggested } },
+      read: reading.read,
+      news: reading.news,
+    };
   }
 
   /**
@@ -471,7 +515,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
    * `memoryDays` 0 is memory off; otherwise notes older than that are wiped and the rest recalled. `settings`: the
    * snapshot the call started with (none in a session made before it was kept: the settings current then).
    */
-  type Made = { memoryDays: number; voice: string; readingStyle?: ReadingStyle; readingVoice?: string; fast: boolean; phoneBuild: string | null; settings?: Settings; keepReplies?: KeepReplies; confirm?: ConfirmLevels };
+  type Made = { memoryDays: number; voice: string; readingStyle?: ReadingStyle; readingVoice?: string; fast: boolean; phoneBuild: string | null; settings?: Settings; keepReplies?: KeepReplies; confirm?: ConfirmLevels; wakeWord?: string; promptsBack?: boolean };
   const settingsOf = (made: Made) => made.settings ?? current();
 
   /**
@@ -509,11 +553,11 @@ function api(cfg: Config, deps: ServerDeps): Api {
   }
 
   /** `voice`: the phone's choice, or null for the settings' default. */
-  async function startSession(sdp: string, conversationId: string, open: Opening, memoryDays: number, accepted: number, voice: string | null, created?: () => void, news = false, readingStyle?: ReadingStyle, readingVoice?: string, fast = false, phoneBuild: string | null = null, keepReplies: KeepReplies = "send", confirm: ConfirmLevels = READBACK_ALL) {
+  async function startSession(sdp: string, conversationId: string, open: Opening, memoryDays: number, accepted: number, voice: string | null, created?: () => void, news = false, readingStyle?: ReadingStyle, readingVoice?: string, fast = false, phoneBuild: string | null = null, keepReplies: KeepReplies = "send", confirm: ConfirmLevels = READBACK_ALL, wakeWord?: string, promptsBack = false) {
     // 7 November: a call started again after hanging up lost its agenda and receipts on the phone.
     const view = viewFor(conversationId, open.kind !== "new");
     // A dictated reply kept for later as the call opened is closed already: its receipt is still this call's.
-    if (open.kind === "draft") view.adopt(open.draft.proposalId);
+    if (open.kind === "draft" && open.draft.proposalId) view.adopt(open.draft.proposalId);
     starting = view;
     try {
       active?.session.close({ kind: "replaced" });
@@ -524,7 +568,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
       recordNames(deps, conversationId);
       // One snapshot of the settings for the whole call, taken in line with other starts.
       const snapshot = current();
-      const settings: Made = { memoryDays, voice: voice ?? snapshot.voice, readingStyle, readingVoice, fast, phoneBuild, settings: snapshot, keepReplies, confirm };
+      const settings: Made = { memoryDays, voice: voice ?? snapshot.voice, readingStyle, readingVoice, fast, phoneBuild, settings: snapshot, keepReplies, confirm, wakeWord, promptsBack };
       const config = buildSessionConfig(sessionOptions(settings), deps, conversationId, new Date(), open);
       const createStart = Date.now();
       const { sessionId, answerSdp, conn: live } = await (deps.createSession ?? createWebRtcSession)(cfg.apiKey, config, sdp, deps.log, {
@@ -561,7 +605,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
 
   const sessionOptions = (s: Made) => {
     const { liveModel, backendModel, prompts, speakFirstNew } = settingsOf(s);
-    return { liveModel, backendModel, prompts, speakFirstNew, voice: s.voice, transport: "webrtc" as const, captions: true, memoryDays: s.memoryDays, fast: s.fast, keepReplies: s.keepReplies, confirm: s.confirm };
+    return { liveModel, backendModel, prompts, speakFirstNew, voice: s.voice, transport: "webrtc" as const, captions: true, memoryDays: s.memoryDays, fast: s.fast, keepReplies: s.keepReplies, confirm: s.confirm, wakeWord: s.wakeWord };
   };
   /** Usage analytics for a session (contracts §5), with its ids on every event. */
   const trackOf = (sessionId: string, conversationId: string) => (event: string, props: Props = {}) =>
@@ -596,6 +640,9 @@ function api(cfg: Config, deps: ServerDeps): Api {
             if (watched.length) carried.set(conversationId, watched);
             return deps.store.saveHandoff(conversationId, { handle: "", rollover: true });
           }
+          // A hold (the tool saved it already; a pause the phrase check heard, here): the phone holds whether or not a
+          // thread is watched for a call-back, which `holdAfter` arranges after it.
+          if (reason.kind === "paused" && !deps.store.handoff(conversationId)) deps.store.saveHandoff(conversationId, { handle: "", hold: true });
           return holdAfter(deps, conversationId, reason, watched);
         },
         news: opts.news ? newsFor(conversationId) : [],
@@ -608,6 +655,8 @@ function api(cfg: Config, deps: ServerDeps): Api {
         fast,
         keepReplies: settings.keepReplies,
         confirm: settings.confirm,
+        wakeWord: settings.wakeWord,
+        promptsBack: settings.promptsBack,
         backendInstructions,
         said: open.kind === "reading" ? open.said : undefined,
         // The same reads as the phone's cue (`/api/updates`), shared: told during the call as soon as they're seen.
@@ -617,7 +666,8 @@ function api(cfg: Config, deps: ServerDeps): Api {
         track: trackOf(sessionId, conversationId),
         opening: open.kind,
         recordingRef: recording ? (deps.recordingRef?.(recordingId) ?? `lattice:sessions/${recordingId}.jsonl`) : undefined,
-        usage: deps.meter ? (seconds) => deps.meter!.voice(sessionId, seconds, snapshot) : undefined,
+        usage: deps.meter ? (seconds) => deps.meter!.voice(sessionId, seconds, snapshot, fast) : undefined,
+        liveModel: snapshot.liveModel,
         view,
       });
     } catch (e) {
@@ -832,6 +882,8 @@ function api(cfg: Config, deps: ServerDeps): Api {
     const open = new Map(namedItems(deps.briefing).map((n) => [n.id, n]));
     const settled = new Map(namedItems(deps.briefing, true).map((n) => [n.id, n]));
     return deps.store.keptReplies().flatMap((k) => {
+      // A new thread's prompt: named by its project, if it has one yet ("" for none).
+      if (isNewThread(k.threadId)) return [{ id: k.id, threadId: k.threadId, threadName: k.threadName, project: k.project, text: k.text, keptAt: k.keptAt, conversationId: k.conversationId, settled: false }];
       const n = open.get(k.threadId) ?? settled.get(k.threadId);
       return n ? [{ id: k.id, threadId: k.threadId, threadName: n.handle, project: n.group, text: k.text, keptAt: k.keptAt, conversationId: k.conversationId, settled: !open.has(k.threadId) }] : [];
     });
@@ -848,7 +900,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
     const text = typeof body.text === "string" ? body.text.trim() : undefined;
     if (body.text !== undefined && !text) return send(400, { error: "Write a reply first." });
     if (text && text.length > DRAFT_MAX) return send(400, { error: "That reply is too long to send in one go." });
-    const again = earlierTap(body, (p) => p.action === "follow_up" && p.fields.keptId === body.keptId && (text === undefined || tappedWords(p.fields.message ?? "") === text));
+    const again = earlierTap(body, (p) => (p.action === "follow_up" || p.action === "start_work") && p.fields.keptId === body.keptId && (text === undefined || tappedWords(p.fields.message ?? "") === text));
     if (again) {
       const answer = await again;
       // Sent, but no longer kept only if the brain stopped in between: it is now.
@@ -863,7 +915,10 @@ function api(cfg: Config, deps: ServerDeps): Api {
     sendingKept.add(kept.id);
     try {
       const words = text ?? kept.text;
-      const res = await tapped({ ...body, id: kept.threadId }, "follow_up", { message: kept.note ? `${kept.note}\n\n${words}` : words, keptId: kept.id, ...(kept.draftId ? { draftId: kept.draftId } : {}) });
+      const message = kept.note ? `${kept.note}\n\n${words}` : words;
+      // A new thread's prompt, kept in a call: started where it says (one with no project yet is refused, to start by voice).
+      const res = isNewThread(kept.threadId) ? await tappedStart(body, kept.threadId, message, kept.id)
+        : await tapped({ ...body, id: kept.threadId }, "follow_up", { message, keptId: kept.id, ...(kept.draftId ? { draftId: kept.draftId } : {}) });
       if (res.status === 200) {
         deps.store.dropKept(kept.id);
         sent?.();
@@ -874,14 +929,18 @@ function api(cfg: Config, deps: ServerDeps): Api {
     }
   }
 
-  /** A new thread started with a tap (contracts §3, "Tap to send"): a dictated draft's `new:` target, and its prompt. */
-  async function tappedStart(body: any, start: NewThread, message: string): Promise<Response> {
-    const again = earlierTap(body, (p) => p.action === "start_work" && p.fields.target === newThreadTarget(start) && p.fields.message === message);
+  /**
+   * A new thread started with a tap (contracts §3, "Tap to send"): a dictated draft's `new:` target (`target`), and its
+   * prompt. `keptId`: it was kept for later in a call, and is no longer once it's started.
+   */
+  async function tappedStart(body: any, target: string, message: string, keptId?: string): Promise<Response> {
+    const again = earlierTap(body, (p) => p.action === "start_work" && p.fields.target === target && p.fields.message === message);
     if (again) return again;
-    if (!(deps.adapter.actionsFor?.(start.placeId) ?? deps.adapter.actions).includes("start_work")) return send(409, { error: "Your computer only lets 10 & 2 listen in, so nothing was started." });
-    const p = await deps.proposals.tapStart(start, message, body.requestId);
+    const start = parseNewThread(target);
+    if (start?.placeId && !(deps.adapter.actionsFor?.(start.placeId) ?? deps.adapter.actions).includes("start_work")) return send(409, { error: "Your computer only lets 10 & 2 listen in, so nothing was started." });
+    const p = await deps.proposals.tapStart(target, message, body.requestId, keptId);
     if ("error" in p) return send(409, p);
-    deps.log(`tap ${p.id} start_work ${start.placeId} → ${p.state}`);
+    deps.log(`tap ${p.id} start_work ${p.fields.placeId} → ${p.state}`);
     if (deps.analytics) trackChange(deps.analytics.track, p, tapVia(body.via), body.dictated === true);
     return tapAnswer(p);
   }
@@ -911,7 +970,8 @@ function api(cfg: Config, deps: ServerDeps): Api {
         const draft = body.mode === "reading" && body.draft !== undefined ? parseDraft(body.draft) : null;
         if (body.mode === "reading" && body.draft !== undefined) {
           if (!draft) return send(400, { error: "That reply couldn't be read." });
-          if (body.heardBack !== true && body.heardBack !== "true") return send(409, { error: "Hear the reply back before sending it." });
+          // A new thread's prompt comes back to the call as the dictation ends, to be kept and asked about (`dictatedOpening`).
+          if (!isNewThread(draft.itemId) && body.heardBack !== true && body.heardBack !== "true") return send(409, { error: "Hear the reply back before sending it." });
         }
         const run = creating.then(async () => {
           const { conversationId, open, created, news } = await opening(given, body.mode, accepted, body.memoryDays === undefined ? 0 : memoryDays);
@@ -921,7 +981,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
           const confirm = confirmFor(body, id);
           if (draft && first.kind === "reading") first = await dictatedOpening(id, draft, first, keepRepliesOf(body), confirm);
           // The news must be in place before the session's first words, so `created` runs as the session is made.
-          const started = await startSession(body.sdp, id, first, memoryDays, accepted, voice, created, news, readingStyle, readingVoice, fastOf(body).conversations, phoneBuildOf(headed(req)), keepRepliesFor(body, id), confirm);
+          const started = await startSession(body.sdp, id, first, memoryDays, accepted, voice, created, news, readingStyle, readingVoice, fastOf(body).conversations, phoneBuildOf(headed(req)), keepRepliesFor(body, id), confirm, wakeWordOf(body), body.newThreads === "talk");
           // What was read to the end counts as heard once there's a session to tell about it.
           reading?.heard();
           return started;
@@ -951,7 +1011,10 @@ function api(cfg: Config, deps: ServerDeps): Api {
         if (user) deps.waits.cancelAll();
         if (user) deps.store.dropHandoff();
         deps.proposals.cancelOpen(user ? "stopped by user" : "the call ended", user ? undefined : active?.conversationId ?? "");
-        active?.session.close({ kind: user ? "user_stop" : "phone_end" });
+        // `handoff`: the phone went from the call to a mode of its own (the call screen's Dictate), which the user was
+        // there for, like the brain's own hand-off.
+        const focus = () => active?.view.snapshot(null).agenda?.find((i) => i.status === "current")?.name ?? "the thread in focus";
+        active?.session.close(user ? { kind: "user_stop" } : body.handoff === "dictating" ? { kind: "dictating", handle: focus() } : { kind: "phone_end" });
         if (user) dropUntold();
         return send(200, { ok: true });
       }
@@ -976,11 +1039,48 @@ function api(cfg: Config, deps: ServerDeps): Api {
         // conversation's wait is newer. (Every new session drops the hand-off, so one that's left is from the session that
         // just hung up; a wait may be older, kept through an interruption.) The phone asks for its reading
         // (`/api/readings`), which is being made already. A ready wait's news is told when the phone comes back.
+        // `handoff=1`, from a phone in the call: answers the moment this conversation hands off to the phone (`reading`,
+        // `dictating`), so the phone closes the call and starts at once, rather than after the hang-up and another ask;
+        // `none` after `wait`, and the phone asks again while the call is on (docs/launch/voice-speed.md).
+        // `hold=1`: this phone holds as a mode (`hold`); an older one is told the call ended, as it was before.
+        const holds = url.searchParams.get("hold") === "1";
+        if (url.searchParams.get("handoff") === "1") {
+          const handedOff = () => {
+            const h = deps.store.handoff(id);
+            if (h && "hold" in h) return holds ? { state: "hold" } : null;
+            if (h && "dictate" in h) return { state: "dictating", handle: h.handle, itemId: h.dictate.itemId };
+            if (h && "reply" in h) return { state: "reading", handle: h.handle, reply: h.reply };
+            return null;
+          };
+          const now = handedOff();
+          if (now || !seconds) return send(200, now ?? { state: "none" });
+          let stop = () => {};
+          const told = await new Promise<object | null>((resolve) => {
+            const timer = setTimeout(() => resolve(null), seconds * 1000);
+            const off = deps.store.onHandoff((c) => {
+              const answer = c === id ? handedOff() : null;
+              if (answer) resolve(answer);
+            });
+            req.signal?.addEventListener("abort", () => resolve(null), { once: true });
+            stop = () => (clearTimeout(timer), off());
+          });
+          stop();
+          return send(200, told ?? { state: "none" });
+        }
+        // `onhold=1`: the phone is on hold (confirmed). Whatever it was handed (a reading, a dictation) is over, and the
+        // hold lasts while it asks. Without a hand-off the brain has let go (a Stop, a new call): the answer says so.
+        if (holds && url.searchParams.get("onhold") === "1") deps.store.keepHold(id);
         const handoff = deps.store.handoffAt(id);
         if (handoff && handoff.at >= (deps.waits.get(id)?.startedAt ?? 0)) {
           const h = handoff.handoff;
           // Only a phone that asks (`rollover=1`) knows "continue"; an older one hears the call ended, as it did before.
           if ("rollover" in h) return send(200, url.searchParams.get("rollover") === "1" ? { state: "continue" } : { state: "none" });
+          // On hold: a wait (a call-back armed, whenever it began) says what's watched, and ends the long poll when it's
+          // ready; without one, the hold goes on.
+          if ("hold" in h) {
+            const w = deps.waits.get(id) ? await deps.waits.until(id, seconds * 1000) : await deps.waits.started(id, seconds * 1000);
+            return send(200, w ? { state: w.ready ? "ready" : "waiting", handle: w.handle, outcome: w.ready } : { state: holds ? "hold" : "none" });
+          }
           return send(200, "dictate" in h ? { state: "dictating", handle: h.handle, itemId: h.dictate.itemId } : { state: "reading", handle: h.handle, reply: h.reply });
         }
         const w = await deps.waits.until(id, seconds * 1000);
@@ -1037,8 +1137,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
         // Always a request id: a reply sent twice (a retry, a double tap) must go out once.
         if (body.requestId === undefined) return send(400, { error: "requestId is required" });
         // A dictated draft's new thread ("new:…", drafts.ts): started with this as its first prompt.
-        const start = typeof body.id === "string" ? parseNewThread(body.id) : null;
-        if (start) return tappedStart(body, start, text);
+        if (typeof body.id === "string" && isNewThread(body.id)) return tappedStart(body, body.id, text);
         return tapped(body, "follow_up", { message: tappedReply(text, typeof body.quote === "string" ? body.quote : null) });
       }
       // Replies kept for later in calls (the phone's Not sent): listed, edited before sending, discarded, or all sent.
@@ -1128,7 +1227,19 @@ function api(cfg: Config, deps: ServerDeps): Api {
         return send(200, { replies: await pastReplies(deps, thread.id) });
       }
       if (req.method === "GET" && url.pathname === "/api/voices") {
-        return send(200, { conversation: CONVERSATION_VOICES, reading: READING_VOICES, conversationDefault: current().voice, readingDefault: "marin" });
+        const settings = current();
+        return send(200, { conversation: CONVERSATION_VOICES, reading: READING_VOICES, conversationDefault: settings.voice, readingDefault: "marin", sample: settings.sampleText });
+      }
+      // A reading voice saying the same few words as every other (Ops' `sampleText`), to hear it before choosing it.
+      // Free (contracts §4).
+      if (req.method === "GET" && url.pathname === "/api/voices/sample") {
+        const voice = url.searchParams.get("voice") ?? "";
+        if (!(READING_VOICES as readonly string[]).includes(voice)) return send(400, { error: "unknown voice" });
+        const samples = deps.samples ?? deps.speech;
+        if (!samples) return send(503, { error: "speech isn't set up on this brain" });
+        const audio = await samples.audio(current().sampleText, voice).catch((e) => (deps.log(`voice sample: ${describe(e)}`), null));
+        if (!audio) return send(502, { error: "Couldn't play that voice. Try again." });
+        return new Response(new Uint8Array(audio), { status: 200, headers: { "content-type": "audio/aac", "content-length": String(audio.length), "cache-control": "private, max-age=86400" } });
       }
       // Replies to read out in full: the given threads' latest, or every reply new to the user, as spoken segments.
       // With `announce` (several read in a row: "Read new replies"), each starts with whose reply it is.
@@ -1144,6 +1255,21 @@ function api(cfg: Config, deps: ServerDeps): Api {
         }
         const announce = body.announce === true || body.announce === "true";
         return send(200, { readings: await prepare(deps, ids, announce ? { ...style, announce } : style) });
+      }
+      // The user's own words to read back in the reading voice (a dictated reply, before it's sent): kept as a reading,
+      // one segment per part the phone plays, so its audio is any reading's (below), metered and kept the same way.
+      // The same words make the same reading, so hearing them again costs nothing.
+      if (req.method === "POST" && url.pathname === "/api/readings/text") {
+        const body = await readJson(req);
+        const parts: unknown = body.segments;
+        if (!Array.isArray(parts) || !parts.length || parts.length > 200 || !parts.every((p) => typeof p === "string" && p.trim() && p.length <= 2000)
+          || (parts as string[]).join("").length > DRAFT_MAX) {
+          return send(400, { error: "segments: 1–200 non-empty strings, within a reply's length" });
+        }
+        const segments = (parts as string[]).map((text, paragraph) => ({ text: text.trim(), paragraph }));
+        const id = createHash("sha256").update(JSON.stringify(["text", segments])).digest("hex").slice(0, 24);
+        deps.store.putReading(id, "", "", JSON.stringify({ text: true }), segments);
+        return send(200, { reading: { id, segments } });
       }
       // The briefing, on demand: an intro, then a part for each thread a call would cover, as a reading whose segments
       // carry their thread's id; the same cards give the same reading. Its audio is any reading's (below).
@@ -1174,6 +1300,11 @@ function api(cfg: Config, deps: ServerDeps): Api {
       if (req.method === "POST" && url.pathname === "/api/read") {
         const body = await readJson(req);
         if (typeof body.id !== "string" || typeof body.messageId !== "string") return send(400, { error: "id and messageId required" });
+        // A thread's part of the briefing (`messageId` the briefing's id): its summary is heard, nothing is read.
+        if (body.briefing === true) {
+          const r = briefingHeard(deps.store, body.id, body.messageId);
+          return send("error" in r ? 404 : 200, r);
+        }
         const conversationId = typeof body.conversationId === "string" && CONVERSATION_ID.test(body.conversationId) ? body.conversationId : null;
         const r = await markRead(deps, body.id, body.messageId, conversationId);
         return send("error" in r ? 409 : 200, r);
@@ -1327,6 +1458,14 @@ export function createBrain(cfg: Config, deps: ServerDeps, demo?: DemoWorlds) {
       }
       // Who usage analytics are about (contracts §5): one person, demo or not.
       deps.analytics?.heard(h.headers["x-driver-analytics"], phoneBuildOf(h));
+      // The user's vocabulary (vocabulary.ts): theirs whether or not the phone is in demo mode, so always the real store.
+      if (req.method === "GET" && url.pathname === "/api/vocabulary") return send(200, { words: merge(ownOf(deps.store)) });
+      if (req.method === "PUT" && url.pathname === "/api/vocabulary") {
+        const own = parseOwn(await readJson(req));
+        if (typeof own === "string") return send(400, { error: own });
+        deps.store.set(VOCABULARY_KEY, JSON.stringify(own));
+        return send(200, { words: merge(own) });
+      }
 
       const starting = req.method === "POST" && url.pathname === "/api/session";
       if (!demo || cfg.demo === "off" || !wantsDemo(cfg, h)) {

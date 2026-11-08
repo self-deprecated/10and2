@@ -84,14 +84,16 @@ export const ROUTES: Route[] = [
   { method: "POST", path: "/internal/devices/add", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/credit", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/revenuecat", access: "internal", by: "brain", where: "cloud" },
+  { method: "POST", path: "/internal/plan", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/demo-usage", access: "internal", by: "brain", where: "cloud" },
   { method: "GET", path: "/internal/account", access: "internal", by: "brain", where: "cloud" },
+  { method: "GET", path: "/internal/costs", access: "internal", by: "brain", where: "cloud" },
 
   // Webhooks, each by its signature.
   {
     method: "POST", path: "/stripe/webhook", access: "webhook", signature: "stripe", by: "worker", where: "cloud",
     body: { id: "evt_1", type: "checkout.session.completed", data: { object: { id: "cs_test_1", client_reference_id: "user_a", payment_status: "paid", metadata: { pack: "minutes_60" } } } },
-    idempotent: { key: "the Checkout Session (`stripe:<id>`)", tested: ["cloud/test/workerd.test.ts", "credits: welcome minutes, metered by"] },
+    idempotent: { key: "the Checkout Session (`stripe:<id>`)", tested: ["cloud/test/workerd.test.ts", "credits: a new account's trial, metered by"] },
   },
   {
     method: "POST", path: "/revenuecat/webhook", access: "webhook", signature: "revenuecat", by: "worker", where: "cloud",
@@ -121,7 +123,8 @@ export const ROUTES: Route[] = [
   { method: "PUT", path: "/api/analytics", access: "signed_in", by: "brain", where: "both", body: { share: true } },
   { method: "POST", path: "/api/machines/revoke", access: "signed_in", by: "brain", where: "cloud", body: { deviceId: "d-0123456789" }, ids: [body("deviceId", "device")] },
   { method: "GET", path: "/api/credits/packs", access: "signed_in", by: "worker", where: "cloud" },
-  { method: "POST", path: "/api/credits/checkout", access: "signed_in", by: "worker", where: "cloud", body: { pack: "minutes_60" } },
+  { method: "POST", path: "/api/credits/checkout", access: "signed_in", by: "worker", where: "cloud", body: { pack: "minutes_30" } },
+  { method: "POST", path: "/api/credits/portal", access: "signed_in", by: "worker", where: "cloud", body: {} },
   { method: "POST", path: "/api/byot/unlock", access: "signed_in", by: "brain", where: "cloud", body: {} },
   { method: "PUT", path: "/api/byot", access: "signed_in", by: "brain", where: "cloud", body: { key: "sk-proj-0123456789abcdefWXYZ" } },
   { method: "DELETE", path: "/api/byot", access: "signed_in", by: "brain", where: "cloud" },
@@ -188,11 +191,20 @@ export const ROUTES: Route[] = [
   },
   { method: "DELETE", path: "/api/kept/:id", access: "signed_in", by: "brain", where: "both", idempotent: { key: "the id: one already gone is discarded too" }, ids: [pathId("kept")] },
 
+  // The user's vocabulary: the words their speech is misheard as (vocabulary.ts).
+  { method: "GET", path: "/api/vocabulary", access: "signed_in", by: "brain", where: "both" },
+  {
+    method: "PUT", path: "/api/vocabulary", access: "signed_in", by: "brain", where: "both", body: { words: [{ word: "embargo", misheard: ["embar go"] }] },
+    idempotent: { key: "words: it sets the user's whole list" },
+  },
+
   // Replies read out, and the briefing.
   { method: "GET", path: "/api/inbox", access: "signed_in", by: "brain", where: "both" },
   { method: "GET", path: "/api/replies", access: "signed_in", by: "brain", where: "both", query: "id=t-12", ids: [query("id", "thread")] },
   { method: "GET", path: "/api/voices", access: "signed_in", by: "brain", where: "both" },
+  { method: "GET", path: "/api/voices/sample", access: "signed_in", by: "brain", where: "both", query: "voice=marin" },
   { method: "POST", path: "/api/readings", access: "signed_in", by: "brain", where: "both", body: { ids: "t-12", style: "written" }, ids: [body("ids", "thread"), body("messageId", "message", { with: { ids: "<own:thread>" } })] },
+  { method: "POST", path: "/api/readings/text", access: "signed_in", by: "brain", where: "both", body: { segments: ["Run it tonight."] } },
   { method: "GET", path: "/api/readings/:id/:n", access: "signed_in", by: "brain", where: "both", query: "voice=marin", ids: [pathId("reading")] },
   { method: "POST", path: "/api/briefing", access: "signed_in", by: "brain", where: "both", body: {} },
   { method: "POST", path: "/api/read", access: "signed_in", by: "brain", where: "both", body: { id: "t-12", messageId: "m-1" }, ids: [

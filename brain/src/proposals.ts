@@ -6,9 +6,9 @@
 import { randomUUID } from "node:crypto";
 import type { Action, Adapter, LaunchProfile, Place, Receipt, WorkItem } from "./adapter.ts";
 import { DONE, type ClutterGroup } from "./briefing.ts";
-import { dictatedParts, DRAFT_MAX, draftState, newThreadTarget } from "./drafts.ts";
+import { dictatedParts, DRAFT_MAX, draftState, newThreadName, newThreadTarget, parseNewThread, type NewThread } from "./drafts.ts";
 import { inGroup, isMark, keyWords, nameKey, norm, pick, resolve, sayKey, saysHead, speechTokens, spokenTitle, withGroup, type Named } from "./handles.ts";
-import { TAP, type Proposal, type ProposalTarget, type Store } from "./store.ts";
+import { TAP, type KeptReply, type Proposal, type ProposalTarget, type Store } from "./store.ts";
 import { mapLimit } from "./util.ts";
 import type { Track } from "./analytics.ts";
 
@@ -19,14 +19,13 @@ export type ProposeAction = "follow_up" | "settle" | "snooze" | "archive" | "set
  */
 export type TapAction = "settle" | "unsettle" | "snooze" | "unsnooze" | "follow_up";
 
-/** `project`, `title` and `profile` are for start_work: where, what the new thread is called, and which launch profile. */
+/** `project` and `profile` are for start_work: where, and which launch profile. The work system names the thread. */
 export type ProposeInput = {
   action: ProposeAction;
   handles: string[];
   message: string | null;
   until: string | null;
   project?: string | null;
-  title?: string | null;
   profile?: string | null;
 };
 export type ToolResult = Record<string, unknown>;
@@ -139,16 +138,16 @@ const projectTokens = (name: string) => {
 };
 
 /**
- * What a new thread's readback must be heard saying, before "with this message": "Start a new thread called <title>, in
- * <project>" word for word. The machine may be left out when no other machine has a project of that name, and the
- * profile when it's the default; a profile the user asked for is heard as a clause of its own. On 5 November the voice
- * said "…, in Driver, with this message" four times over and each "yes" was refused.
+ * What a new thread's readback must be heard saying, before "with this message": "Start a new thread in <project>" word
+ * for word. The machine may be left out when no other machine has a project of that name, and the profile when it's the
+ * default; a profile the user asked for is heard as a clause of its own. On 5 November the voice said "…, in Driver, with
+ * this message" four times over and each "yes" was refused.
  */
-function startHeard(title: string, place: Place, places: Place[], profile: LaunchProfile, isDefault: boolean): MustHear[] {
+function startHeard(place: Place, places: Place[], profile: LaunchProfile, isDefault: boolean): MustHear[] {
   const { project, rest } = projectTokens(place.name);
   const key = project.join(" ");
   const shared = places.some((o) => o.id !== place.id && projectTokens(o.name).project.join(" ") === key);
-  const named = nameTokens(`Start a new thread called ${title}`);
+  const named = nameTokens("Start a new thread");
   const head = shared ? [...named, ...project, ...rest.filter((w) => !isMark(w))] : [...named, ...project];
   const profileWords = speechTokens(`, with the ${profile.name} profile`);
   const where = [...(shared ? [] : rest), ...(isDefault ? profileWords : [])];
@@ -419,13 +418,13 @@ export class Proposals {
       readback = `Settle ${ids.length} finished subagent ${ids.length === 1 ? "thread" : "threads"} under ${groups.length} parent ${groups.length === 1 ? "thread" : "threads"}.`;
       entities.push({ words: ["subagent", "sub", "agent", "review", "finish"], need: 1 });
     } else if (input.action === "start_work") {
-      const start = this.newThread({ project: input.project ?? "" }, input.title ?? "", input.profile ?? null);
+      const start = this.newThread({ project: input.project ?? "" }, input.profile ?? null);
       if ("error" in start) return start;
       const message = (input.message ?? "").trim();
       const bad = badMessage(message);
       if (bad) return { error: bad };
-      Object.assign(fields, { placeId: start.place.id, place: start.place.name, title: start.title, profile: start.profile, message });
-      // Title, place and profile are heard word for word, as one clause up to "with this message"; the message as a follow-up's.
+      Object.assign(fields, { placeId: start.place.id, place: start.place.name, profile: start.profile, message });
+      // Place and profile are heard word for word, as one clause up to "with this message"; the message as a follow-up's.
       readback = `${start.head}, with this message: "${message}"`;
       entities.push(...start.heard);
       const words = messageWords(message);
@@ -486,7 +485,7 @@ export class Proposals {
     }
 
     const actions: Action[] = input.action === "start_work"
-      ? [{ kind: "start_work", placeId: fields.placeId!, title: fields.title!, message: fields.message!, profile: fields.profile! }]
+      ? [{ kind: "start_work", placeId: fields.placeId!, message: fields.message!, profile: fields.profile! }]
       : targets.map((t) => toAction({ action: input.action, fields } as Proposal, t.itemId));
     const reason = keeping ? null : await this.check(actions);
     if (reason) return { error: reason };
@@ -500,7 +499,7 @@ export class Proposals {
     let entitiesFrom = createdFrom;
     const sameEntities = (o: Proposal) =>
       o.action === input.action && o.fields.until === fields.until && o.fields.placeId === fields.placeId &&
-      o.fields.title === fields.title && o.fields.profile?.name === fields.profile?.name &&
+      o.fields.profile?.name === fields.profile?.name &&
       JSON.stringify(o.targets.map((t) => t.itemId).sort()) === JSON.stringify(targets.map((t) => t.itemId).sort());
     for (const old of atOnce ? [] : this.d.store.openProposals(conversationId)) {
       if (sameEntities(old)) entitiesFrom = Math.min(entitiesFrom, old.createdFrom);
@@ -547,15 +546,14 @@ export class Proposals {
   }
 
   /**
-   * Where a new thread starts, what it's called and with which profile, from the user's words (`project`) or, for a
-   * dictated start, the place it was dictated for (`placeId`). `head` is the readback up to its message, all heard word
-   * for word.
+   * Where a new thread starts and with which profile, from the user's words (`project`) or, for a dictated start, the
+   * place it was dictated for (`placeId`). `head` is the readback up to its message, all heard word for word. The work
+   * system names the thread.
    */
-  newThread(where: { project: string } | { placeId: string }, rawTitle: string, asked: string | null): { place: Place; title: string; profile: LaunchProfile; head: string; heard: MustHear[] } | { error: string } {
+  newThread(where: { project: string } | { placeId: string }, asked: string | null): { place: Place; profile: LaunchProfile; head: string; heard: MustHear[] } | { error: string } {
     const profiles = this.d.profiles ?? [];
-    const named = asked?.trim().replace(/\s+profile$/i, "");
-    const profile = named ? profiles.find((p) => nameKey(p.name) === nameKey(named)) : profiles[0];
-    if (!profile) return { error: profiles.length ? `There's no ${named} profile; there are ${list(profiles.map((p) => p.name))}. Ask the user which.` : "Driver has no launch profiles set up." };
+    const profile = this.profileOf(asked);
+    if ("error" in profile) return profile;
     const places = this.d.places?.() ?? [];
     let place: Place;
     if ("project" in where) {
@@ -567,13 +565,18 @@ export class Proposals {
       if (!found) return { error: "That project isn't reachable now (its machine may be asleep), or it's gone from T3, so nothing was started. The prompt is still on the phone." };
       place = found;
     }
-    const title = spokenTitle(rawTitle);
-    if (!keyWords(title).length) return { error: "Give the new thread a short title of a few words, from what the user asked for." };
-    if (title.length > 80 || /\bthis\s+message\b|\bshall\s+i\b|\byour\s+dictated\b/i.test(title)) return { error: "Give the new thread a shorter, plain title of a few words." };
     // Two places said alike ("agent-hearth" and "agent hearth" on one machine) can't be told apart by any readback.
     const twin = places.find((o) => o.id !== place.id && sayKey(o.name) === sayKey(place.name));
     if (twin) return { error: tooAlike({ target: place.name, other: twin.name }) };
-    return { place, title, profile, head: `Start a new thread called ${title}, in ${place.name}, with the ${profile.name} profile`, heard: startHeard(title, place, places, profile, profile === profiles[0]) };
+    return { place, profile, head: `Start a new thread in ${place.name}, with the ${profile.name} profile`, heard: startHeard(place, places, profile, profile === profiles[0]) };
+  }
+
+  /** The launch profile the user asked for by name, or with none, the default. */
+  profileOf(asked: string | null): LaunchProfile | { error: string } {
+    const profiles = this.d.profiles ?? [];
+    const named = asked?.trim().replace(/\s+profile$/i, "");
+    const profile = named ? profiles.find((p) => nameKey(p.name) === nameKey(named)) : profiles[0];
+    return profile ?? { error: profiles.length ? `There's no ${named} profile; there are ${list(profiles.map((p) => p.name))}. Ask the user which.` : "Driver has no launch profiles set up." };
   }
 
   /** Whether a dictated draft may be proposed: not if it's been sent or is being sent; its own lost proposal again, here. */
@@ -590,19 +593,20 @@ export class Proposals {
   }
 
   /**
-   * A new thread's opening prompt, dictated on the phone and heard back there in full: a start to agree to, read back
-   * as one said aloud is, with "your dictated prompt" in place of the message. Sent once, like a dictated reply.
+   * A new thread's opening prompt, dictated on the phone (and kept for later as `keptId`, if it is): a start to agree to,
+   * read back as one said aloud is, with "your dictated prompt" in place of the message. Sent once, like a dictated
+   * reply. `profile`: a launch profile's name, or null for the default.
    */
-  async proposeDraftStart(conversationId: string, d: { draftId: string; placeId: string; title: string; profile: string; message: string; words: number; parts: number }, level: Level = "readback"): Promise<{ proposal: Proposal } | { error: string }> {
+  async proposeDraftStart(conversationId: string, d: { draftId: string | null; placeId: string; profile: string | null; message: string; words: number; parts: number; keptId?: string }, level: Level = "readback"): Promise<{ proposal: Proposal } | { error: string }> {
     const current = this.preparing(conversationId);
     const now = this.now();
     if (!this.d.adapter.actions.includes("start_work")) return { error: "This system can't start work." };
     if (d.message.length > DRAFT_MAX + 2000) return { error: "That prompt is too long to send." };
-    const again = this.draftAgain(conversationId, d.draftId, now, "prompt");
+    const again = d.draftId ? this.draftAgain(conversationId, d.draftId, now, "prompt") : null;
     if (again) return again;
-    const start = this.newThread({ placeId: d.placeId }, d.title, d.profile);
+    const start = this.newThread({ placeId: d.placeId }, d.profile);
     if ("error" in start) return start;
-    const reason = await this.check([{ kind: "start_work", placeId: start.place.id, title: start.title, message: d.message, profile: start.profile }]);
+    const reason = await this.check([{ kind: "start_work", placeId: start.place.id, message: d.message, profile: start.profile }]);
     if (reason) return { error: reason };
     if (!current()) return { error: "That proposal was stopped or replaced; nothing was proposed." };
     for (const old of this.d.store.openProposals(conversationId)) this.d.store.putProposal({ ...old, state: "cancelled", result: "superseded" });
@@ -612,7 +616,10 @@ export class Proposals {
       conversationId,
       action: "start_work",
       targets: [],
-      fields: { placeId: start.place.id, place: start.place.name, title: start.title, profile: start.profile, message: d.message, draftId: d.draftId, confirm: draftLevel(level) },
+      fields: {
+        placeId: start.place.id, place: start.place.name, profile: start.profile, message: d.message, confirm: draftLevel(level),
+        ...(d.draftId ? { draftId: d.draftId } : {}), ...(d.keptId ? { keptId: d.keptId } : {}),
+      },
       readback: `${start.head}, with your dictated prompt, ${size(d.words, d.parts)}.`,
       // "…, with your dictated prompt": the head's own clause is followed by "with your", not "with this".
       mustHear: start.heard.map((g) => ({ ...g, from: createdFrom, ...(Array.isArray(g.next) ? { next: ["with", "your"] } : {}) })),
@@ -701,7 +708,8 @@ export class Proposals {
   keep(conversationId: string, id: string): ToolResult {
     const p = this.d.store.proposal(id);
     if (!p || p.conversationId !== conversationId) return { error: "No such proposal." };
-    if (p.action !== "follow_up" || p.targets.length !== 1) return { error: "Only a reply to a thread can be kept for later. Say so, and ask whether to go ahead or leave it." };
+    if (p.action === "start_work" && p.fields.keptId) return this.keepStart(p);
+    if (p.action !== "follow_up" || p.targets.length !== 1) return { error: "Only a reply to a thread or a dictated prompt can be kept for later. Say so, and ask whether to go ahead or leave it." };
     const target = p.targets[0];
     const said = `Kept your reply to ${target.handle}. It's in Not sent on the phone.`;
     const instruction = "Say only that it's kept, in Not sent on their phone (\"Kept. It's in Not sent on your phone.\"), then carry on with what they want next.";
@@ -721,6 +729,16 @@ export class Proposals {
     return { kept: true, kept_id: kept.id, result: said, instruction };
   }
 
+  /** "Keep it for later" for a kept prompt proposed to start (`sendKept`): it stays kept, and nothing is started. */
+  private keepStart(p: Proposal): ToolResult {
+    const kept = this.d.store.keptReply(p.fields.keptId!);
+    const instruction = "Say only that it's kept, in Not sent on their phone (\"Kept. It's in Not sent on your phone.\"), then carry on with what they want next.";
+    if (p.state === "proposed") this.d.store.putProposal({ ...p, state: "cancelled", result: KEPT });
+    else if (!(p.state === "cancelled" && p.result === KEPT)) return { error: `That prompt can't be kept: it's already ${p.state}${p.result ? ` (${p.result})` : ""}.` };
+    if (!kept) return { error: "That prompt isn't kept any more: it was started or discarded. Say so." };
+    return { kept: true, kept_id: kept.id, result: "Kept your prompt for a new thread. It's in Not sent on the phone.", instruction };
+  }
+
   /** Kept replies being sent by voice now (`sendKept`): each goes once at a time. */
   private readonly sendingKept = new Set<string>();
 
@@ -729,9 +747,11 @@ export class Proposals {
    * asking is the yes for "none" and "yes", so it's sent now; "readback" proposes it, to read back and agree to; "tap"
    * sends nothing (Send on it in Not sent does). Sent, it's no longer kept; the call's receipt is a change like any.
    */
-  async sendKept(conversationId: string, keptId: string, levels: ConfirmLevels = READBACK_ALL): Promise<ToolResult> {
+  async sendKept(conversationId: string, keptId: string, levels: ConfirmLevels = READBACK_ALL, where: { project?: string | null; profile?: string | null } = {}): Promise<ToolResult> {
     const kept = this.d.store.keptReply(keptId);
     if (!kept) return { error: "That reply isn't kept any more: it was sent or discarded. Say so." };
+    const start = parseNewThread(kept.threadId);
+    if (start) return this.startKept(conversationId, kept, start, levels, where);
     const level = levels.reply ?? "readback";
     if (level === "tap") {
       return { sent: false, result: "Nothing was sent.", instruction: "Nothing was sent: the user's settings send replies only with a tap. Tell them to tap Send on it in Not sent on their phone." };
@@ -767,6 +787,55 @@ export class Proposals {
       const p: Proposal = { ...base, state: "executing", mustHear: [] };
       this.d.store.putProposal(p);
       this.d.log?.(`kept ${kept.id}: sent by voice as ${p.id}`);
+      const r = await this.execute(p, false);
+      return "error" in r ? r : { ...r, proposal_id: p.id };
+    } finally {
+      this.sendingKept.delete(kept.id);
+    }
+  }
+
+  /**
+   * The user asked to start the new thread whose prompt they dictated and kept (`sendKept`), at their start level: in
+   * the project they name now (`where.project`), else the one it was dictated for; with neither, they're asked which.
+   * Placed, the kept prompt says where from then on, so Send in Not sent can start it too. Then, as for a kept reply:
+   * asking is the yes for "none" and "yes", "readback" reads it back first, and "tap" waits for Send in Not sent.
+   */
+  private async startKept(conversationId: string, kept: KeptReply, start: NewThread, levels: ConfirmLevels, where: { project?: string | null; profile?: string | null }): Promise<ToolResult> {
+    if (!this.d.adapter.actions.includes("start_work")) return { error: "This system can't start work." };
+    if (this.sendingKept.has(kept.id)) return { error: "That prompt is being started right now." };
+    const places = this.d.places?.() ?? [];
+    // A place no longer there (its machine asleep, or gone from T3) is asked about again, as none is.
+    let placeId = places.some((p) => p.id === start.placeId) ? start.placeId : null;
+    if (where.project?.trim()) {
+      const found = pickPlace(where.project, places);
+      if ("error" in found) return found;
+      placeId = found.place.id;
+    }
+    if (!placeId) {
+      const recent = [...places].sort((a, b) => (b.activeAt ?? "").localeCompare(a.activeAt ?? "")).slice(0, 6).map((p) => p.name);
+      return { error: `Which project should it start in? Ask the user.${recent.length ? ` Projects active lately: ${recent.join("; ")}.` : ""}` };
+    }
+    const profile = where.profile?.trim() || start.profile;
+    const placed = this.newThread({ placeId }, profile);
+    if ("error" in placed) return placed;
+    if (placeId !== start.placeId || (profile ?? null) !== start.profile) {
+      this.d.store.keepReply({ ...kept, threadId: newThreadTarget({ placeId, profile }), threadName: placed.place.name, project: placed.place.name });
+    }
+    const level = levels.start ?? "readback";
+    if (level === "tap") {
+      return { sent: false, result: "Nothing was started.", instruction: `Nothing was started: the user's settings start threads only with a tap. Tell them it's set to start in ${placed.place.name}: they tap Send on it in Not sent on their phone.` };
+    }
+    const message = kept.note ? `${kept.note}\n\n${kept.text}` : kept.text;
+    const words = kept.text.split(/\s+/).filter(Boolean).length;
+    const made = await this.proposeDraftStart(conversationId, { draftId: kept.draftId, keptId: kept.id, placeId, profile, message, words, parts: 1 }, level);
+    if ("error" in made) return made;
+    const p = made.proposal;
+    if (level === "readback") return { proposal_id: p.id, readback: p.readback, instruction: "Say the readback word for word, then ask \"Shall I go ahead?\" and stop. Nothing has been started yet." };
+    // Asking was the yes.
+    this.sendingKept.add(kept.id);
+    try {
+      this.d.store.putProposal({ ...p, state: "executing" });
+      this.d.log?.(`kept ${kept.id}: started by voice as ${p.id}`);
       const r = await this.execute(p, false);
       return "error" in r ? r : { ...r, proposal_id: p.id };
     } finally {
@@ -920,19 +989,23 @@ export class Proposals {
   }
 
   /**
-   * A new thread started with a tap: a prompt for it, dictated or typed on the phone, sent with Send. Checked as a
-   * dictated start is (`proposeDraftStart`: the place, title and profile), then started once, as a yes would.
+   * A new thread started with a tap: a prompt for it, dictated or typed on the phone, sent with Send to its `new:`
+   * target (`target`, as the phone sent it, so a retry is matched on exactly what was tapped). Checked as a dictated
+   * start is (`proposeDraftStart`: the place and profile), then started once, as a yes would. One with no project yet
+   * is started in a call, where Driver asks which. `keptId`: a prompt kept for later in a call, no longer kept once started.
    */
-  async tapStart(start: { placeId: string; title: string; profile: string }, message: string, requestId?: string): Promise<Proposal | { error: string }> {
+  async tapStart(target: string, message: string, requestId?: string, keptId?: string): Promise<Proposal | { error: string }> {
+    const start = parseNewThread(target);
+    if (!start) return { error: "That new thread couldn't be read, so nothing was started." };
+    if (!start.placeId) return { error: "Nothing was started: it has no project yet. Start it in a call, and 10 & 2 asks which project." };
     if (!(this.d.places?.() ?? []).some((x) => x.id === start.placeId)) return { error: "That project isn't reachable now (its computer may be asleep), or it's gone, so nothing was started." };
-    const s = this.newThread({ placeId: start.placeId }, start.title, start.profile);
+    const s = this.newThread({ placeId: start.placeId }, start.profile);
     if ("error" in s) return { error: "That new thread can't be started from here. Start it in a call instead." };
     const now = this.now();
     const p: Proposal = {
       id: tapId(requestId), conversationId: TAP, action: "start_work", targets: [],
-      // `target`: the new: id as the phone sent it, so a retry is matched on exactly what was tapped.
-      fields: { placeId: s.place.id, place: s.place.name, title: s.title, profile: s.profile, message, target: newThreadTarget(start) },
-      readback: `start ${s.title}, tapped on the phone`, mustHear: [], createdFrom: 0, expiresAt: now, state: "executing", createdAt: now, result: null,
+      fields: { placeId: s.place.id, place: s.place.name, profile: s.profile, message, target, ...(keptId ? { keptId } : {}) },
+      readback: `start a new thread in ${s.place.name}, tapped on the phone`, mustHear: [], createdFrom: 0, expiresAt: now, state: "executing", createdAt: now, result: null,
     };
     return this.runTap(p, () => this.start(p, false));
   }
@@ -1050,7 +1123,8 @@ export class Proposals {
   /**
    * Starts the proposal's new thread, once: the key is `<proposal>:start`, so a yes after a lost answer launches with the
    * same key and gets the same thread back. The place is checked live first. Once started, the thread is named in the
-   * conversation by its title, counted as messaged there (so `wait_for` takes it), and starred.
+   * conversation as "your new thread in <project>" (or by its title, from before 8 November), counted as messaged there
+   * (so `wait_for` takes it), and starred, so Driver calls back when it replies.
    */
   private async start(p: Proposal, retry: boolean): Promise<ToolResult> {
     // A tap's outcome is read on the phone, not said by Driver.
@@ -1069,15 +1143,17 @@ export class Proposals {
     }
     const prior = this.d.store.operation(key);
     const fresh = this.d.store.beginOperation(p.id, f.placeId!, "start_work", key);
-    const action: Action = { kind: "start_work", placeId: f.placeId!, title: f.title!, message: f.message!, profile: f.profile! };
+    // A start proposed before 8 November keeps its title; any since lets the work system name the thread.
+    const action: Action = { kind: "start_work", placeId: f.placeId!, ...(f.title ? { title: f.title } : {}), message: f.message!, profile: f.profile! };
+    const name = f.title ?? newThreadName(f.place);
     const checked = fresh ? await this.check([action]) : null;
     const r: Receipt = checked ? { ok: false as const, error: checked } : await this.d.adapter.execute(action, key).catch((e) => ({ ok: false as const, error: String(e), unknown: true }));
     if (!r.ok) {
       if (prior?.state === "unknown") r.unknown = true;
       this.d.store.finishOperation(key, r.unknown ? "unknown" : "failed", r.error);
       const result = r.unknown
-        ? tapped ? `Couldn't tell whether ${f.title} was started: the connection dropped. Check ${f.place} before trying again.`
-          : `I couldn't confirm whether ${f.title} was started: the connection dropped. Saying yes again retries it safely.`
+        ? tapped ? `Couldn't tell whether ${name} was started: the connection dropped. Check ${f.place} before trying again.`
+          : `I couldn't confirm whether ${name} was started: the connection dropped. Saying yes again retries it safely.`
         : `Nothing was started. ${f.place} said: ${r.error}`;
       this.d.store.putProposal({ ...p, state: r.unknown ? "unknown" : "failed", result });
       this.d.log?.(`proposal ${p.id} start_work → ${r.unknown ? "unknown" : "failed"}`);
@@ -1085,10 +1161,12 @@ export class Proposals {
     }
     this.d.store.finishOperation(key, "done", null);
     const itemId = r.itemId ?? null;
-    const result = `Started ${f.title} in ${f.place}${itemId ? ", and starred it" : ""}.`;
+    const result = f.title ? `Started ${f.title} in ${f.place}${itemId ? ", and starred it" : ""}.` : `Started ${name}${itemId ? ", and starred it" : ""}.`;
     this.d.store.putProposal({ ...p, state: "executed", result, fields: { ...f, ...(itemId ? { itemId } : {}) } });
     if (itemId) {
-      if (!tapped) this.d.store.alias(p.conversationId, nameKey(f.title!), itemId);
+      // Named in this conversation as Driver called it ("your new thread in driver", "the new thread") until the work
+      // system's name for it is in the briefing.
+      if (!tapped) for (const n of new Set([name, name.replace(/^your /, ""), "new thread", "your new thread"])) this.d.store.alias(p.conversationId, nameKey(n), itemId);
       this.d.store.star(itemId, true);
       await this.d.started?.(itemId).catch((e) => this.d.log?.(`proposal ${p.id}: couldn't list the new thread (${String(e)})`));
     }

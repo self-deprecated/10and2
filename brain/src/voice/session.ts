@@ -1,13 +1,14 @@
 // One GPT-Live session, whatever the transport: runs delegated tools, records transcripts into the
 // conversation, and ends the session on goodbye, silence or a time cap (it bills while open).
 import type { Report } from "../adapter.ts";
-import { headTail, type Briefing, type BriefingView } from "../briefing.ts";
-import { mentionsThread, UTTERANCE, withGroup } from "../handles.ts";
+import { briefedMark, headTail, type Briefing, type BriefingView } from "../briefing.ts";
+import { mentionsThread, tellsAbout, UTTERANCE, withGroup } from "../handles.ts";
 import { agrees, KEPT, READBACK_ALL, spokenWords, trackChange, type ConfirmLevels, type KeepReplies, type ToolResult, type UserTurn } from "../proposals.ts";
 import type { Proposal, Seen, Store } from "../store.ts";
+import { isNewThread } from "../drafts.ts";
 import type { WatchedReplies } from "../updates.ts";
 import type { LiveConn, SessionConfig } from "./live.ts";
-import { asOf, backendInstructions, briefingBlock, frontendInstructions, keptNote, launchNote, type Recent } from "./prompts.ts";
+import { asOf, backendInstructions, briefed, briefingBlock, frontendInstructions, keptNote, launchNote, type Recent } from "./prompts.ts";
 import { namedItems, runTool, seenOf, TOOLS, type ToolDeps, type Watched } from "./tools.ts";
 import { masked, type ReadingStyle } from "../reading.ts";
 import { datedLine, driveBlock, historyLine } from "../drives.ts";
@@ -20,6 +21,8 @@ import { median, type Calls } from "../calls.ts";
 import type { Track } from "../analytics.ts";
 import type { About, CallState, CallView } from "./callview.ts";
 import { asksAbout, asksRecap, CLAIM_OF, claimsIn, isRecap, type Claim } from "./claims.ts";
+import { correctArgs, vocabularyOf } from "../vocabulary.ts";
+import { tokensOf, type RecordSpend } from "../spend.ts";
 
 export { asksToPause, endsWithGoodbye } from "./endPolicy.ts";
 
@@ -46,7 +49,7 @@ export class Conversations {
   lastUserTurn(id: string): UserTurn {
     const buf = this.buffers.get(id);
     // A turn that is only a sound ("[sniff") isn't an answer: the one before it stands.
-    if (buf?.role === "user" && spokenWords(buf.text)) return { text: buf.text, atSpoken: buf.atSpoken };
+    if (buf?.role === "user" && spokenWords(buf.text)) return { text: this.corrected(buf), atSpoken: buf.atSpoken };
     return this.lastUser.get(id) ?? { text: "", atSpoken: 0 };
   }
   /** The assistant's next words begin a new utterance: mark it in what was spoken (not in the stored transcript). */
@@ -67,9 +70,16 @@ export class Conversations {
    */
   flush(id: string) {
     const buf = this.buffers.get(id);
-    if (buf?.role === "user" && spokenWords(buf.text)) this.lastUser.set(id, { text: buf.text, atSpoken: buf.atSpoken });
-    if (buf) this.store.addTurn(id, buf.role, buf.text, buf.at, buf.corrected);
+    if (buf?.role === "user" && spokenWords(buf.text)) this.lastUser.set(id, { text: this.corrected(buf), atSpoken: buf.atSpoken });
+    if (buf) this.store.addTurn(id, buf.role, this.corrected(buf), buf.at, buf.corrected);
     this.buffers.delete(id);
+  }
+  /**
+   * A turn's words as kept: the user's with their vocabulary applied (vocabulary.ts), to the whole turn, since a
+   * mishearing can span transcript deltas ("embar" "go"); Driver's as said.
+   */
+  private corrected(buf: { role: "user" | "assistant"; text: string }): string {
+    return buf.role === "user" ? vocabularyOf(this.store).correct(buf.text) : buf.text;
   }
   /**
    * Driver said `said`, which its record says didn't happen, and corrected it (`note`): the turn is kept as said, and
@@ -102,6 +112,8 @@ export type SessionOptions = {
   speakFirstNew?: boolean;
   /** What a reply Driver words for a thread does (the phone's setting `keepReplies`); absent: "send". */
   keepReplies?: KeepReplies;
+  /** The user's wake word (the phone's setting `wakeWord`); absent: "10 & 2". */
+  wakeWord?: string;
   /** How the user agrees to each kind of change (the phone's setting `confirm`); absent: every change read back and heard. */
   confirm?: ConfirmLevels;
 };
@@ -130,10 +142,16 @@ export type CallbackReply = { handle: string; outcome: string; report: Report; u
 export type ReadOut = { handle: string; heard: "all" | "part" | "none"; parts: number; of: number; text: string; itemId?: string; at?: string };
 /**
  * A reply the user dictated on the phone and heard back there, open as proposal `proposalId` for them to agree to.
- * `newThread`: it's the opening prompt of a thread to start, called `handle`. `keep` (the user's setting
- * `keepReplies`): "ask" whether to send it now or keep it for later; "kept" for later already (the proposal is closed).
+ * `keep` (the user's setting `keepReplies`): "ask" whether to send it now or keep it for later; "kept" for later already
+ * (the proposal is closed). `newThread`: instead, the opening prompt of a thread to start, brought back to the call as
+ * the dictation ended and kept already (`NewThreadOut`), with no proposal yet.
  */
-export type DictatedOut = { handle: string; proposalId: string; readback: string; newThread?: boolean; keep?: "ask" | "kept" };
+export type DictatedOut = { handle: string; proposalId: string | null; readback: string; newThread?: NewThreadOut; keep?: "ask" | "kept" };
+/**
+ * A new thread's dictated prompt, kept as `keptId` (Not sent) until the user says what to do with it: `words` long, for
+ * `place` if they named the project before dictating, else perhaps for a project it names (`suggested`).
+ */
+export type NewThreadOut = { keptId: string; words: number; place: string | null; suggested: string[] };
 /** A reply the user was dictating when they went back to the conversation: saved on the phone, not sent. */
 export type KeptDraft = { handle: string; parts: number };
 export type Opening =
@@ -146,7 +164,7 @@ export type Opening =
    * After the phone read replies out (`read_aloud`, or its own button) or the user dictated: what was heard, what the
    * user then said, any reply they left unsent, and any call-back news.
    */
-  | { kind: "reading"; read: ReadOut[]; said: string; news: CallbackReply[]; kept?: KeptDraft }
+  | { kind: "reading"; read: ReadOut[]; said: string; news: CallbackReply[]; kept?: KeptDraft; held?: number }
   /** After the user dictated a reply on the phone and heard it back (perhaps while replies were read to them): Driver asks to send it. */
   | { kind: "draft"; draft: DictatedOut; read: ReadOut[]; news: CallbackReply[] };
 
@@ -177,6 +195,16 @@ function newsOf(replies: CallbackReply[], name: Name): string {
 }
 
 /** What a session's opening tells the voice model, from its sections (sections.ts); `prompts` overrides editable ones. */
+/** How long a hold was, as the voice model is told it: "less than a minute", "6 minutes", "1 hour and 5 minutes". */
+export function heldFor(seconds: number): string {
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 1) return "less than a minute";
+  const count = (n: number, unit: string) => `${n} ${unit}${n === 1 ? "" : "s"}`;
+  if (minutes < 60) return count(minutes, "minute");
+  const rest = minutes % 60;
+  return rest ? `${count(Math.floor(minutes / 60), "hour")} and ${count(rest, "minute")}` : count(minutes / 60, "hour");
+}
+
 export function openingNote(opening: Opening, changeList: string[], name: Name = (h) => h, prompts: Prompts = {}): string | null {
   const changes = changeList.length ? fill("opening.changes", { changes: changeList.join(" | ") }) : "";
   const meanwhile = (news: CallbackReply[]) =>
@@ -196,10 +224,13 @@ export function openingNote(opening: Opening, changeList: string[], name: Name =
       return fill("opening.callback", { names: names(false), news: newsOf(replies, name), each: replies.length > 1 ? fill("opening.callback.each") : "", names_mid: names(true), changes });
     }
     case "reading": {
-      const { said, news, kept } = opening;
+      const { said, news, kept, held } = opening;
       const then = news.length ? fill("opening.reading.then-news") : "";
+      // Back from a hold: how long, then anything read before it.
+      const hold = held !== undefined ? fill("opening.reading.held", { time: heldFor(held) }) : "";
+      const read = opening.read.length ? readOut(opening.read, name) : !kept && !hold ? fill("opening.reading.nothing") : "";
       return fill("opening.reading", {
-        read: opening.read.length ? readOut(opening.read, name) : !kept ? fill("opening.reading.nothing") : "",
+        read: [hold, read].filter(Boolean).join("\n"),
         meanwhile: meanwhile(news),
         kept: kept ? fill("opening.reading.kept", { name: name(kept.handle), parts: `${kept.parts} ${kept.parts === 1 ? "part" : "parts"}`, name_mid: name(kept.handle, true) }) : "",
         speak: said.trim()
@@ -210,13 +241,24 @@ export function openingNote(opening: Opening, changeList: string[], name: Name =
     }
     case "draft": {
       const { draft, read, news } = opening;
-      const what = draft.newThread ? fill("opening.draft.new-thread", { handle: draft.handle }) : fill("opening.draft.reply", { name: name(draft.handle, true) });
       const heard = read.length ? `${readOut(read, name)}\n` : "";
+      if (typeof draft.newThread === "object") {
+        const t = draft.newThread;
+        const ask = t.place ?? (t.suggested.length === 1 ? t.suggested[0] : null);
+        return fill("opening.draft.new-thread", {
+          read: heard,
+          size: wordsOf(t.words),
+          meanwhile: news.length ? meanwhile(news) + fill("opening.draft.new-thread.news-later") : "",
+          ask: ask ? fill("opening.draft.new-thread.where", { project: ask }) : fill(t.suggested.length ? "opening.draft.new-thread.which-of" : "opening.draft.new-thread.which", { projects: t.suggested.join(" or ") }),
+          changes,
+        });
+      }
+      const what = fill("opening.draft.reply", { name: name(draft.handle, true) });
       if (draft.keep === "kept") return fill("opening.draft.kept", { read: heard, what, meanwhile: meanwhile(news), then: news.length ? fill("opening.reading.then-news") : "", changes });
       return fill(draft.keep === "ask" ? "opening.draft.ask" : "opening.draft", {
         read: heard,
         what,
-        proposal: draft.proposalId,
+        proposal: draft.proposalId ?? "",
         meanwhile: news.length ? meanwhile(news) + fill("opening.draft.news-later") : "",
         readback: draft.readback,
         changes,
@@ -224,6 +266,9 @@ export function openingNote(opening: Opening, changeList: string[], name: Name =
     }
   }
 }
+
+/** How long a dictated prompt is, as the voice model is told it: "about 140 words". */
+const wordsOf = (n: number) => (n < 20 ? `${n} ${n === 1 ? "word" : "words"}` : `about ${Math.round(n / 10) * 10} words`);
 
 /** What the phone read out to the user just now, and how much of each reply they heard. */
 function readOut(read: ReadOut[], name: Name): string {
@@ -243,9 +288,18 @@ export function backendNote(opening: Opening, name: Name = (h) => h): string | n
   if (opening.kind === "new" || opening.kind === "callback" || opening.kind === "reading") return fill("backend-note.spoke-first");
   if (opening.kind !== "draft") return null;
   const { handle, proposalId, readback, newThread, keep } = opening.draft;
-  const what = newThread ? fill("backend-note.draft.new-thread", { handle }) : fill("opening.draft.reply", { name: name(handle, true) });
+  if (typeof newThread === "object") {
+    const t = newThread;
+    return fill("backend-note.draft.new-thread", {
+      size: wordsOf(t.words),
+      kept: t.keptId,
+      project: t.place ? fill("backend-note.draft.new-thread.placed", { place: t.place })
+        : t.suggested.length ? fill("backend-note.draft.new-thread.suggested", { projects: t.suggested.join(" or ") }) : fill("backend-note.draft.new-thread.unplaced"),
+    });
+  }
+  const what = fill("opening.draft.reply", { name: name(handle, true) });
   if (keep === "kept") return fill("backend-note.draft.kept", { what });
-  return fill(keep === "ask" ? "backend-note.draft.ask" : "backend-note.draft", { what, proposal: proposalId, readback });
+  return fill(keep === "ask" ? "backend-note.draft.ask" : "backend-note.draft", { what, proposal: proposalId ?? "", readback });
 }
 
 /** The most report text the backend's prompt is given, about 6,000 tokens; threads past it are listed by name only. */
@@ -301,6 +355,8 @@ export function preload(briefing: Briefing, now: Date): { block: string; key: st
 function keptFor(deps: Pick<ToolDeps, "briefing" | "store">, now: number): string | null {
   const open = new Map(namedItems(deps.briefing).map((n) => [n.id, n]));
   return keptNote(deps.store.keptReplies().flatMap((k) => {
+    // A new thread's prompt, kept: for its project, if it has one yet.
+    if (isNewThread(k.threadId)) return [{ id: k.id, handle: "a new thread", group: k.project || "no project yet", text: k.text, keptAt: k.keptAt }];
     const n = open.get(k.threadId);
     return n ? [{ id: k.id, handle: n.handle, group: n.group, text: k.text, keptAt: k.keptAt }] : [];
   }), now);
@@ -344,15 +400,17 @@ export function buildSessionConfig(opts: SessionOptions, deps: ToolDeps, convers
   const after = opening.kind === "callback" || opening.kind === "reading" || opening.kind === "draft" || opening.kind === "rejoin" || opening.kind === "continue";
   const input = after ? [...turns, ...note, ...said] : history.length || (opening.kind === "new" && !silentNew) ? [...note, ...turns] : undefined;
   const always = [{ type: "session.closed" }, { type: "error" }];
+  // The words the user says, for both models: their speech can come through misheard (vocabulary.ts).
+  const words = vocabularyOf(deps.store).words();
   return {
     model: opts.liveModel,
-    instructions: frontendInstructions(block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL),
+    instructions: frontendInstructions(block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL, opts.wakeWord, words),
     audio: opts.transport === "ws" ? { format: { type: "audio/pcm", rate: 24000 }, output: { voice: opts.voice } } : { output: { voice: opts.voice } },
     delegation: {
       type: "responses",
       responses: {
         model: opts.backendModel,
-        instructions: backendInstructions(block, now, silentNew ? null : backendNote(opening, name), deps.adapter.actions.includes("start_work") ? launchNote(deps.adapter.places?.() ?? [], deps.profiles ?? []) : null, preload(deps.briefing, now).block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL, keptFor(deps, now.getTime())),
+        instructions: backendInstructions(block, now, silentNew ? null : backendNote(opening, name), deps.adapter.actions.includes("start_work") ? launchNote(deps.adapter.places?.() ?? [], deps.profiles ?? []) : null, preload(deps.briefing, now).block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL, keptFor(deps, now.getTime()), words),
         tools: TOOLS.map((t) => ({ type: "function", strict: true, ...t })),
         // Never "required": it would loop on the answering response.
         tool_choice: "auto",
@@ -484,8 +542,12 @@ export class VoiceSession {
     fast?: boolean;
     /** What a reply Driver words for a thread does (the phone's setting `keepReplies`); absent: "send". */
     keepReplies?: KeepReplies;
+    /** The user's wake word, which the phrase checks take off the front of what they say; absent: "10 & 2". */
+    wakeWord?: string;
     /** How the user agrees to each kind of change (the phone's setting `confirm`); absent: every change read back and heard. */
     confirm?: ConfirmLevels;
+    /** The phone brings a new thread's dictated prompt back to the call (`newThreads` "talk"): `dictate` needs no project. */
+    promptsBack?: boolean;
     /**
      * The backend's instructions built afresh from the briefing: when given, a briefing refresh that changes the threads'
      * replies (`preload`) brings the backend up to date mid-session.
@@ -518,6 +580,12 @@ export class VoiceSession {
      */
     usage?: (seconds: number) => { out: boolean } | Promise<{ out: boolean }>;
     /**
+     * Records what the session costs (spend.ts): its billed seconds on `liveModel`, and each backend response's tokens.
+     * Never what was said.
+     */
+    spent?: RecordSpend;
+    liveModel?: string;
+    /**
      * A hard cap on this session (the cloud's anonymous demo drive, 2 minutes): `CAP_WRAP_MS` before it Driver is told to
      * say the demo is over and goodbye, and at it the session is ended and hung up, whatever is going on.
      */
@@ -532,7 +600,11 @@ export class VoiceSession {
   private preloadKey: string;
   private stopRefresh?: () => void;
   /** Things to mark heard once the assistant names their thread, counted from when they were expected. */
-  private expected: { handle: string; from: number; said: () => void; itemId?: string }[] = [];
+  /**
+   * `summary`: the thread's summary (its project named), which marks only that (`markBriefed`), never its reply heard,
+   * and only once Driver tells something about it (`tellsAbout`), not just names it.
+   */
+  private expected: { handle: string; from: number; said: () => void; itemId?: string; summary?: { group: string } }[] = [];
   /** Named, but heard only once the user speaks after it or the session ends deliberately. */
   private told: { said: () => void; itemId?: string }[] = [];
   /**
@@ -599,12 +671,18 @@ export class VoiceSession {
     this.deps = deps;
     this.clock = deps.clock ?? realClock;
     // A session taken back after a restart keeps its cap from when it began (`startedAt`).
-    this.endState = { ...initialEndState(this.clock.now(), deps.said), ...(deps.startedAt !== undefined ? { startedAt: deps.startedAt } : {}) };
+    this.endState = { ...initialEndState(this.clock.now(), deps.said, deps.wakeWord), ...(deps.startedAt !== undefined ? { startedAt: deps.startedAt } : {}) };
     this.done = new Promise((r) => (this.finish = r));
     deps.store.touchConversation(ids.conversationId);
     deps.store.startSession(ids.sessionId, ids.conversationId, this.clock.now(), deps.fast);
     for (const n of deps.news ?? []) this.expect(n.handle, n.said, n.itemId);
     ({ threads: this.preloaded, key: this.preloadKey } = preload(deps.briefing, new Date(this.clock.now())));
+    // What the briefing gives the models to tell (`briefingBlock`): each thread's summary is heard once Driver names it,
+    // so the next call's briefing goes on from there.
+    for (const c of briefed(deps.briefing.view(), this.clock.now()).shown) {
+      const mark = briefedMark(c);
+      this.expect(c.handle, () => deps.store.markBriefed(c.itemId, mark), undefined, c.group);
+    }
     // A reply the opening tells (a call-back's news, a reply the phone just read out) is where watching it begins: on
     // 7 November a call-back's reply, newer than the briefing's, was told again 24 s in as if it had just come.
     for (const o of [...(deps.news ?? []), ...(deps.read ?? [])]) if (o.itemId && o.at) this.opened.set(o.itemId, o.at);
@@ -623,8 +701,8 @@ export class VoiceSession {
    * Runs `said` once the assistant has named `handle` from now on and the user could hear it: they spoke afterwards, or
    * the session ended deliberately (`deliberate`). A call that drops right after the name leaves it untold, to be told again.
    */
-  expect(handle: string, said: () => void, itemId?: string) {
-    this.expected.push({ handle, from: this.deps.conversations.spoken(this.ids.conversationId).length, said, ...(itemId ? { itemId } : {}) });
+  expect(handle: string, said: () => void, itemId?: string, summaryIn?: string) {
+    this.expected.push({ handle, from: this.deps.conversations.spoken(this.ids.conversationId).length, said, ...(itemId ? { itemId } : {}), ...(summaryIn !== undefined ? { summary: { group: summaryIn } } : {}) });
   }
 
   /** The replies this session's opening tells, by thread: when each finished (see the constructor). */
@@ -778,7 +856,7 @@ export class VoiceSession {
   private answeredFromPrompt(text: string) {
     const names = [...namedItems(this.deps.briefing), ...namedItems(this.deps.briefing, true)].map((n) => n.handle);
     const named = this.preloaded.filter((p) => mentionsThread(text, p.handle, names));
-    if (named.length !== 1 || named[0].running || this.expected.some((e) => e.handle === named[0].handle)) return;
+    if (named.length !== 1 || named[0].running || this.expected.some((e) => e.handle === named[0].handle && !e.summary)) return;
     const { handle, itemId, seen } = named[0];
     this.expect(handle, () => this.deps.store.markSeen(itemId, seen, this.ids.conversationId));
   }
@@ -807,7 +885,7 @@ export class VoiceSession {
   }
 
   private advance(input: EndInput) {
-    const result = step(this.endState, input, this.clock.now());
+    const result = step(this.endState, input, this.clock.now(), (said) => vocabularyOf(this.deps.store).correct(said));
     this.endState = result.state;
     if (result.log !== undefined) this.log(result.log);
     if (result.stalledMs !== undefined) {
@@ -843,7 +921,9 @@ export class VoiceSession {
 
   /** OpenAI counted `seconds` for this session so far: the meter debits them, and a call out of credits says goodbye. */
   private counted(seconds: unknown) {
-    if (typeof seconds !== "number" || !Number.isFinite(seconds) || !this.deps.usage) return;
+    if (typeof seconds !== "number" || !Number.isFinite(seconds)) return;
+    this.deps.spent?.({ op: "call", model: this.deps.liveModel ?? "unknown", sessionId: this.ids.sessionId, seconds: Math.max(this.billed, seconds) });
+    if (!this.deps.usage) return;
     this.billed = Math.max(this.billed, seconds);
     const billed = this.billed;
     // Synchronous in the user's own brain; a demo world asks the user's brain, so its answer comes later.
@@ -954,7 +1034,7 @@ export class VoiceSession {
           const names = [...namedItems(this.deps.briefing), ...namedItems(this.deps.briefing, true)].map((n) => n.handle);
           // Sentence by sentence: "Agent Reel Dashboard passed. Agent Reel failed." names each once.
           const told = (e: (typeof this.expected)[number]) =>
-            done.length > e.from && done.slice(e.from).split(/(?<=[.?!])/).some((sentence) => mentionsThread(sentence, e.handle, names));
+            done.length > e.from && done.slice(e.from).split(/(?<=[.?!])/).some((sentence) => e.summary ? tellsAbout(sentence, e.handle, e.summary.group, names) : mentionsThread(sentence, e.handle, names));
           this.expected = this.expected.filter((e) => !(told(e) && (this.told.push({ said: e.said, itemId: e.itemId }), true)));
         }
         break;
@@ -1006,6 +1086,11 @@ export class VoiceSession {
 
   private async onResponseEvent(inner: any) {
     const type = inner?.type;
+    // Each backend response's tokens, however it ended and whether or not the call is closing: they're billed.
+    const response = inner?.response;
+    if (response?.usage && /^response\.(completed|failed|incomplete|cancelled)$/.test(type)) {
+      this.deps.spent?.({ op: "backend", model: String(response.model ?? "unknown"), tier: response.service_tier, sessionId: this.ids.sessionId, ...tokensOf(response.usage) });
+    }
     // Hanging up (Stop, goodbye, a wait) ends the backend's work: no tool runs after that, nothing is continued.
     if (this.endState.closing) {
       this.pending.clear();
@@ -1064,7 +1149,8 @@ export class VoiceSession {
         this.handled.add(callId);
         let args: unknown = {};
         try {
-          args = JSON.parse(call.args || "{}");
+          // "Start a thread in the embar go repo" reaches the tool as "embargo": the user's vocabulary, in every argument.
+          args = correctArgs(JSON.parse(call.args || "{}"), vocabularyOf(this.deps.store));
         } catch {}
         const toolStart = this.clock.now();
         // What a proposal, or the stars, were before the call: only what it changed is counted (`toolCalled`).
@@ -1077,7 +1163,7 @@ export class VoiceSession {
         const result = await runTool(call.name, args, {
             conversationId: this.ids.conversationId,
             memory: this.deps.memory ?? true,
-            whenSaid: (handle, said) => this.expect(handle, said),
+            whenSaid: (handle, said, summaryIn) => this.expect(handle, said, undefined, summaryIn),
             readingStyle: this.deps.readingStyle,
             readingVoice: this.deps.readingVoice,
             requestEnd: (reason) => this.advance({ type: "tool_requested_end", reason }),
@@ -1087,6 +1173,7 @@ export class VoiceSession {
             keepReplies: this.deps.keepReplies,
             confirm: this.deps.confirm,
             awaitingDraft: () => this.deps.opening === "draft" && this.endState.userWords.trim() === "",
+            promptsBack: this.deps.promptsBack,
             about: (threads) => about.push(...threads),
             flag: (note) => this.flagFromTool(note),
           }, this.deps).catch(
@@ -1099,7 +1186,7 @@ export class VoiceSession {
         this.counts.toolCalls++;
         this.roundTools++;
         this.toolCalled(call.name, args, result, threw, this.clock.now() - toolStart, before);
-        this.log(`${call.name}(${call.args}) ${this.since()} → ${JSON.stringify(result).slice(0, 200)}`);
+        this.log(`${call.name}(${JSON.stringify(args)}) ${this.since()} → ${JSON.stringify(result).slice(0, 200)}`);
         this.deps.record?.({ type: "tool", callId, name: call.name, args, result });
         try {
           this.deps.view?.tool(call.name, args, result, about);
@@ -1118,6 +1205,8 @@ export class VoiceSession {
       }
       this.freshUtterance = true;
       this.conn.send({ type: "response.create" });
+      // A hand-off hangs up here, with its result answered (unanswered, OpenAI takes 9 s to close).
+      this.advance({ type: "tool_answered" });
     } finally {
       this.toolsRunning--;
       this.advance({ type: "activity" });
@@ -1130,7 +1219,7 @@ export class VoiceSession {
    * that asks anything (not "mm-hmm" over Driver) is where the claim check counts what Driver did from.
    */
   private endUserTurn() {
-    const said = this.userSaid;
+    const said = vocabularyOf(this.deps.store).correct(this.userSaid);
     this.userSaid = "";
     // Only a turn with words in it changes what the user last asked; "debug this" alone (no goodbye) never ends the call.
     if (spokenWords(said)) this.onlyFlagged = asksToFlag(spokenWords(said)) && !endsWithGoodbye(said);

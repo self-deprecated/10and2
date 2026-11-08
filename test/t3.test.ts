@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer, type WebSocket } from "ws";
-import { answersFor, mapStatus, snoozedUntil, T3Adapter, toCommand, toLaunch, worktreeStart, type ShellThread } from "../src/t3/adapter.ts";
+import { answersFor, mapStatus, snoozedUntil, T3Adapter, titleFrom, toCommand, toLaunch, worktreeStart, type ShellThread } from "../src/t3/adapter.ts";
 import type { LaunchProfile } from "../src/contract.ts";
 import { ConnectionError, RpcClient, RpcError } from "../src/t3/rpc.ts";
 
@@ -292,6 +292,13 @@ test("a launch is built in code: the profile's modes, a worktree of the policy's
   assert.equal(plan.interactionMode, "plan");
   assert.throws(() => toCommand(start, "k"), "start_work never goes through dispatchCommand");
   assert.deepEqual((toLaunch(start, "k", {}, null) as any).workspaceStrategy, { type: "root" }, "a folder that isn't a repository runs in itself");
+});
+
+test("a launch with no title has T3 name the thread from its message, with a seed from it until then", () => {
+  const message = "(Dictated by voice in Driver and transcribed on my phone.)\n\nAdd gift cards to checkout, with a balance page and tests for every edge case.";
+  const launch = toLaunch({ kind: "start_work", placeId: "p1", message, profile: build }, "P-2:start", {}) as any;
+  assert.deepEqual([launch.title, launch.generateTitle, launch.initialMessage.text], ["Add gift cards to checkout, with a balance page…", true, message]);
+  assert.equal(titleFrom("Fix the login."), "Fix the login");
 });
 
 test("a new worktree starts from the policy's branch where the repository has it, HEAD where it doesn't, and nowhere outside a repository", async (t) => {

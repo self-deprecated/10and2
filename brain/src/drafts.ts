@@ -1,6 +1,7 @@
 // A reply the user dictated on the phone, in their own words, sent as they said it. The phone records and transcribes
 // it, keeps it until it's sent, and reads it back to the user; the brain only puts the parts together, with which
 // paragraph of the reply each one answers, and sends it through the usual proposal and its heard gate.
+import { randomUUID } from "node:crypto";
 import type { Segment } from "./reading.ts";
 import type { Proposal, Store } from "./store.ts";
 
@@ -12,22 +13,55 @@ export type DraftPart = { text: string; readingId: string | null; paragraph: num
 export type Draft = { id: string; itemId: string; parts: DraftPart[] };
 
 /**
- * A draft for a thread not started yet (`dictate` with a project): where to start it, its title and profile, carried as
- * the draft's target ("new:…"), so the phone keeps and sends it like any other. Everything in it is checked again when
- * it's proposed, as a start said aloud is.
+ * A draft for a thread not started yet (`dictate` with no thread): maybe where to start it (`placeId`, when the user
+ * named the project before dictating) and a launch profile they asked for, carried as the draft's target ("new:…"), so
+ * the phone keeps and sends it like any other. The work system names the thread. Everything in it is checked again when
+ * it's proposed, as a start said aloud is; with no place, Driver asks which project after the dictation.
  */
-export type NewThread = { placeId: string; title: string; profile: string };
+export type NewThread = { placeId: string | null; profile: string | null };
 
-export const newThreadTarget = (t: NewThread) => `new:${Buffer.from(JSON.stringify([t.placeId, t.title, t.profile])).toString("base64url")}`;
+/**
+ * `new:` and, base64url, `{"n": <a fresh id, so two prompts never share a draft>, "p": place, "f": profile}`. Phones in
+ * TestFlight before 8 November keep `[placeId, title, profile]` instead: still read, the title ignored. That shape can go
+ * once every tester's build is from 8 November or later (voice-new-thread.md).
+ */
+export const newThreadTarget = (t: NewThread, id = randomUUID().slice(0, 8)) =>
+  `new:${Buffer.from(JSON.stringify({ n: id, ...(t.placeId ? { p: t.placeId } : {}), ...(t.profile ? { f: t.profile } : {}) })).toString("base64url")}`;
+
+export const isNewThread = (itemId: string) => itemId.startsWith("new:");
 
 export function parseNewThread(itemId: string): NewThread | null {
-  if (!itemId.startsWith("new:")) return null;
+  if (!isNewThread(itemId)) return null;
+  const given = (v: unknown) => (typeof v === "string" && v ? v : null);
   try {
-    const [placeId, title, profile] = JSON.parse(Buffer.from(itemId.slice(4), "base64url").toString("utf8"));
-    return [placeId, title, profile].every((v) => typeof v === "string" && v) ? { placeId, title, profile } : null;
+    const t = JSON.parse(Buffer.from(itemId.slice(4), "base64url").toString("utf8"));
+    if (Array.isArray(t)) {
+      const [placeId, title, profile] = t;
+      return [placeId, title, profile].every((v) => typeof v === "string" && v) ? { placeId, profile } : null;
+    }
+    return t && typeof t === "object" && given(t.n) ? { placeId: given(t.p), profile: given(t.f) } : null;
   } catch {
     return null;
   }
+}
+
+/**
+ * What a new thread is called until the work system has named it: "your new thread in driver". The voice and the
+ * receipts say it; T3 Code and Claude Code name the thread from its first prompt.
+ */
+export const newThreadName = (place: string | null | undefined) => (place ? `your new thread in ${place}` : "your new thread");
+
+/** Words as compared for a project's name: "screen-gate" is "screen gate". */
+const plainWords = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+
+/**
+ * Projects a dictated prompt names in passing ("…in the driver repo…"), by name without the machine: Driver offers to
+ * start it there, for the user to confirm. At most three.
+ */
+export function mentionedPlaces(text: string, places: { name: string }[]): string[] {
+  const said = ` ${plainWords(text)} `;
+  const projects = [...new Set(places.map((p) => p.name.replace(/, on [\w-]+$/, "")))];
+  return projects.filter((p) => plainWords(p) && said.includes(` ${plainWords(p)} `)).slice(0, 3);
 }
 
 /** The longest dictated reply: about half an hour of speech. */

@@ -5,7 +5,8 @@ import { loadConfig } from "./config.ts";
 import { Store } from "./store.ts";
 import { RemoteAdapter } from "./connectors.ts";
 import { Machines } from "./machines.ts";
-import { makeLlm } from "./llm.ts";
+import { makeLlm, type Llm, type Used } from "./llm.ts";
+import { COST_DAYS, dayOf, recorder, type Op } from "./spend.ts";
 import { syncVisits } from "./reads.ts";
 import { modelRewriter } from "./reading.ts";
 import { openAiSpeech, Speech } from "./voice/speech.ts";
@@ -45,6 +46,12 @@ store.recoverExecutingProposals();
 const hangups = new Hangups({ store, hangup: (id) => hangup(cfg.apiKey, id), log, track: analytics.track });
 hangups.resume();
 const llm = makeLlm(cfg.apiKey);
+// What every model call costs (spend.ts), in the store beside everything else: all of it on Jordan's own key.
+const spent = recorder(store, log);
+const spending = (op: Op): Llm => {
+  const used = (u: Used) => spent({ op, ...u });
+  return { json: (call, name, schema) => llm.json({ ...call, spent: used }, name, schema), text: (call) => llm.text({ ...call, spent: used }) };
+};
 const state = dirname(cfg.db);
 // The brain's files (recordings, read-aloud audio, flags, the phone's logs), next to the database.
 const files = dirFiles(state);
@@ -52,9 +59,9 @@ const files = dirFiles(state);
 // expire even with recording turned off.
 const recordings = new Recordings(files, { days: cfg.recordingDays, maxMb: cfg.recordingsMaxMb, log });
 // Replies read aloud: their audio next to the database, and their prepared text for a month.
-const speech = new Speech(files, { synthesize: openAiSpeech(cfg.apiKey, cfg.ttsModel), model: cfg.ttsModel, days: cfg.speechDays, maxMb: cfg.speechMaxMb, log });
+const speech = new Speech(files, { synthesize: openAiSpeech(cfg.apiKey, cfg.ttsModel, (u) => spent({ op: "speech", model: cfg.ttsModel, ...u })), model: cfg.ttsModel, days: cfg.speechDays, maxMb: cfg.speechMaxMb, log });
 // Old recordings and audio go now and every hour, whatever else the brain is doing.
-const prune = () => void Promise.all([recordings.prune(), speech.prune()]);
+const prune = () => void Promise.all([recordings.prune(), speech.prune(), Promise.resolve().then(() => store.pruneCosts(dayOf(Date.now() - COST_DAYS * 86_400_000)))]);
 prune();
 setInterval(prune, 3600_000).unref();
 /** What the real brain and every demo world have in common. */
@@ -62,8 +69,9 @@ const common = {
   log, speech, files, openSocket: nodeSocket, brainRev: rev, profiles: cfg.launchProfiles, recordings: cfg.recordSessions ? recordings : undefined, analytics,
   // The one consent (contracts §5), taken by the server from each request as it arrives; in memory on Lattice.
   consent: analytics.consent,
-  rewrite: modelRewriter(llm, cfg.rewriteModel), rewriteChunkChars: cfg.rewriteChunkChars, leadInColdHours: cfg.leadInColdHours,
-  writeBriefing: modelBriefingWriter(llm, cfg.openerModel),
+  rewrite: modelRewriter(spending("rewriter"), cfg.rewriteModel), rewriteChunkChars: cfg.rewriteChunkChars, leadInColdHours: cfg.leadInColdHours,
+  writeBriefing: modelBriefingWriter(spending("briefing_writer"), cfg.openerModel),
+  spent,
 };
 // A moment flagged in a call ("debug this"), for agents to review: next to the database, pointing at the recordings.
 const flagsIn = (dir: string, s: Store) => new Flags(files, { store: s, log, dir });
@@ -76,7 +84,7 @@ if (cfg.demo !== "off") {
   const demoAnalytics = tagged(analytics, { mode: "demo" });
   const demoHangups = new Hangups({ store: new Store(join(state, "demo-sessions.db")), hangup: (id) => hangup(cfg.apiKey, id), log: (m) => log(`demo: ${m}`), track: demoAnalytics.track });
   demoHangups.resume();
-  const write = demoWriter(llm, cfg.rewriteModel);
+  const write = demoWriter(spending("demo_writer"), cfg.rewriteModel);
   demo = () => demoWorld({ ...common, analytics: demoAnalytics, hangups: demoHangups, write, flags: (s) => flagsIn("demo-flags", s) });
 }
 
@@ -91,7 +99,7 @@ if (cfg.demo === "only") {
   const connectors = cfg.connectors.map((c) => ({ ...c, adapter: new RemoteAdapter(c.name) }));
   const adapter = new Machines(connectors.map((c) => ({ ...c, said: c.local ? spokenHost() : undefined })), log);
   const { briefing, conversations, proposals, waits } = wire({
-    adapter, store, classify: modelClassifier(llm, cfg.classifyModel), writeOpener: modelOpener(llm, cfg.openerModel), profiles: cfg.launchProfiles, log,
+    adapter, store, classify: modelClassifier(spending("classifier"), cfg.classifyModel), writeOpener: modelOpener(spending("opener"), cfg.openerModel), profiles: cfg.launchProfiles, log,
     track: analytics.track,
   });
   adapter.watch((ids, urgent) => briefing.onChange(ids, urgent));

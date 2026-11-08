@@ -4,22 +4,46 @@
 import type { Config } from "./config.ts";
 import { PLACEHOLDER, PROMPT_SECTIONS, templateOf, type Prompts } from "./voice/sections.ts";
 import { BACKEND_MODELS, LIVE_MODELS } from "./models.ts";
-import { CONVERSATION_VOICES } from "./voice/voices.ts";
+import { CONVERSATION_VOICES, VOICE_SAMPLE_TEXT } from "./voice/voices.ts";
 import { FORBIDDEN } from "./user-text.ts";
 
 /**
  * The eval suite a pass was measured with: part of the template hash, so a pass from an older suite doesn't count for
  * this one. Raise it whenever the scenarios in eval/run.ts, or how they're judged, change.
  */
-export const EVAL_SUITE_VERSION = 1;
+export const EVAL_SUITE_VERSION = 2;
 
 /** Free seconds a day (UTC) for each allowance label (Clerk `public_metadata.driver.allowance`): testers, and the stage account. */
 export const ALLOWANCES = { tester: 600, presenter: 3 * 3600 } as const;
 export type AllowanceLabel = keyof typeof ALLOWANCES;
 export const isAllowance = (label: unknown): label is AllowanceLabel => typeof label === "string" && Object.hasOwn(ALLOWANCES, label);
 
-/** Once per account, when its brain first opens. */
-export const WELCOME_SECONDS = 600;
+/**
+ * How fast things use minutes, and how many there are (docs/launch/plans.md; Jordan, 8 November). The ledger counts
+ * seconds; these say how many seconds each thing takes. A call takes the rates it started with to its end.
+ */
+export const MINUTES = {
+  /** Talking in fast mode uses minutes this many percent as fast. */
+  fastPercent: 150,
+  /** A reading's audio in 10 & 2's voice uses one second per this many characters (about a third of a minute a minute). */
+  readingCharsPerSecond: 45,
+  /** Each pick-up (a call, a call-back, back from Hold) uses at least this many seconds: the provider's minimum. */
+  pickupSeconds: 15,
+  /** The trial: this many free seconds a day (UTC)… */
+  trialDailySeconds: 600,
+  /** …on up to this many different days. */
+  trialDays: 3,
+  /** The subscription's minutes each week, from Monday 00:00 UTC. */
+  weeklySeconds: 35 * 60,
+} as const;
+export type Minutes = { -readonly [K in keyof typeof MINUTES]: number };
+
+/**
+ * The most an account's background work (spend.ts `BACKGROUND`: the briefing's classifier, opener and writer, and
+ * rewrites) may cost Driver in a UTC day, in cents. Past it, that work waits for the next day: the briefing is put
+ * together from the cards, as at zero minutes (cloud/src/costs.ts). Provisional until measured (cost-tracking.md).
+ */
+export const BACKGROUND_CENTS_PER_DAY = 25;
 
 /**
  * The longest a session may be set to run before it rolls over: with `ROLL_LATE` it still ends before a deferred code
@@ -40,9 +64,13 @@ export type Settings = {
   backendModel: string;
   /** The conversation voice, unless the phone chose one. */
   voice: string;
-  /** Minutes credited once, when an account's brain first opens. */
-  welcomeSeconds: number;
+  /** What every reading voice's sample says (`GET /api/voices/sample`); a change makes each sample again, once. */
+  sampleText: string;
+  /** How fast things use minutes, the trial and the subscription's weekly minutes (`MINUTES`). */
+  minutes: Minutes;
   allowances: Record<AllowanceLabel, number>;
+  /** The background work's daily ceiling per account, in cents (`BACKGROUND_CENTS_PER_DAY`). */
+  backgroundCentsPerDay: number;
   /** Overrides of the prompts' editable sections (voice/sections.ts). */
   prompts: Prompts;
   /** A line the app shows once (by its text's id), or none. Phone settings come from `current` only (§4.4). */
@@ -63,8 +91,10 @@ export function defaults(cfg: Pick<Config, "idleMs" | "maxSessionMs" | "liveMode
     liveModel: cfg.liveModel,
     backendModel: cfg.backendModel,
     voice: cfg.voice,
-    welcomeSeconds: WELCOME_SECONDS,
+    sampleText: VOICE_SAMPLE_TEXT,
+    minutes: { ...MINUTES },
     allowances: { ...ALLOWANCES },
+    backgroundCentsPerDay: BACKGROUND_CENTS_PER_DAY,
     prompts: {},
     banner: null,
     minBuild: { ios: null },
@@ -80,6 +110,8 @@ export const gitSettings = () => defaults({ idleMs: 90_000, maxSessionMs: 15 * 6
 
 /** At most this long, in characters. */
 export const BANNER_MAX = 140;
+/** A voice sample's words: long enough to judge a voice by, short enough to make for nothing. */
+export const SAMPLE_TEXT_MAX = 300;
 /** A banner's id, from its text: the same text is shown once, edited text again (FNV-1a, so it's the same everywhere). */
 export function bannerId(text: string): string {
   let h = 0x811c9dc5;
@@ -111,6 +143,14 @@ const banner: Check = (v) => {
   if (text.length > BANNER_MAX) return `is longer than ${BANNER_MAX} characters`;
   if (/[\u0000-\u001f<>]/.test(text)) return "must be one line of plain text";
   if (FORBIDDEN.test(text)) return "names the AI provider or a model, which users never read (say \"AI\" or \"the voice model\")";
+  return null;
+};
+
+const sampleText: Check = (v) => {
+  if (typeof v !== "string" || v.trim().length < 20) return "must be a sentence or two";
+  if (v.length > SAMPLE_TEXT_MAX) return `is longer than ${SAMPLE_TEXT_MAX} characters`;
+  if (/[\u0000-\u001f<>]/.test(v)) return "must be one line of plain text";
+  if (FORBIDDEN.test(v)) return "names the AI provider or a model, which users never hear (say \"AI\" or \"the voice model\")";
   return null;
 };
 
@@ -148,8 +188,13 @@ export const SETTINGS: Record<string, { label: string; check: Check; gated?: boo
   maxMinutes: { label: "Minutes before a session rolls over into the next", check: int(5, MAX_MINUTES_CAP) },
   liveNotices: { label: "Tell starred threads' replies during a call", check: bool },
   voice: { label: "Conversation voice, unless the phone chose one", check: oneOf(CONVERSATION_VOICES) },
-  welcomeSeconds: { label: "Welcome credit, once per account, for accounts opened from now on (seconds)", check: int(0, 3600) },
+  sampleText: { label: "What each reading voice's sample says", check: sampleText },
+  minutes: {
+    label: "How fast minutes are used, the trial and the subscription",
+    check: fields({ fastPercent: int(100, 400), readingCharsPerSecond: int(10, 200), pickupSeconds: int(0, 60), trialDailySeconds: int(0, 3600), trialDays: int(0, 14), weeklySeconds: int(0, 36_000) }),
+  },
   allowances: { label: "Free seconds each UTC day, by account label", check: fields({ tester: int(0, 3600), presenter: int(0, 14_400) }) },
+  backgroundCentsPerDay: { label: "Background work (briefing, rewrites) each account may cost us a UTC day (cents)", check: int(0, 500) },
   banner: { label: "Banner in the app, shown once", check: banner },
   minBuild: { label: "Oldest iOS build that may start a new call", check: fields({ ios: (v) => (v === null || (typeof v === "string" && /^\d{12}$/.test(v)) ? null : "must be a 12-digit build or none") }) },
   liveModel: { label: "Voice model", check: oneOf(LIVE_MODELS), gated: true },
@@ -213,7 +258,7 @@ export const NOBODY: Who = { tester: false, staff: false };
 
 const inAudience = (audience: Audience | null | undefined, who: Who) => (audience === "testers" && who.tester) || (audience === "staff" && who.staff);
 
-/** Git's settings with a version's overrides on top: objects (`allowances`, `minBuild`) key by key; prompts replace. */
+/** Git's settings with a version's overrides on top: objects (`minutes`, `allowances`, `minBuild`) key by key; prompts replace. */
 export function apply(base: Settings, overrides: Overrides, version: number | null): Settings {
   const out: Record<string, unknown> = { ...base, version };
   for (const [k, v] of Object.entries(overrides)) {

@@ -82,7 +82,7 @@ const DONE_AS: Record<string, string> = { follow_up: "sent", start_work: "starte
 export function historyLine(p: Proposal): string {
   const names = p.targets.map((t) => `“${t.handle}”`).join(", ");
   const what = p.action === "follow_up" ? `reply to ${names}`
-    : p.action === "start_work" ? `new thread “${p.fields.title ?? ""}” in ${p.fields.place ?? "a project"}`
+    : p.action === "start_work" ? (p.fields.title ? `new thread “${p.fields.title}” in ${p.fields.place ?? "a project"}` : `new thread in ${p.fields.place ?? "a project"}`)
     : p.action === "settle_subagents" ? `${p.targets.length} finished subagent threads`
     : p.action === "snooze" && p.fields.until ? `${names} until ${spokenDate(new Date(p.fields.until), p.createdAt).text}`
     : names;

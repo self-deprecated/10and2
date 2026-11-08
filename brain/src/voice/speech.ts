@@ -5,6 +5,8 @@ import { createHash } from "node:crypto";
 import OpenAI from "openai";
 import type { Files } from "../files.ts";
 import { describe, limiter } from "../util.ts";
+import { retryCounter } from "../llm.ts";
+import { aacSeconds } from "../spend.ts";
 
 
 /** How it's read. Never thread text: the reply goes only in `input`, so nothing in it can steer the voice. */
@@ -13,12 +15,28 @@ const INSTRUCTIONS = "Read this aloud clearly and naturally, at a calm, steady p
 /** Turns text into AAC audio; tests swap in a fake. */
 export type Synthesize = (text: string, voice: string) => Promise<Buffer>;
 
-export function openAiSpeech(apiKey: string, model: string): Synthesize {
-  // One retry at most: a retried request is billed again.
-  const client = new OpenAI({ apiKey, maxRetries: 1, timeout: 60_000 });
+/** What one synthesis made: characters spoken, seconds of audio (measured from it), retries. */
+export type SpeechUsed = { chars: number; seconds: number | undefined; retries: number };
+
+/** `spent`: given what each synthesis made, once it's made (spend.ts records it). */
+export function openAiSpeech(apiKey: string, model: string, spent?: (u: SpeechUsed) => void): Synthesize {
+  // One retry at most: a retried request is billed again. Each is counted.
+  const counter = retryCounter();
+  const client = new OpenAI({ apiKey, maxRetries: 1, timeout: 60_000, fetch: counter.fetch });
   return async (text, voice) => {
-    const res = await client.audio.speech.create({ model, voice, input: text, instructions: INSTRUCTIONS, response_format: "aac" });
-    return Buffer.from(await res.arrayBuffer());
+    const tag = counter.tag();
+    try {
+      const res = await client.audio.speech.create({ model, voice, input: text, instructions: INSTRUCTIONS, response_format: "aac" }, { headers: tag.headers });
+      const audio = Buffer.from(await res.arrayBuffer());
+      try {
+        spent?.({ chars: text.length, seconds: aacSeconds(audio) ?? undefined, retries: tag.retries() });
+      } catch {
+        // Recording never fails the speech.
+      }
+      return audio;
+    } finally {
+      tag.done();
+    }
   };
 }
 

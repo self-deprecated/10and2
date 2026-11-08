@@ -127,7 +127,28 @@ export class Waits {
     this.log(`wait ${conversationId}: waiting for ${watched.map((i) => i.handle).join(", ")}`);
     this.track("wait_started", { conversation_id: conversationId, threads: watched.length, patient: watched.some((i) => i.patient), via: w.auto ? "goodbye" : "wait_for" });
     this.poll();
+    this.notify();
     return w;
+  }
+
+  /**
+   * A phone on hold with nothing watched: returns once a wait starts for the conversation (a call-back armed), or after
+   * `ms` with none.
+   */
+  async started(conversationId: string, ms: number): Promise<Wait | null> {
+    if (!this.waits.has(conversationId) && ms > 0) {
+      await new Promise<void>((resolve) => {
+        const finish = () => {
+          this.clock.clear(timer);
+          this.listeners.delete(check);
+          resolve();
+        };
+        const check = () => this.waits.has(conversationId) && finish();
+        const timer = this.clock.setTimeout(finish, ms);
+        this.listeners.add(check);
+      });
+    }
+    return this.get(conversationId);
   }
 
   get(conversationId: string): Wait | null {

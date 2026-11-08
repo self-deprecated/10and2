@@ -117,7 +117,7 @@ export async function timeline(deps: ReadDeps, q: TimelineQuery): Promise<{ item
       const target = p.targets[0];
       // A new thread started with a tap is listed as "start", with the thread once it's known (its id null until then).
       const started = p.action === "start_work";
-      const was = { handle: p.fields.title ?? "", group: p.fields.place ?? "" };
+      const was = { handle: p.fields.title ?? "New thread", group: p.fields.place ?? "" };
       const thread: TapThread | null = started ? (p.fields.itemId ? threadOf(p.fields.itemId, was) : { id: null, name: was.handle, project: was.group }) : target ? threadOf(target.itemId, target) : null;
       if (!thread || !wanted(thread)) continue;
       // A reply sent with a tap is listed as "reply", and a start as "start", each with its first words.

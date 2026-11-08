@@ -69,9 +69,23 @@ export type Action =
   | { kind: "unsnooze"; itemId: string }
   | { kind: "unsettle"; itemId: string }
   | { kind: "archive"; itemId: string }
-  | { kind: "start_work"; placeId: string; title: string; message: string; profile: LaunchProfile };
+  /** No `title`: the work system names the thread from its prompt (T3 Code's `generateTitle`; Claude Code by itself). */
+  | { kind: "start_work"; placeId: string; title?: string; message: string; profile: LaunchProfile };
 
 export type ActionKind = Action["kind"];
+
+/**
+ * A short name for a new thread from its first prompt, for whatever needs one before the work system has named it (a
+ * connector before 0.6.0, demo mode): its first line of the user's own words (not the line saying it was dictated, nor a
+ * quoted one), cut at a word to about 50 characters. connector/src/t3/adapter.ts has the same, for T3's seed title.
+ */
+export function titleFrom(message: string): string {
+  const line = message.split("\n").map((l) => l.trim()).find((l) => l && !/^\(.*\)$/.test(l) && !l.startsWith(">")) ?? "";
+  const words = line.replace(/\s+/g, " ");
+  if (words.length <= 50) return words.replace(/[\s.,;:]+$/, "") || "New thread";
+  const cut = words.slice(0, 50);
+  return `${cut.slice(0, Math.max(cut.lastIndexOf(" "), 25)).replace(/[\s.,;:]+$/, "")}…`;
+}
 
 /** What an action is about: the item it changes, or the place new work starts in. */
 export const targetOf = (a: Action) => (a.kind === "start_work" ? a.placeId : a.itemId);

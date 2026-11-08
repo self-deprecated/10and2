@@ -7,7 +7,7 @@ export const SUBPROTOCOL = "10and2.mcp.1";
 /** The MCP revision whose message shapes both ends speak. */
 export const MCP_VERSION = "2025-06-18";
 /** This connector's version, as `serverInfo.version` (kept equal to package.json's). */
-export const VERSION = "0.5.0";
+export const VERSION = "0.6.0";
 export const MAX_FRAME = 8 << 20;
 /** The keep-alive frames, outside JSON-RPC, so the brain's auto-response answers them without waking. */
 export const PING = '{"type":"ping"}';
@@ -40,11 +40,12 @@ export function actionOf(v: any): Action {
   if (v.kind === "start_work") {
     onlyFields(v, ["kind", "placeId", "title", "message", "profile"]);
     const p = v.profile;
-    if (!text(v.placeId) || !text(v.title) || !text(v.message) || !p || !text(p.name) ||
+    // No title: the work system names the thread from its prompt (a brain before 8 November always sends one).
+    if (!text(v.placeId) || (v.title !== undefined && !text(v.title)) || !text(v.message) || !p || !text(p.name) ||
       !["worktree", "root"].includes(p.workspace) || !["approval-required", "auto-accept-edits", "auto", "full-access"].includes(p.runtimeMode) ||
       !["default", "plan"].includes(p.interactionMode)) throw new Error("That launch profile or project isn't valid.");
     onlyFields(p, ["name", "workspace", "runtimeMode", "interactionMode"]);
-    return { kind: v.kind, placeId: v.placeId, title: v.title, message: v.message, profile: { name: p.name, workspace: p.workspace, runtimeMode: p.runtimeMode, interactionMode: p.interactionMode } };
+    return { kind: v.kind, placeId: v.placeId, ...(v.title !== undefined ? { title: v.title } : {}), message: v.message, profile: { name: p.name, workspace: p.workspace, runtimeMode: p.runtimeMode, interactionMode: p.interactionMode } };
   }
   if (!text(v.itemId)) throw new Error("A thread is required.");
   switch (v.kind) {
@@ -78,7 +79,8 @@ const ACTING: Record<ActionKind, Tool> = {
   archive: { name: "archive", description: "Archives a thread.", inputSchema: obj({ itemId: str }) },
   unsnooze: { name: "unsnooze", description: "Wakes a snoozed thread now.", inputSchema: obj({ itemId: str }) },
   unsettle: { name: "unsettle", description: "Brings a settled thread back.", inputSchema: obj({ itemId: str }) },
-  start_work: { name: "start_work", description: "Starts new work in a place, with a named launch profile.", inputSchema: obj({ placeId: str, title: str, message: str, profile }) },
+  // `title` isn't required: a brain that sees so lets the work system name the thread (brain/src/connector-client.ts).
+  start_work: { name: "start_work", description: "Starts new work in a place, with a named launch profile; named by the work system from its message unless given a title.", inputSchema: obj({ placeId: str, title: str, message: str, profile }, ["placeId", "message", "profile"]) },
 };
 
 /** The tools this machine offers: reading always, acting only as its local policy allows. */

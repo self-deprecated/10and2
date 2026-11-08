@@ -160,8 +160,21 @@ export async function worktreeStart(root: string, base: string): Promise<string 
 }
 
 /**
+ * A short seed title from a prompt, as T3's own clients make one: the first line of the user's words (not a line saying
+ * it was dictated, nor a quoted one), cut at a word to about 50 characters. brain/src/adapter.ts `titleFrom` is the same.
+ */
+export function titleFrom(message: string): string {
+  const line = message.split("\n").map((l) => l.trim()).find((l) => l && !/^\(.*\)$/.test(l) && !l.startsWith(">")) ?? "";
+  const words = line.replace(/\s+/g, " ");
+  if (words.length <= 50) return words.replace(/[\s.,;:]+$/, "") || "New thread";
+  const cut = words.slice(0, 50);
+  return `${cut.slice(0, Math.max(cut.lastIndexOf(" "), 25)).replace(/[\s.,;:]+$/, "")}…`;
+}
+
+/**
  * A launch, built in code from the profile: the project's own id, a fresh worktree or its own checkout (never a path),
- * no attachments. A worktree starts from `base` (`worktreeStart`): a branch, which T3 fetches from origin first, or
+ * no attachments. With no title, T3 names the thread from its first message (`generateTitle`), showing a seed made from
+ * it until then: T3 needs a title either way. A worktree starts from `base` (`worktreeStart`): a branch, which T3 fetches from origin first, or
  * "HEAD", the checkout's current commit; null runs it in the project's folder. The same `commandId` returns the same
  * thread (T3 keeps launch receipts).
  */
@@ -171,8 +184,8 @@ export function toLaunch(action: Extract<Action, { kind: "start_work" }>, comman
     commandId,
     creationSource: "mobile",
     projectId: action.placeId,
-    title: action.title,
-    generateTitle: false,
+    title: action.title ?? titleFrom(action.message),
+    generateTitle: !action.title,
     modelSelection,
     runtimeMode: p.runtimeMode,
     interactionMode: p.interactionMode,

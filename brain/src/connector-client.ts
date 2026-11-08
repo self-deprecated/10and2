@@ -4,7 +4,7 @@
 //
 // What the brain knows of the machine (its view, rev and tools) is plain data a host can save and restore, so a
 // Durable Object that hibernates between frames picks up where it left off without asking again.
-import type { Action, ActionKind, Adapter, LaunchProfile, PastReply, Place, Receipt, Report, WorkItem } from "./adapter.ts";
+import { titleFrom, type Action, type ActionKind, type Adapter, type LaunchProfile, type PastReply, type Place, type Receipt, type Report, type WorkItem } from "./adapter.ts";
 
 export const SUBPROTOCOL = "10and2.mcp.1";
 export const MCP_VERSION = "2025-06-18";
@@ -25,7 +25,11 @@ export type Refusals = Record<string, Partial<Record<ActionKind, string>>>;
 /** What the brain knows of a machine; a host may save it and restore it after a restart or hibernation. */
 type Mode = LaunchProfile["runtimeMode"];
 const MODES: Mode[] = ["approval-required", "auto-accept-edits", "auto", "full-access"];
-export type Saved = { rev: string | null; items: WorkItem[]; places: Place[]; connections: Connection[]; refusals: Refusals; ceiling: Mode; actions: ActionKind[] };
+/**
+ * `names`: the connector lets the work system name a new thread itself (its start_work doesn't require a title; 0.6.0
+ * on). Absent or false, a start is sent a title made from its prompt (`titleFrom`), as connectors before it need one.
+ */
+export type Saved = { rev: string | null; items: WorkItem[]; places: Place[]; connections: Connection[]; refusals: Refusals; ceiling: Mode; actions: ActionKind[]; names?: boolean };
 /** The socket, as the host carries it. `lastSeen`: when the connector was last heard from (a frame or a ping). */
 export type Wire = { send(text: string): void; close(code: number, reason: string): void; lastSeen(): number };
 
@@ -160,8 +164,11 @@ export class RemoteAdapter implements Adapter {
 
   private async listTools(wire: Wire) {
     const r = await this.request("tools/list", {}, wire);
-    const names: unknown[] = Array.isArray(r?.tools) ? r.tools.map((t: any) => t?.name) : [];
+    const tools: any[] = Array.isArray(r?.tools) ? r.tools : [];
+    const names: unknown[] = tools.map((t) => t?.name);
     this.state.actions = ACTIONS.filter((a) => names.includes(a));
+    const required = tools.find((t) => t?.name === "start_work")?.inputSchema?.required;
+    this.state.names = Array.isArray(required) && !required.includes("title");
     this.opts.onSaved?.(this.saved);
   }
 
@@ -253,7 +260,7 @@ export class RemoteAdapter implements Adapter {
 
   async execute(action: Action, key: string): Promise<Receipt> {
     if (!this.connected(targetOf(action))) return { ok: false, error: `${spoken(this.name)} isn't connected right now, so nothing was sent.` };
-    const { kind, ...args } = action;
+    const { kind, ...args } = action.kind === "start_work" && !action.title && !this.state.names ? { ...action, title: titleFrom(action.message) } : action;
     try {
       const r = await this.request("tools/call", { name: kind, arguments: args, _meta: { "tenandtwo/key": key, "tenandtwo/ttlMs": this.opts.timeoutMs } });
       if (!validReceipt(r?.structuredContent)) return { ok: false, unknown: true, error: `${spoken(this.name)} answered with something Driver doesn't understand; the outcome may be unknown.` };

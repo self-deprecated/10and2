@@ -186,6 +186,42 @@ export function mentionsThread(said: string, name: string, others: string[]): bo
   });
 }
 
+/** Words that move a conversation along rather than say anything about a thread: "okay, next up, let's look at …". */
+const STEERING = new Set(
+  ("let lets look next now up okay ok then right alright well so also too finally lastly another more move moving start go turn onto over " +
+    "first last shall we us you your want about what how here there hear check see").split(" ").map(stem),
+);
+
+/**
+ * Whether sentence `said` tells something about this thread (in project `group`), not only names it: not a question,
+ * and at least two words about it beyond its name, its project and steering words. Where the sentence names other
+ * threads too, only the words from this thread's name to the next one's count, so "A now sends people home, and B took
+ * the dock off" tells both, while "A, B and C finished." and "Next up is C." tell none. When in doubt it says no, which
+ * only means the thread's summary may be told again.
+ */
+export function tellsAbout(said: string, name: string, group: string, others: string[]): boolean {
+  if (said.trim().endsWith("?") || !mentionsThread(said, name, others)) return false;
+  const tokens = digits(norm(said).split(" ").filter(Boolean), true).filter((w) => (w.length > 1 || /^\d$/.test(w)) && !STOP.has(w)).map(stem);
+  // Where a name is said: the start of the run of words that has most of it, so "Fix login redirect … Update login
+  // screen" finds each name where it is, not at the first "login".
+  const at = (n: string) => {
+    const words = new Set(keyWords(n, true));
+    let best = -1;
+    let most = 0;
+    tokens.forEach((t, i) => {
+      if (!words.has(t)) return;
+      const has = new Set(tokens.slice(i, i + words.size).filter((w) => words.has(w))).size;
+      if (has > most) [best, most] = [i, has];
+    });
+    return best;
+  };
+  const from = at(name);
+  const named = others.filter((o) => sayKey(o) !== sayKey(name) && mentionsThread(said, o, others));
+  const known = new Set([...keyWords(name, true), ...keyWords(group, true)]);
+  const about = tokens.slice(named.length ? from : 0, Math.min(tokens.length, ...named.map(at).filter((i) => i > from)));
+  return new Set(about.filter((t) => !known.has(t) && !STEERING.has(t))).size >= 2;
+}
+
 /** Whether `said` names `name` the way the briefing's names are heard: most of its words (all, for up to three). */
 export function mentions(said: string, name: string): boolean {
   const words = keyWords(name, true);
