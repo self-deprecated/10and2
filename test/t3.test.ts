@@ -1,9 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer, type WebSocket } from "ws";
-import { answersFor, mapStatus, snoozedUntil, T3Adapter, toCommand, toLaunch, type ShellThread } from "../src/t3/adapter.ts";
+import { answersFor, mapStatus, snoozedUntil, T3Adapter, toCommand, toLaunch, worktreeStart, type ShellThread } from "../src/t3/adapter.ts";
 import type { LaunchProfile } from "../src/contract.ts";
 import { ConnectionError, RpcClient, RpcError } from "../src/t3/rpc.ts";
 
@@ -33,6 +37,8 @@ test("actions map to exactly the four allowed thread commands", () => {
   assert.deepEqual(toCommand({ kind: "settle", itemId: "t" }, "k"), { type: "thread.settle", commandId: "k", threadId: "t" });
   assert.deepEqual(toCommand({ kind: "archive", itemId: "t" }, "k"), { type: "thread.archive", commandId: "k", threadId: "t" });
   assert.deepEqual(toCommand({ kind: "snooze", itemId: "t", until: "2026-10-19T06:00:00.000Z" }, "k"), { type: "thread.snooze", commandId: "k", threadId: "t", snoozedUntil: "2026-10-19T06:00:00.000Z" });
+  assert.deepEqual(toCommand({ kind: "unsnooze", itemId: "t" }, "k"), { type: "thread.unsnooze", commandId: "k", threadId: "t", reason: "user" });
+  assert.deepEqual(toCommand({ kind: "unsettle", itemId: "t" }, "k"), { type: "thread.unsettle", commandId: "k", threadId: "t", reason: "user" });
   const f = toCommand({ kind: "follow_up", itemId: "t", message: "Go ahead." }, "k") as any;
   assert.equal(f.type, "message.dispatch");
   assert.deepEqual(f.dispatchMode, { type: "queue_after_active" });
@@ -271,7 +277,7 @@ test("T3Adapter: until T3 has answered, marking read is to be tried again, not g
 
 const build: LaunchProfile = { name: "Build", workspace: "worktree", runtimeMode: "full-access", interactionMode: "default" };
 
-test("a launch is built in code: the profile's modes, a worktree of HEAD or the root, never a path", () => {
+test("a launch is built in code: the profile's modes, a worktree of the policy's base or the root, never a path", () => {
   const start = { kind: "start_work" as const, placeId: "p1", title: "Launch profiles", message: "Add launch profiles.", profile: build };
   assert.deepEqual(toLaunch(start, "P-1:start", { instanceId: "codex", model: "gpt-6" }), {
     commandId: "P-1:start", creationSource: "mobile", projectId: "p1", title: "Launch profiles", generateTitle: false,
@@ -280,8 +286,39 @@ test("a launch is built in code: the profile's modes, a worktree of HEAD or the 
   });
   const plan = toLaunch({ ...start, profile: { name: "Here", workspace: "root", runtimeMode: "approval-required", interactionMode: "plan" } }, "k", {}) as any;
   assert.deepEqual(plan.workspaceStrategy, { type: "root" });
+  assert.deepEqual((toLaunch(start, "k", {}, "main") as any).workspaceStrategy, { type: "worktree", baseRef: "main", startFromOrigin: true }, "a branch is fetched from origin first");
+  assert.deepEqual((toLaunch(start, "k", {}, "HEAD") as any).workspaceStrategy, { type: "worktree", baseRef: "HEAD" });
+  assert.deepEqual((toLaunch({ ...start, profile: { ...build, workspace: "root" } }, "k", {}, "main") as any).workspaceStrategy, { type: "root" }, "the checkout itself ignores it");
   assert.equal(plan.interactionMode, "plan");
   assert.throws(() => toCommand(start, "k"), "start_work never goes through dispatchCommand");
+  assert.deepEqual((toLaunch(start, "k", {}, null) as any).workspaceStrategy, { type: "root" }, "a folder that isn't a repository runs in itself");
+});
+
+test("a new worktree starts from the policy's branch where the repository has it, HEAD where it doesn't, and nowhere outside a repository", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "worktree-start-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", ["-C", cwd, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { stdio: "ignore" });
+  const repo = (name: string, branch: string) => {
+    const r = join(dir, name);
+    git(dir, "init", "-q", "-b", branch, r);
+    git(r, "commit", "-q", "--allow-empty", "-m", "first");
+    return r;
+  };
+  const main = repo("main", "main"), master = repo("master", "master");
+  const notes = join(dir, "notes");
+  execFileSync("mkdir", [notes]);
+  assert.equal(await worktreeStart(main, "main"), "main");
+  assert.equal(await worktreeStart(main, "HEAD"), "HEAD");
+  assert.equal(await worktreeStart(master, "main"), "HEAD", "no main here or on origin: the checkout's commit, rather than a failed launch");
+  // A branch only on origin counts, as T3 fetches it.
+  const clone = join(dir, "clone");
+  git(dir, "clone", "-q", main, clone);
+  git(clone, "checkout", "-q", "--detach");
+  git(clone, "branch", "-q", "-D", "main");
+  assert.equal(await worktreeStart(clone, "main"), "main");
+  assert.equal(await worktreeStart(notes, "main"), null);
+  assert.equal(await worktreeStart(notes, "HEAD"), null);
+  assert.equal(await worktreeStart(join(dir, "gone"), "main"), null);
 });
 
 test("T3Adapter: places are the shell's projects; a launch uses the project's model, is named at once, and repeats as the same thread", async () => {

@@ -7,7 +7,7 @@ export const SUBPROTOCOL = "10and2.mcp.1";
 /** The MCP revision whose message shapes both ends speak. */
 export const MCP_VERSION = "2025-06-18";
 /** This connector's version, as `serverInfo.version` (kept equal to package.json's). */
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 export const MAX_FRAME = 8 << 20;
 /** The keep-alive frames, outside JSON-RPC, so the brain's auto-response answers them without waking. */
 export const PING = '{"type":"ping"}';
@@ -26,7 +26,10 @@ export const ERR = { parse: -32700, invalidRequest: -32600, noMethod: -32601, in
 
 export const text = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 128_000;
 
+/** The actions a machine's policy names. */
 export const ACTIONS: readonly ActionKind[] = ["follow_up", "settle", "snooze", "archive", "start_work"];
+/** Every action tool: the policy's, and undoing a snooze or a settle (allowed wherever doing it is, `allows`). */
+export const TOOL_ACTIONS: readonly ActionKind[] = [...ACTIONS, "unsnooze", "unsettle"];
 
 function onlyFields(value: object, fields: string[]) {
   if (Object.keys(value).some((key) => !fields.includes(key))) throw new Error("Unknown action fields aren't supported.");
@@ -45,7 +48,7 @@ export function actionOf(v: any): Action {
   }
   if (!text(v.itemId)) throw new Error("A thread is required.");
   switch (v.kind) {
-    case "archive": case "settle":
+    case "archive": case "settle": case "unsnooze": case "unsettle":
       onlyFields(v, ["kind", "itemId"]);
       return { kind: v.kind, itemId: v.itemId };
     case "follow_up":
@@ -73,10 +76,12 @@ const ACTING: Record<ActionKind, Tool> = {
   settle: { name: "settle", description: "Marks a thread as dealt with.", inputSchema: obj({ itemId: str }) },
   snooze: { name: "snooze", description: "Hides a thread until a time.", inputSchema: obj({ itemId: str, until: str }) },
   archive: { name: "archive", description: "Archives a thread.", inputSchema: obj({ itemId: str }) },
+  unsnooze: { name: "unsnooze", description: "Wakes a snoozed thread now.", inputSchema: obj({ itemId: str }) },
+  unsettle: { name: "unsettle", description: "Brings a settled thread back.", inputSchema: obj({ itemId: str }) },
   start_work: { name: "start_work", description: "Starts new work in a place, with a named launch profile.", inputSchema: obj({ placeId: str, title: str, message: str, profile }) },
 };
 
 /** The tools this machine offers: reading always, acting only as its local policy allows. */
 export function tools(allowed: readonly ActionKind[]): Tool[] {
-  return [...READING, ...ACTIONS.filter((a) => allowed.includes(a)).map((a) => ACTING[a])];
+  return [...READING, ...TOOL_ACTIONS.filter((a) => allowed.includes(a)).map((a) => ACTING[a])];
 }

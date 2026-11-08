@@ -52,7 +52,7 @@ export type Place = { id: string; name: string; /** When an item there was last 
 
 /**
  * What new work runs with. Voice only ever names a profile; this is the most it can ask for. `workspace`: a fresh
- * worktree of the project's current commit, or the project's own checkout.
+ * worktree (starting where that machine's connector settings say), or the project's own checkout.
  */
 export type LaunchProfile = {
   name: string;
@@ -65,6 +65,9 @@ export type Action =
   | { kind: "follow_up"; itemId: string; message: string }
   | { kind: "settle"; itemId: string }
   | { kind: "snooze"; itemId: string; until: string }
+  /** Undoing a snooze or a settle: only from a tap on the phone, never by voice. */
+  | { kind: "unsnooze"; itemId: string }
+  | { kind: "unsettle"; itemId: string }
   | { kind: "archive"; itemId: string }
   | { kind: "start_work"; placeId: string; title: string; message: string; profile: LaunchProfile };
 
@@ -79,6 +82,8 @@ export type Receipt = { ok: true; itemId?: string } | { ok: false; error: string
 export interface Adapter {
   readonly name: string;
   readonly actions: readonly ActionKind[];
+  /** What the machine holding `itemId` can do, when this adapter spans machines that may differ (an older connector). */
+  actionsFor?(itemId: string): readonly ActionKind[];
   /** Whether the current connection has loaded live data, for one item or the local adapter. */
   connected(itemId?: string): boolean;
   /** Composite adapters identify local items for local health checks. Single adapters are local. */

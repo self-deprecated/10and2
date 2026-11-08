@@ -63,7 +63,7 @@ type Row = { transcript: Transcript; cwd: string; live: Live[]; item: WorkItem }
 
 export class ClaudeAdapter implements Adapter {
   readonly name = "claude";
-  readonly actions = ["follow_up", "settle", "snooze", "archive", "start_work"] as const;
+  readonly actions = ["follow_up", "settle", "snooze", "archive", "start_work", "unsnooze", "unsettle"] as const;
   readonly configDir: string;
   readonly socketPath: string;
   private readonly opts: Options;

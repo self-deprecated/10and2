@@ -16,6 +16,10 @@ export type AnalyticsOptions = {
   brainRev: string;
   /** The account's mode on every event; a function when it can change while the brain runs (a cloud account setting its own key). */
   mode: string | (() => string);
+  /** The account's allowance label (`tester`, `presenter`) on every event, when it has one (a cloud account). */
+  allowance?: () => string | null;
+  /** The account's consent (`ConsentHolder`), shared with its owner, who changes it; a fresh one (sharing) if not given. */
+  consent?: ConsentHolder;
   log: (m: string) => void;
   fetch?: typeof fetch;
   /** How long the first queued event waits for others before a batch goes (default 10 s). */
@@ -31,11 +35,80 @@ type Event = { event: string; distinct_id: string; uuid: string; timestamp: stri
 /** A distinct id as the phone sends it: PostHog's anonymous UUID, or a Clerk user id after sign-in. */
 const DISTINCT_ID = /^[\w.:@-]{1,128}$/;
 
+/** The account's analytics consent as it's kept (contracts §5): see `ConsentHolder`. */
+export type Consent = { off: boolean; explicit: boolean; seq: number };
+/** A `PUT /api/analytics`'s place: which arrival it was, and the consent's number then. */
+export type Ticket = { arrival: number; seq: number };
+
+/**
+ * An account's analytics consent (contracts §5), one per account object, made before anything else in it. Changed only
+ * synchronously, as each request arrives (never after an await, so a request that started earlier can't land later),
+ * and read by `Analytics.track` when each event is recorded.
+ *
+ * - `heard(header)`: a request's `x-driver-analytics`. `off` turns it off at once; an id shares again only for an account
+ *   whose phone never used `PUT /api/analytics` (`explicit`: an older app goes by its last header).
+ * - `PUT /api/analytics`: `next()` as it arrives, then `set(share, ticket)` once its body is read, which counts only if
+ *   nothing changed in between (an `off` from any request, or a later `PUT`).
+ * - `adopt(off, seq)`: what the account's brain says, in its Demo object; an older one is ignored.
+ *
+ * `seq` moves on with every change; `onChange` is told after each, to keep the latest or pass it on.
+ */
+export class ConsentHolder {
+  off = false;
+  explicit = false;
+  seq = 0;
+  onChange: (() => void) | null = null;
+
+  get value(): Consent {
+    return { off: this.off, explicit: this.explicit, seq: this.seq };
+  }
+
+  restore(kept: Consent | null) {
+    if (kept) [this.off, this.explicit, this.seq] = [kept.off, kept.explicit, kept.seq];
+  }
+
+  heard(header: unknown) {
+    if (header === "off") this.change(true, this.explicit);
+    else if (typeof header === "string" && DISTINCT_ID.test(header) && !this.explicit && this.off) this.change(false, false);
+  }
+
+  /** `PUT /api/analytics` arrivals so far: a later one wins over an earlier one whose body is read last. */
+  private arrivals = 0;
+
+  /** A `PUT /api/analytics` arriving: its ticket for `set`. It changes nothing, so `seq` (the number passed on with
+   *  the consent) only ever names a consent that was committed. */
+  next(): Ticket {
+    return { arrival: ++this.arrivals, seq: this.seq };
+  }
+
+  /** The `PUT`'s choice, once its body is read: false (ignored) when a later `PUT` arrived or anything changed since
+   *  its `next()`. Committed as a change of its own number. */
+  set(share: boolean, ticket: Ticket): boolean {
+    if (ticket.arrival !== this.arrivals || ticket.seq !== this.seq) return false;
+    this.change(!share, true);
+    return true;
+  }
+
+  /** The account's consent as its brain passed it on: each change has its own number, so one not newer is old news. */
+  adopt(off: boolean, seq: number) {
+    if (seq <= this.seq) return;
+    [this.off, this.explicit, this.seq] = [off, true, seq];
+    this.onChange?.();
+  }
+
+  private change(off: boolean, explicit: boolean) {
+    [this.off, this.explicit] = [off, explicit];
+    this.seq++;
+    this.onChange?.();
+  }
+}
+
 export class Analytics {
-  private readonly o: Required<Omit<AnalyticsOptions, "fetch">> & { fetch: typeof fetch };
-  /** The distinct id the phone gave last (`x-driver-analytics`), and whether it asked for nothing to be sent. */
+  private readonly o: Required<Omit<AnalyticsOptions, "fetch" | "allowance" | "consent">> & Pick<AnalyticsOptions, "allowance"> & { fetch: typeof fetch };
+  /** The distinct id the phone gave last (`x-driver-analytics`). */
   private phoneId: string | null = null;
-  private optedOut = false;
+  /** The account's consent, read at each event (`ConsentHolder`): its owner changes it, never this. */
+  readonly consent: ConsentHolder;
   /** The verified account (the Clerk user id), which wins over the phone's id. */
   private accountId: string | null = null;
   private appBuild: string | null = null;
@@ -45,6 +118,7 @@ export class Analytics {
 
   constructor(options: AnalyticsOptions) {
     this.o = { flushMs: 10_000, batchSize: 50, maxQueue: 1000, fetch: (...a) => fetch(...a), ...options, host: options.host.replace(/\/+$/, "") };
+    this.consent = options.consent ?? new ConsentHolder();
   }
 
   get enabled(): boolean {
@@ -53,23 +127,16 @@ export class Analytics {
 
   /** Who events are about now: null when there's nobody to say (no id yet) or they opted out. */
   get person(): string | null {
-    return this.optedOut ? null : (this.accountId ?? this.phoneId);
+    return this.consent.off ? null : (this.accountId ?? this.phoneId);
   }
 
   /**
-   * What a request said (`x-driver-analytics` and `x-driver-build`): an id becomes who events are about, and `off`
-   * stops them until an id comes again. A request without the header (the desk page) changes nothing.
+   * Who a request says events are about (`x-driver-analytics`, an id) and the phone's build (`x-driver-build`). Its
+   * consent isn't this's to change: the account object's `ConsentHolder` takes it as the request arrives.
    */
   heard(header: unknown, appBuild?: string | null) {
     if (appBuild) this.appBuild = appBuild;
-    if (typeof header !== "string" || header === "") return;
-    if (header === "off") {
-      this.optedOut = true;
-      return;
-    }
-    if (!DISTINCT_ID.test(header)) return;
-    this.optedOut = false;
-    this.phoneId = header;
+    if (typeof header === "string" && header !== "off" && DISTINCT_ID.test(header)) this.phoneId = header;
   }
 
   /** The account this brain belongs to, from its verified token (a cloud brain); the phone's id is then only a fallback. */
@@ -79,10 +146,12 @@ export class Analytics {
 
   readonly track: Track = (event, props = {}) => {
     const who = this.person;
+    // The account's consent as it is now, when the event is recorded (`person`): the one check (contracts §5).
     if (!this.enabled || !who) return;
     const properties: Record<string, unknown> = {
       source: "brain", env: this.o.env, runtime: this.o.runtime, brain_rev: this.o.brainRev, mode: typeof this.o.mode === "function" ? this.o.mode() : this.o.mode,
       ...(this.appBuild ? { app_build: this.appBuild } : {}),
+      ...(this.o.allowance?.() ? { allowance: this.o.allowance() } : {}),
       $lib: "driver-brain", $geoip_disable: true,
     };
     for (const [k, v] of Object.entries(props)) if (v !== undefined) properties[k] = v;

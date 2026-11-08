@@ -117,7 +117,8 @@ export const isMark = (w: string) => mark(w);
  * readback says but which the name alone already identifies, or only its first clauses ("in sd" of "in sd, on
  * Quartz"), when `where` keeps its clause marks.
  */
-export function saysHead(spoken: string[], head: string[], next: string | null, where: string[] = []): boolean {
+export function saysHead(spoken: string[], head: string[], next: string | string[] | null, where: string[] = []): boolean {
+  const after = typeof next === "string" ? [next] : next;
   start: for (let i = 0; i < spoken.length; i++) {
     // A clause starts after any mark, including where a new utterance began.
     if (i > 0 && !mark(spoken[i - 1])) continue;
@@ -145,14 +146,18 @@ export function saysHead(spoken: string[], head: string[], next: string | null, 
       if (k >= 0) j = k;
       else if (clause >= 0) j = clause;
     }
-    if (next === null) {
+    if (after === null) {
       // Only a real sentence end finishes the name; never the end of what's been said so far (the name may go on:
       // "Agent Reel" → "… Dashboard"), nor an utterance start. A comma does only before the readback's own question.
       if (spoken[j] === BREAK || (spoken[j] === COMMA && spoken[j + 1] === "shall")) return true;
       continue;
     }
-    while (mark(spoken[j])) j++;
-    if (spoken[j] === next) return true;
+    // The words that follow, each perhaps after a mark: "with this" for a new thread, so "with the Plan profile" isn't it.
+    let k = j;
+    if (after.every((w) => {
+      while (mark(spoken[k])) k++;
+      return spoken[k++] === w;
+    })) return true;
   }
   return false;
 }

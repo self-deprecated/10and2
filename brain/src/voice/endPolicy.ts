@@ -61,6 +61,10 @@ const USER_WORDS = 300;
 /** What the voice model says while it hands a turn to the backend (its instructions allow nothing else). */
 const FILLER = /^\s*(?:(?:let me check|one moment)[.!]?\s*)*$/i;
 
+/** A rollover may begin this long before the session's cap, at a quiet moment, and comes this long after it at the latest. */
+export const ROLL_EARLY = 90_000;
+export const ROLL_LATE = 30_000;
+
 export type EndState = {
   startedAt: number;
   lastActivity: number;
@@ -94,7 +98,8 @@ export type EndInput =
   | { type: "already_replied" }
   | { type: "activity" }
   | { type: "closing"; reason: EndReason }
-  | { type: "tick"; busy: boolean; idleMs: number; maxMs: number; stallMs?: number };
+  /** `holding`: the backend is answering or a change awaits the user's yes, so a rollover waits (up to `ROLL_LATE` past the cap). */
+  | { type: "tick"; busy: boolean; idleMs: number; maxMs: number; stallMs?: number; holding?: boolean };
 
 export type EndStep = {
   state: EndState;
@@ -189,7 +194,20 @@ export function step(previous: EndState, input: EndInput, now: number): EndStep 
       break;
     case "tick": {
       if (state.closing) break;
-      if (now - state.startedAt > input.maxMs) {
+      // A session can't run past the cap (deploys wait for it), but the call can: near it, at a quiet moment, the session
+      // ends as a rollover and the phone opens the next one in the same conversation at once (5 November: Driver went
+      // silent at the cap, and the phone didn't know why). Quiet: no tool at work, no change awaiting a yes, nobody
+      // speaking, and Driver has answered the user's last words.
+      const age = now - state.startedAt;
+      if (age > input.maxMs - ROLL_EARLY && !state.endRequestedAt) {
+        const quiet = !input.busy && !input.holding && !state.awaitingReply &&
+          now - state.lastAssistantDelta > 1500 && now - state.lastUserDelta > 1500 && state.lastAssistantDelta >= state.lastUserDelta;
+        if (quiet || age > input.maxMs + ROLL_LATE) {
+          result.decision = { closeNow: { kind: "rollover" } };
+          break;
+        }
+      }
+      if (age > input.maxMs + ROLL_LATE) {
         result.decision = { closeNow: { kind: "max_duration" } };
         break;
       }

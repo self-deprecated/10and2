@@ -5,33 +5,37 @@ import type { Store } from "./store.ts";
 import { Recordings } from "./voice/recording.ts";
 import { describe } from "./util.ts";
 
-/** Filler before a command: "okay, debug this". */
-const LEAD = /^(?:(?:ok(?:ay)?|alright|all right|right|so|well|hey|driver|please|just|and|now)\b[\s,.!]*)*/i;
+/**
+ * Filler before a command: "okay, debug this", and the sounds speech-to-text writes before one ("Hmm. Debug this",
+ * "Tsk. Debug this": on 7 November neither flagged).
+ */
+const LEAD = /^(?:(?:ok(?:ay)?|alright|all right|right|so|well|hey|driver|please|just|and|now|h+m+|m+h?m+|tsk|uh+|um+|er+|ah+|oh+)\b[\s,.!]*)*/i;
 /** What may follow the keyword: "debug this", "flag that one", "mark it for review". */
 const WHAT = String.raw`[\s,]+(?:(?:this|that|it)(?: one| moment| bit| part| conversation| call)?|for review)\b`;
 /**
  * "Debug.", "debug this", "Driver, debug that: it didn't say the options", "flag this for review" yes; "debug the login
- * thread", "what's the debug flag" no. It must open the turn: "debug" alone or with this/that/it/for review after it,
- * "flag" and "mark" only with them. "Flag" alone isn't one: on 2 November it was the end of "did you do a debug flag?",
- * split into a turn of its own.
+ * thread", "what's the debug flag" no. It must open a sentence of the turn (after any filler): "debug" alone or with
+ * this/that/it/for review after it, "flag" and "mark" only with them. "Flag" alone isn't one: on 2 November it was the
+ * end of "did you do a debug flag?", split into a turn of its own.
  */
 const FLAG_COMMAND = new RegExp(String.raw`^(?:debug(?:[\s,.!:;-]*$|${WHAT})|(?:flag|mark)${WHAT})`, "i");
-/** Later in the turn, a sentence that is only the keyword: "Well, I'm waiting. Debug." (2 November). */
-const KEYWORD_ALONE = /^debug[\s,!:-]*$/i;
 /**
  * How speech-to-text heard "debug" said on its own, on 2 November: "The bug", "De bug", "D bug". Only as the whole
  * turn: "the bug in the login thread" is about a bug.
  */
 const MISHEARD = /^(?:the|de|d)[\s-]*bug[\s.!]*$/i;
 
-/** The user's words flag this moment for review. */
+/**
+ * The user's words flag this moment for review: a sentence of the turn is the command ("Well, I'm waiting. Debug.",
+ * 2 November), after any filler. Sentences end at . ! ? or ;, so "Hmm. Debug this" is two.
+ */
 export const asksToFlag = (said: string) => {
   const s = said.trim();
-  return FLAG_COMMAND.test(s.replace(LEAD, "")) || MISHEARD.test(s) || s.split(/[.!?;]+/).some((sentence) => KEYWORD_ALONE.test(sentence.trim().replace(LEAD, "")));
+  return MISHEARD.test(s) || s.split(/(?<=[.!?;])\s*/).some((sentence) => FLAG_COMMAND.test(sentence.trim().replace(LEAD, "")));
 };
 
 /** `brainRev`, `phoneBuild`: what was running (unknown for a flag made after the fact: the recording's header says). */
-export type Flag = { conversationId: string; sessionId: string; at: number; said: string; brainRev?: string; phoneBuild?: string | null };
+export type Flag = { conversationId: string; sessionId: string; at: number; said: string; brainRev?: string; phoneBuild?: string | null; configVersion?: number | null };
 
 const iso = (ms: number | null | undefined) => (ms ? new Date(ms).toISOString() : "–");
 /** A file name that sorts by when the moment was: `20261102-071754-live_u0_Efgadp3o.md` (UTC). */
@@ -122,7 +126,7 @@ export class Flags {
       "## Where to look",
       "",
       `- Conversation \`${f.conversationId}\`; flagged in session \`${f.sessionId}\`.`,
-      `- Running: brain \`${f.brainRev ?? "unknown"}\`, phone build \`${f.phoneBuild ?? "unknown"}\`${f.brainRev ? "" : " (flagged after the fact: each recording's header has `brainRev` and `phoneBuild`)"}.`,
+      `- Running: brain \`${f.brainRev ?? "unknown"}\`, phone build \`${f.phoneBuild ?? "unknown"}\`${f.configVersion ? `, Ops settings version ${f.configVersion}` : ""}${f.brainRev ? "" : " (flagged after the fact: each recording's header has `brainRev` and `phoneBuild`)"}.`,
       `- Sessions in this conversation (UTC), with their recordings:`,
       ...sessions.map((s) => `  - \`${s.id}\`${s.id === f.sessionId ? " (flagged here)" : ""}: ${iso(s.startedAt).slice(11, 19)}–${iso(s.endedAt).slice(11, 19)}, ${s.endReason ?? "still open"}; ${recording(s.id)}`),
       `- The phone's logs from then: ${logs.length ? logs.map((p) => `\`${p}\``).join(", ") : "none found"}.`,

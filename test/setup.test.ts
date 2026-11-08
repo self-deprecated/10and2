@@ -154,7 +154,7 @@ test("setup pairs in the browser, keeps the credential private, writes a policy;
   assert.equal(statSync(creds).mode & 0o777, 0o600);
   assert.equal(JSON.parse(readFileSync(creds, "utf8"))[origin], credential);
   const policy = JSON.parse(readFileSync(join(dir, "config", "10and2", "connector.json"), "utf8"));
-  assert.deepEqual(policy, { brain: `${origin.replace("http", "ws")}/connector`, projects: "*", actions: ["follow_up", "settle", "snooze", "archive", "start_work"], maxRuntimeMode: "full-access", t3: true, claude: false });
+  assert.deepEqual(policy, { brain: `${origin.replace("http", "ws")}/connector`, projects: "*", actions: ["follow_up", "settle", "snooze", "archive", "start_work"], maxRuntimeMode: "full-access", t3: true, claude: false, worktreeBase: "main" });
 
   const again = await cli(["setup", "--no-autostart"], env);
   assert.equal(again.status, 0);
@@ -165,6 +165,7 @@ test("setup pairs in the browser, keeps the credential private, writes a policy;
   assert.match(status.out, /Not running/);
   assert.match(status.out, /Sees +every project in T3 Code/);
   assert.match(status.out, /Can +follow up, start work, settle, snooze and archive, after your spoken yes/);
+  assert.match(status.out, /New T3 Code worktrees start from the latest main on origin/);
   assert.doesNotMatch(status.out, /brain/i, "no internals in what people read");
   assert.ok(!status.out.includes(credential));
   const verbose = await cli(["status", "--verbose"], env);

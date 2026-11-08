@@ -47,7 +47,7 @@ export function stockReply(message: string, newThread: boolean, title: string): 
 
 export class DemoAdapter implements Adapter {
   readonly name = "demo";
-  readonly actions = ["follow_up", "settle", "snooze", "archive", "start_work"] as const;
+  readonly actions = ["follow_up", "settle", "snooze", "archive", "start_work", "unsnooze", "unsettle"] as const;
   private readonly threads = new Map<string, Thread>();
   private readonly receipts = new Map<string, Receipt>();
   private readonly listeners = new Set<(ids: string[], urgent: boolean) => void>();
@@ -162,6 +162,8 @@ export class DemoAdapter implements Adapter {
       t.item.wroteAt = now;
     } else if (action.kind === "settle") t.item.settled = true;
     else if (action.kind === "snooze") t.item.snoozedUntil = action.until;
+    else if (action.kind === "unsnooze") t.item.snoozedUntil = null;
+    else if (action.kind === "unsettle") t.item.settled = false;
     else if (action.kind === "archive") t.archived = true;
     t.item.updatedAt = now;
     this.log(`demo: ${action.kind} ${t.item.title}`);

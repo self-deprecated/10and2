@@ -3,6 +3,8 @@ import { mkdirSync, chmodSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Receipt } from "../contract.ts";
 
+/** What Driver keeps for a Claude session itself, since Claude has no such state. */
+export type OverlayKind = "settle" | "snooze" | "archive" | "unsettle" | "unsnooze";
 export type Overlay = { settledAt: string | null; snoozedAt: string | null; snoozedUntil: string | null; archived: number };
 export type Operation = { hash: string; receipt: string | null };
 export type Run = { sessionId: string; pid: number | null; procStart: string | null };
@@ -33,7 +35,7 @@ export class Store {
       this.db.exec("COMMIT"); return true;
     } catch (e) { this.db.exec("ROLLBACK"); throw e; }
   }
-  completeOverlay(key: string, hash: string, id: string, kind: "settle" | "snooze" | "archive", at: string, until?: string): Receipt | null {
+  completeOverlay(key: string, hash: string, id: string, kind: OverlayKind, at: string, until?: string): Receipt | null {
     this.db.exec("BEGIN IMMEDIATE");
     try {
       if (this.operation(key)) { this.db.exec("ROLLBACK"); return null; }
@@ -58,11 +60,13 @@ export class Store {
     if (pid === undefined) this.db.prepare("DELETE FROM claude_runs WHERE sessionId=?").run(id);
     else this.db.prepare("DELETE FROM claude_runs WHERE sessionId=? AND pid=?").run(id, pid);
   }
-  apply(id: string, kind: "settle" | "snooze" | "archive", at: string, until?: string) {
+  apply(id: string, kind: OverlayKind, at: string, until?: string) {
     this.db.prepare("INSERT OR IGNORE INTO claude_overlay(sessionId) VALUES(?)").run(id);
     if (kind === "settle") this.db.prepare("UPDATE claude_overlay SET settledAt=?,snoozedUntil=NULL WHERE sessionId=?").run(at, id);
     if (kind === "snooze") this.db.prepare("UPDATE claude_overlay SET snoozedAt=?,snoozedUntil=?,settledAt=NULL WHERE sessionId=?").run(at, until!, id);
     if (kind === "archive") this.db.prepare("UPDATE claude_overlay SET archived=1 WHERE sessionId=?").run(id);
+    if (kind === "unsettle") this.db.prepare("UPDATE claude_overlay SET settledAt=NULL WHERE sessionId=?").run(id);
+    if (kind === "unsnooze") this.db.prepare("UPDATE claude_overlay SET snoozedAt=NULL,snoozedUntil=NULL WHERE sessionId=?").run(id);
   }
   close() { this.db.close(); }
 }

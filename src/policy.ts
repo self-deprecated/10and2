@@ -22,7 +22,16 @@ export type Policy = {
   claude: boolean;
   /** Whether this machine's T3 Code is read. On by default; off for a machine with Claude Code only. */
   t3: boolean;
+  /**
+   * Where a new T3 Code worktree starts: a branch, fetched from origin first so it's the latest there (the branch as it
+   * is here when origin hasn't got it), or "HEAD", whatever the project's checkout is on now.
+   */
+  worktreeBase: string;
 };
+
+/** A branch name or "HEAD": no option, revset or range syntax, since T3 hands it to git and jj. */
+export const validBase = (b: unknown): b is string =>
+  typeof b === "string" && /^[A-Za-z0-9_][A-Za-z0-9._/-]{0,199}$/.test(b) && !b.includes("..") && !b.endsWith("/") && !b.endsWith(".lock");
 
 const ACTIONS: readonly ActionKind[] = ["follow_up", "settle", "snooze", "archive", "start_work"];
 /** Narrowest first. */
@@ -87,7 +96,9 @@ export function parsePolicy(text: string): Policy {
   if (raw.claude !== undefined && typeof raw.claude !== "boolean") throw bad("claude must be true or false");
   if (raw.t3 !== undefined && typeof raw.t3 !== "boolean") throw bad("t3 must be true or false");
   if (raw.t3 === false && !raw.claude) throw bad("t3 and claude are both off, so there's nothing to connect");
-  return { brain: raw.brain, projects, actions: [...new Set(actions as ActionKind[])], maxRuntimeMode, claude: raw.claude ?? false, t3: raw.t3 ?? true };
+  const worktreeBase = raw.worktreeBase ?? "HEAD";
+  if (!validBase(worktreeBase)) throw bad('worktreeBase must be a branch name, such as "main", or "HEAD"');
+  return { brain: raw.brain, projects, actions: [...new Set(actions as ActionKind[])], maxRuntimeMode, claude: raw.claude ?? false, t3: raw.t3 ?? true, worktreeBase };
 }
 
 export function loadPolicy(path = defaultPolicyPath()): Policy {
@@ -103,8 +114,11 @@ export function visible(policy: Policy, folder: string | null | undefined): bool
   return policy.projects.some((root) => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep));
 }
 
+/** Undoing a snooze or a settle is allowed wherever doing it is: a policy names only the five actions. */
+const UNDOES: Partial<Record<ActionKind, ActionKind>> = { unsnooze: "snooze", unsettle: "settle" };
+
 export function allows(policy: Policy, kind: ActionKind): boolean {
-  return policy.actions.includes(kind);
+  return policy.actions.includes(UNDOES[kind] ?? kind);
 }
 
 /** Whether a launch profile stays within the policy's ceiling. */

@@ -4,7 +4,8 @@
 // built in code from the ledger and the live thread list, never written by a model.
 import type { WorkItem } from "./adapter.ts";
 import type { BriefingView } from "./briefing.ts";
-import type { Store } from "./store.ts";
+import { KEPT, spokenDate } from "./proposals.ts";
+import type { Proposal, Store } from "./store.ts";
 
 export const DRIVE_GAP_MS = 30 * 60_000;
 export const CARRY_ON_MS = 90 * 60_000;
@@ -47,14 +48,18 @@ export type DriveSummary = {
   waiting: string[];
 };
 
-/** What a drive did, from the ledger: `names` says threads as they're named now; one not named any more is left out. */
-export function summarize(store: Store, drive: Drive, names: Map<string, string>): DriveSummary {
+/** The changes carried out in a drive, oldest first. */
+function drivesChanges(store: Store, drive: Drive): Proposal[] {
   const inDrive = (at: number) => at >= drive.start - 60_000 && at <= drive.end + 60_000;
-  const changes = drive.conversations
+  return drive.conversations
     .flatMap((c) => store.proposalsFor(c))
     .filter((p) => (p.state === "executed" || p.state === "partial") && p.result && inDrive(store.carriedOutAt(p.id) ?? p.createdAt))
-    .sort((a, b) => a.createdAt - b.createdAt)
-    .map((p) => p.result!);
+    .sort((a, b) => a.createdAt - b.createdAt);
+}
+
+/** What a drive did, from the ledger: `names` says threads as they're named now; one not named any more is left out. */
+export function summarize(store: Store, drive: Drive, names: Map<string, string>): DriveSummary {
+  const changes = drivesChanges(store, drive).map((p) => p.result!);
   const heardIds = new Set([...store.heardBetween(drive.conversations, drive.start, drive.end + 60_000), ...store.readsBetween(drive.start, drive.end + 60_000)]);
   const waits = store.waits().filter((w) => drive.conversations.includes(w.conversationId) && !w.ready);
   return {
@@ -67,14 +72,42 @@ export function summarize(store: Store, drive: Drive, names: Map<string, string>
   };
 }
 
+/** What each kind of change is, once carried out, in a history line. */
+const DONE_AS: Record<string, string> = { follow_up: "sent", start_work: "started", settle: "settled", settle_subagents: "settled", snooze: "snoozed", archive: "archived" };
+
+/**
+ * A change as background for the models, never a sentence to say: "reply to “Fix login”: sent". On 7 November the
+ * voice said "Sent the message to …" word for word from its instructions, for a reply it had just failed to send.
+ */
+export function historyLine(p: Proposal): string {
+  const names = p.targets.map((t) => `“${t.handle}”`).join(", ");
+  const what = p.action === "follow_up" ? `reply to ${names}`
+    : p.action === "start_work" ? `new thread “${p.fields.title ?? ""}” in ${p.fields.place ?? "a project"}`
+    : p.action === "settle_subagents" ? `${p.targets.length} finished subagent threads`
+    : p.action === "snooze" && p.fields.until ? `${names} until ${spokenDate(new Date(p.fields.until), p.createdAt).text}`
+    : names;
+  const done = DONE_AS[p.action] ?? "done";
+  const outcome = p.state === "executed" ? done
+    : p.state === "partial" ? `${done} for some of them`
+    : p.state === "cancelled" && p.result === KEPT ? "kept for later, unsent"
+    : p.state === "proposed" || p.state === "executing" ? "proposed, not agreed to yet"
+    : p.state === "failed" ? "failed, nothing changed"
+    : p.state === "unknown" ? "may or may not have gone through"
+    : p.state;
+  return `${what}: ${outcome}`;
+}
+
+/** A change's history line with when it was carried out (or proposed): "14:53, reply to “Fix login”: sent". */
+export const datedLine = (store: Store, p: Proposal) => `${time(store.carriedOutAt(p.id) ?? p.createdAt)}, ${historyLine(p)}`;
+
 const list = (xs: string[]) => (xs.length <= 1 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs.at(-1)}`);
 const time = (at: number) => new Date(at).toLocaleTimeString("en-GB", { hour: "2-digit", minute: "2-digit" });
 const when = (at: number) => `${new Date(at).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" })} at ${time(at)}`;
 
-/** A drive's summary as sentences, or null when nothing happened in it. */
-export function summaryText(s: DriveSummary): string | null {
+/** A drive's summary as sentences, or null when nothing happened in it. `changes`: its changes said otherwise. */
+export function summaryText(s: DriveSummary, changes: string[] = s.changes): string | null {
   const parts = [
-    ...s.changes,
+    ...changes,
     s.heard.length ? `Heard from ${list(s.heard)}.` : "",
     s.notes.length ? `Remembered: ${s.notes.map((n) => n.replace(/[.!?]+$/, "")).join("; ")}.` : "",
     s.waiting.length ? `Still waiting on ${list(s.waiting)}.` : "",
@@ -126,8 +159,12 @@ export function driveBlock(store: Store, conversationId: string, now: number, me
   const last = all.at(-1);
   if (!last || last.end < memoryStart) return null;
   if (continues(last, conversationId, now)) {
-    const text = summaryText(summarize(store, last, live.names));
-    return text ? `What Driver has done on this drive so far (since ${time(last.start)}), from its own record: ${text} Say this when the user asks what they got done.` : null;
+    const s = summarize(store, last, live.names);
+    const done = drivesChanges(store, last).map((p) => datedLine(store, p));
+    const text = summaryText(s, done.length ? [`Changes: ${done.join("; ")}.`] : []);
+    return text
+      ? `This drive so far (since ${time(last.start)}), from Driver's own record. It is history: none of it is the result of anything the user asks now, so never give it as what you just did; tell it, as dated background, only when the user asks what they got done. ${text}`
+      : null;
   }
   return sinceText(store, last, live.items, live.view, live.names);
 }

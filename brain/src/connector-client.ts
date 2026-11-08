@@ -16,7 +16,7 @@ const REQUEST_MS = 25_000;
 /** A link the connector hasn't pinged for this long is treated as down, so a half-open one fails at once. */
 const STALE_MS = 75_000;
 const MAX_PENDING = 128;
-const ACTIONS: ActionKind[] = ["follow_up", "settle", "snooze", "archive", "start_work"];
+const ACTIONS: ActionKind[] = ["follow_up", "settle", "snooze", "archive", "start_work", "unsnooze", "unsettle"];
 /** JSON-RPC errors that mean the connector did nothing: bad arguments, no such tool, too busy. */
 const NOTHING_DONE = new Set([-32602, -32601, -32000]);
 

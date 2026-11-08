@@ -5,7 +5,7 @@ import { WebSocket } from "ws";
 import type { Receipt } from "./contract.ts";
 import type { Ledger } from "./ledger.ts";
 import type { Local } from "./local.ts";
-import { ACTIONS, actionOf, CLOSE, ERR, MAX_FRAME, MAX_REQUESTS, MAX_TTL_MS, MCP_VERSION, PING, PING_MS, PONG, SILENCE_MS, SUBPROTOCOL, text, tools, VERSION, WORK_URI } from "./protocol.ts";
+import { actionOf, CLOSE, ERR, MAX_FRAME, MAX_REQUESTS, MAX_TTL_MS, MCP_VERSION, PING, PING_MS, PONG, SILENCE_MS, SUBPROTOCOL, text, tools, TOOL_ACTIONS, VERSION, WORK_URI } from "./protocol.ts";
 import { defaultPolicyPath } from "./policy.ts";
 import { redactOutbound } from "./redact.ts";
 import { describe } from "./util.ts";
@@ -227,7 +227,7 @@ export class Link {
         return r === "unsupported" ? result({ unsupported: true }, "Unsupported here.") : result(r, r.ok ? "Done." : r.error, !r.ok);
       }
     }
-    if (!ACTIONS.includes(p.name)) throw new RpcError(ERR.noMethod, "There's no such tool.");
+    if (!TOOL_ACTIONS.includes(p.name)) throw new RpcError(ERR.noMethod, "There's no such tool.");
     if (!a.actions.includes(p.name)) throw invalid(`Driver isn't allowed to ${String(p.name).replaceAll("_", " ")} on this machine.`);
     let action;
     try { action = actionOf({ ...args, kind: p.name }); } catch (e) { throw invalid(describe(e)); }

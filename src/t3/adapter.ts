@@ -5,6 +5,7 @@
 import type { Action, Adapter, ItemStatus, LaunchProfile, PastReply, Place, Receipt, ReplyRef, Report, WorkItem } from "../contract.ts";
 import { issueSession, revokeSession, CONNECTOR_SCOPES, type Cli, type T3Session } from "./auth.ts";
 import { ConnectionError, RpcClient, RpcError } from "./rpc.ts";
+import { execFile } from "node:child_process";
 import { describe } from "../util.ts";
 
 const M = {
@@ -123,6 +124,10 @@ export function toCommand(action: Action, commandId: string): Record<string, unk
       return { type: "thread.archive", commandId, threadId: action.itemId };
     case "snooze":
       return { type: "thread.snooze", commandId, threadId: action.itemId, snoozedUntil: action.until };
+    case "unsnooze":
+      return { type: "thread.unsnooze", commandId, threadId: action.itemId, reason: "user" };
+    case "unsettle":
+      return { type: "thread.unsettle", commandId, threadId: action.itemId, reason: "user" };
     case "follow_up":
       // Starts a run on an idle thread and queues behind a busy one; never steers or interrupts.
       return {
@@ -142,10 +147,25 @@ export function toCommand(action: Action, commandId: string): Record<string, unk
 }
 
 /**
- * A launch, built in code from the profile: the project's own id, a fresh worktree of its current commit or its own
- * checkout (never a path), no attachments. The same `commandId` returns the same thread (T3 keeps launch receipts).
+ * Where a new worktree of the project in `root` starts, given the policy's `worktreeBase`: null when the folder isn't in
+ * a git repository, which has nothing to branch, so the work runs in the folder itself; "HEAD" when the repository has
+ * no branch of that name here or from origin (a project whose main branch is named otherwise); else `base`.
  */
-export function toLaunch(action: Extract<Action, { kind: "start_work" }>, commandId: string, modelSelection: unknown): Record<string, unknown> {
+export async function worktreeStart(root: string, base: string): Promise<string | null> {
+  const git = (...args: string[]) => new Promise<boolean>((done) => execFile("git", ["-C", root, ...args], { timeout: 10_000 }, (e) => done(!e)));
+  if (!await git("rev-parse", "--is-inside-work-tree")) return null;
+  if (base === "HEAD") return base;
+  const has = (ref: string) => git("rev-parse", "--verify", "--quiet", `${ref}^{commit}`);
+  return await has(`refs/remotes/origin/${base}`) || await has(`refs/heads/${base}`) ? base : "HEAD";
+}
+
+/**
+ * A launch, built in code from the profile: the project's own id, a fresh worktree or its own checkout (never a path),
+ * no attachments. A worktree starts from `base` (`worktreeStart`): a branch, which T3 fetches from origin first, or
+ * "HEAD", the checkout's current commit; null runs it in the project's folder. The same `commandId` returns the same
+ * thread (T3 keeps launch receipts).
+ */
+export function toLaunch(action: Extract<Action, { kind: "start_work" }>, commandId: string, modelSelection: unknown, base: string | null = "HEAD"): Record<string, unknown> {
   const p: LaunchProfile = action.profile;
   return {
     commandId,
@@ -156,7 +176,8 @@ export function toLaunch(action: Extract<Action, { kind: "start_work" }>, comman
     modelSelection,
     runtimeMode: p.runtimeMode,
     interactionMode: p.interactionMode,
-    workspaceStrategy: p.workspace === "worktree" ? { type: "worktree", baseRef: "HEAD" } : { type: "root" },
+    workspaceStrategy: p.workspace === "root" || base === null ? { type: "root" }
+      : base === "HEAD" ? { type: "worktree", baseRef: "HEAD" } : { type: "worktree", baseRef: base, startFromOrigin: true },
     initialMessage: { text: action.message, attachments: [] },
   };
 }
@@ -168,13 +189,15 @@ type Options = {
   log: (msg: string) => void;
   /** Defaults to T3's CLI; tests swap in fakes. */
   visible?: (root: string) => boolean;
+  /** Where new worktrees start (the policy's `worktreeBase`); "HEAD" when unset. */
+  worktreeBase?: string;
   onRevoked?: () => void;
   auth?: { issue(): Promise<T3Session>; revoke(sessionId: string): Promise<void> };
 };
 
 export class T3Adapter implements Adapter {
   readonly name = "t3";
-  readonly actions = ["follow_up", "settle", "snooze", "archive", "start_work"] as const;
+  readonly actions = ["follow_up", "settle", "snooze", "archive", "start_work", "unsnooze", "unsettle"] as const;
 
   private readonly opts: Options;
   private session: T3Session | null = null;
@@ -373,9 +396,11 @@ export class T3Adapter implements Adapter {
     if (!this.projectInfo.has(action.placeId)) return { ok: false, error: "That project is no longer in T3." };
     const model = this.modelFor(action.placeId);
     if (!model) return { ok: false, error: "T3 has no model to start it with: the project has no default model and no threads." };
+    const root = this.projectInfo.get(action.placeId)!.workspaceRoot;
+    const base = action.profile.workspace === "worktree" && root ? await worktreeStart(root, this.opts.worktreeBase ?? "HEAD") : "HEAD";
     let threadId: string;
     try {
-      const r = await this.client.request<{ threadId: string }>(M.launchThread, toLaunch(action, commandId, model));
+      const r = await this.client.request<{ threadId: string }>(M.launchThread, toLaunch(action, commandId, model, base));
       threadId = r.threadId;
     } catch (e) {
       if (e instanceof ConnectionError) return { ok: false, error: e.message, unknown: true };

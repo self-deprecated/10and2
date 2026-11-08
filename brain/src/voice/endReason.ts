@@ -9,6 +9,8 @@ export type EndReason =
   | { kind: "dictating"; handle: string }
   | { kind: "idle" }
   | { kind: "max_duration" }
+  /** The session reached its time cap: the phone carries the call on in a new session of the same conversation. */
+  | { kind: "rollover" }
   | { kind: "user_stop" }
   | { kind: "replaced" }
   | { kind: "connection_closed" }
@@ -18,7 +20,11 @@ export type EndReason =
   | { kind: "phone_end" }
   | { kind: "restarted" }
   /** The cloud account's credits ran out during the call (contracts §4): Driver said so and goodbye. */
-  | { kind: "out_of_credits" };
+  | { kind: "out_of_credits" }
+  /** The anonymous demo drive reached its cap (`capMs`, the cloud's 2 minutes): Driver said so and goodbye. */
+  | { kind: "demo_over" }
+  /** Staff ended it from 10 & 2 Ops (docs/launch/ops-app.md §3): no call-back, and nothing counts as heard. */
+  | { kind: "ended_by_staff" };
 
 export function reasonText(reason: EndReason): string {
   switch (reason.kind) {
@@ -29,6 +35,8 @@ export function reasonText(reason: EndReason): string {
     case "dictating": return `dictating a reply to ${reason.handle}`;
     case "idle": return "idle";
     case "max_duration": return "max duration";
+    case "rollover": return "rolled over to a new session";
+    case "ended_by_staff": return "ended by staff";
     case "user_stop": return "stopped by user";
     case "replaced": return "replaced by a new session";
     case "connection_closed": return "connection closed";
@@ -38,6 +46,7 @@ export function reasonText(reason: EndReason): string {
     case "phone_end": return "ended by the phone";
     case "restarted": return "the brain restarted while it was open";
     case "out_of_credits": return "out of credits";
+    case "demo_over": return "the demo's time was up";
   }
 }
 
@@ -49,5 +58,5 @@ export function holdsAfter(reason: EndReason): boolean {
 /** The user was on the line for these endings, so what Driver had said counts as heard. */
 export function deliberate(reason: EndReason): boolean {
   return reason.kind === "goodbye" || reason.kind === "paused" || reason.kind === "waiting" || reason.kind === "reading" || reason.kind === "dictating" || reason.kind === "idle" ||
-    reason.kind === "max_duration" || reason.kind === "user_stop" || reason.kind === "out_of_credits";
+    reason.kind === "max_duration" || reason.kind === "rollover" || reason.kind === "user_stop" || reason.kind === "out_of_credits" || reason.kind === "demo_over";
 }

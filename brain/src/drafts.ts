@@ -59,13 +59,38 @@ export function parseDraft(raw: unknown): Draft | null {
 
 export const wordCount = (d: Draft) => d.parts.reduce((n, p) => n + (p.text.match(/\S+/g)?.length ?? 0), 0);
 
-/** The start of a paragraph of what was read, as a short quote: whole words, and no quote marks of its own. */
-function quote(segments: Segment[], paragraph: number): string | null {
-  const text = segments.filter((s) => s.paragraph === paragraph).map((s) => s.text).join(" ").replace(/["“”]/g, "'").replace(/\s+/g, " ").trim();
+/** The start of a paragraph, as a short quote: whole words, on one line, and no quote marks of its own. */
+function shortQuote(paragraph: string): string | null {
+  const text = paragraph.replace(/["“”]/g, "'").replace(/\s+/g, " ").trim();
   if (!text) return null;
   if (text.length <= QUOTE_MAX) return text;
   const cut = text.slice(0, QUOTE_MAX);
   return `${cut.slice(0, Math.max(cut.lastIndexOf(" "), QUOTE_MAX / 2)).replace(/[\s,;:.]+$/, "")}…`;
+}
+
+/** The start of a paragraph of what was read, as a short quote. */
+const quote = (segments: Segment[], paragraph: number) => shortQuote(segments.filter((s) => s.paragraph === paragraph).map((s) => s.text).join(" "));
+
+/**
+ * A reply sent with a tap (`/api/reply`): the user's words as they wrote them, after the start of the paragraph of the
+ * thread's reply they answer, if they picked one ("Reply to this"), as a quoted line.
+ */
+export function tappedReply(text: string, paragraph: string | null): string {
+  const said = paragraph === null ? null : shortQuote(paragraph.slice(0, 2000));
+  return said ? `> ${said}\n\n${text}` : text;
+}
+
+/** What a tapped reply says, without the dictation's first line (a kept reply's) or the quoted line it may start with. */
+export const tappedWords = (message: string) => dictatedParts(message).text.replace(/^> [^\n]*\n\n/, "");
+
+/** The first line of a dictated message, saying it was dictated: parts answering a reply as it was read, or none. */
+const DICTATED = "(Dictated by voice in Driver and transcribed on my phone, so names and technical words may be misheard.)";
+const DICTATED_READ = "(Dictated by voice in Driver while your reply was read to me, and transcribed on my phone, so names and technical words may be misheard.)";
+
+/** A message as its first line saying it was dictated (`note`), if it has one, and the user's words after it. */
+export function dictatedParts(message: string): { note: string | null; text: string } {
+  for (const note of [DICTATED, DICTATED_READ]) if (message.startsWith(`${note}\n\n`)) return { note, text: message.slice(note.length + 2) };
+  return { note: null, text: message };
 }
 
 /**
@@ -75,9 +100,7 @@ function quote(segments: Segment[], paragraph: number): string | null {
  */
 export function assemble(draft: Draft, segments: (readingId: string) => { itemId: string; segments: Segment[] } | null): string {
   const anchored = draft.parts.some((p) => p.readingId !== null);
-  const header = anchored
-    ? "(Dictated by voice in Driver while your reply was read to me, and transcribed on my phone, so names and technical words may be misheard.)"
-    : "(Dictated by voice in Driver and transcribed on my phone, so names and technical words may be misheard.)";
+  const header = anchored ? DICTATED_READ : DICTATED;
   if (!anchored) return [header, ...draft.parts.map((p) => p.text)].join("\n\n");
   const blocks = draft.parts.map((p) => {
     if (p.readingId === null || p.paragraph === null) return `Overall:\n${p.text}`;
@@ -89,8 +112,11 @@ export function assemble(draft: Draft, segments: (readingId: string) => { itemId
   return [header, ...blocks].join("\n\n");
 }
 
-/** How the phone learns what became of a draft it handed over: sent, maybe sent (the outcome was lost), or not. */
-export type DraftState = "sent" | "unknown" | "unsent";
+/**
+ * How the phone learns what became of a draft it handed over: sent, maybe sent (the outcome was lost), kept for later on
+ * the brain (`keptId`: it's in Not sent), or not.
+ */
+export type DraftState = "sent" | "unknown" | "kept" | "unsent";
 
 export function draftState(proposals: Proposal[]): { state: DraftState; result: string | null } {
   const sent = proposals.find((p) => p.state === "executed" || p.state === "partial");
@@ -100,4 +126,8 @@ export function draftState(proposals: Proposal[]): { state: DraftState; result: 
   return { state: "unsent", result: null };
 }
 
-export const draftStateOf = (store: Store, draftId: string) => draftState(store.draftProposals(draftId));
+export function draftStateOf(store: Store, draftId: string): { state: DraftState; result: string | null; keptId?: string } {
+  const s = draftState(store.draftProposals(draftId));
+  const kept = s.state === "unsent" ? store.keptByDraft(draftId) : null;
+  return kept ? { state: "kept", result: null, keptId: kept.id } : s;
+}

@@ -6,12 +6,19 @@
 import { randomUUID } from "node:crypto";
 import type { Action, Adapter, LaunchProfile, Place, Receipt, WorkItem } from "./adapter.ts";
 import { DONE, type ClutterGroup } from "./briefing.ts";
-import { DRAFT_MAX } from "./drafts.ts";
+import { dictatedParts, DRAFT_MAX, draftState, newThreadTarget } from "./drafts.ts";
 import { inGroup, isMark, keyWords, nameKey, norm, pick, resolve, sayKey, saysHead, speechTokens, spokenTitle, withGroup, type Named } from "./handles.ts";
-import type { Proposal, Store } from "./store.ts";
+import { TAP, type Proposal, type ProposalTarget, type Store } from "./store.ts";
 import { mapLimit } from "./util.ts";
+import type { Track } from "./analytics.ts";
 
 export type ProposeAction = "follow_up" | "settle" | "snooze" | "archive" | "settle_subagents" | "start_work";
+/**
+ * What a tap on the phone changes in a thread (`Proposals.tap`): a reply sent with Send is a `follow_up`. Following one
+ * is the brain's own (`noted`).
+ */
+export type TapAction = "settle" | "unsettle" | "snooze" | "unsnooze" | "follow_up";
+
 /** `project`, `title` and `profile` are for start_work: where, what the new thread is called, and which launch profile. */
 export type ProposeInput = {
   action: ProposeAction;
@@ -26,10 +33,67 @@ export type ToolResult = Record<string, unknown>;
 /** The user's latest turn and how much the assistant had said when it began. */
 export type UserTurn = { text: string; atSpoken: number };
 
+/**
+ * What the user said, without the sounds speech-to-text writes in brackets: "[sniff", "[hum]", "[cough]". On 5 November a
+ * sniff right after "Do it" became the user's latest turn, the yes was refused, and the voice said "Sent." anyway.
+ */
+export const spokenWords = (text: string) => text.replace(/\[[^\][\n]{0,40}(?:\]|$)/g, " ").replace(/\s+/g, " ").trim();
+
+/**
+ * The result of a reply proposal kept for later (`Proposals.keep`): closed as "cancelled", since nothing was sent, with
+ * this result, so its receipt says kept (callview.ts).
+ */
+export const KEPT = "Kept for later.";
+
+/**
+ * What a reply to a thread does in a call (the phone's setting, "Ask each time" by default there): "ask" whether to send
+ * it now or keep it for later, "keep" it for later at once (no readback, no yes: nothing is sent), or "send" it on a
+ * spoken yes. Only replies to existing threads; any other change is proposed as ever.
+ */
+export type KeepReplies = "ask" | "keep" | "send";
+
+/**
+ * How the user agrees to a change in a call (the phone's setting `confirm`, per kind of change): "none" carries it out
+ * as soon as it's proposed; "yes" on a clear yes after it was proposed; "readback" on a yes after the readback was heard
+ * in full (every change, before 7 November); "tap" only with the phone's Send.
+ */
+export type Level = "none" | "yes" | "readback" | "tap";
+export type ConfirmLevels = { reply: Level; start: Level; archive: Level; settle: Level; snooze: Level; tidy: Level };
+/** What a call gets for any kind of change its phone doesn't say (an older phone says none). */
+export const DEFAULT_CONFIRM: ConfirmLevels = { reply: "yes", start: "yes", archive: "yes", settle: "none", snooze: "none", tidy: "none" };
+/** Every change read back and heard: a session told nothing (tests, a session made before levels, taken back after a restart). */
+export const READBACK_ALL: ConfirmLevels = { reply: "readback", start: "readback", archive: "readback", settle: "readback", snooze: "readback", tidy: "readback" };
+const LEVELS: readonly Level[] = ["none", "yes", "readback", "tap"];
+/** Which setting a proposed action follows. */
+export const CONFIRM_KEY = { follow_up: "reply", start_work: "start", archive: "archive", settle: "settle", snooze: "snooze", settle_subagents: "tidy" } as const satisfies Record<ProposeAction, keyof ConfirmLevels>;
+
+/** The phone's `confirm` (an object, or one encoded as JSON): each kind it says, the default for the rest. */
+export function confirmOf(raw: unknown): ConfirmLevels {
+  let given: any = raw;
+  if (typeof raw === "string") {
+    try {
+      given = JSON.parse(raw);
+    } catch {
+      given = null;
+    }
+  }
+  const out = { ...DEFAULT_CONFIRM };
+  if (!given || typeof given !== "object") return out;
+  for (const k of Object.keys(out) as (keyof ConfirmLevels)[]) if (LEVELS.includes(given[k])) out[k] = given[k];
+  return out;
+}
+
+/** What a spoken confirm the brain refused would have done, as a receipt says it: "Not sent". */
+export const NOT_DONE: Record<string, string> = {
+  follow_up: "Not sent", start_work: "Not started", archive: "Not archived", settle: "Not settled", snooze: "Not snoozed", settle_subagents: "Not settled",
+};
+
 const EXPIRY_MS = 120_000;
 /** An outcome lost to a dropped connection may be retried (same keys) for a while longer. */
 const RETRY_MS = 10 * 60_000;
 const MAX_TARGETS = 10;
+/** How long a carried-out change stays in `/api/updates` for the phone's tone (it polls every 3 s). */
+const DONE_MS = 30_000;
 
 export type ProposalDeps = {
   store: Store;
@@ -49,6 +113,8 @@ export type ProposalDeps = {
   lastUserTurn: (conversationId: string) => UserTurn;
   now?: () => number;
   log?: (m: string) => void;
+  /** Analytics (contracts §5): a reply kept for later is `reply_kept`. */
+  track?: Track;
 };
 
 const list = (xs: string[]) => (xs.length <= 1 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs.at(-1)}`);
@@ -63,6 +129,35 @@ const nameTokens = (s: string) => speechTokens(s).filter((w) => !isMark(w));
 const said = (t: { handle: string; group?: string }) => (t.group === undefined ? t.handle : withGroup(t.handle, t.group));
 /** The same, before what follows it in a sentence: "Send Agent Reel, in sd, this message". */
 const saidBefore = (t: { handle: string; group?: string }) => (t.group === undefined ? t.handle : withGroup(t.handle, t.group, true));
+type MustHear = Omit<Proposal["mustHear"][number], "from">;
+
+/** A place's project, as heard: "in driver" of "in driver, on Lattice". */
+const projectTokens = (name: string) => {
+  const t = speechTokens(`in ${name}`);
+  const m = t.findIndex(isMark);
+  return { project: m < 0 ? t : t.slice(0, m), rest: m < 0 ? [] : t.slice(m) };
+};
+
+/**
+ * What a new thread's readback must be heard saying, before "with this message": "Start a new thread called <title>, in
+ * <project>" word for word. The machine may be left out when no other machine has a project of that name, and the
+ * profile when it's the default; a profile the user asked for is heard as a clause of its own. On 5 November the voice
+ * said "…, in Driver, with this message" four times over and each "yes" was refused.
+ */
+function startHeard(title: string, place: Place, places: Place[], profile: LaunchProfile, isDefault: boolean): MustHear[] {
+  const { project, rest } = projectTokens(place.name);
+  const key = project.join(" ");
+  const shared = places.some((o) => o.id !== place.id && projectTokens(o.name).project.join(" ") === key);
+  const named = nameTokens(`Start a new thread called ${title}`);
+  const head = shared ? [...named, ...project, ...rest.filter((w) => !isMark(w))] : [...named, ...project];
+  const profileWords = speechTokens(`, with the ${profile.name} profile`);
+  const where = [...(shared ? [] : rest), ...(isDefault ? profileWords : [])];
+  return [
+    { words: [], need: 0, head, where, next: ["with", "this"] },
+    ...(isDefault ? [] : [{ words: [], need: 0, head: nameTokens(`with the ${profile.name} profile`), next: "with" }]),
+  ];
+}
+
 /** The project a readback says after the name, as heard: optional there, since the name alone is unique. */
 const whereTokens = (t: { handle: string; group?: string }) => {
   if (said(t) === t.handle) return [];
@@ -167,8 +262,9 @@ export function heard(p: Pick<Proposal, "mustHear">, spoken: string, atSpoken = 
   return p.mustHear.every((g) => {
     if (g.head) return saysHead(speechTokens(spoken.slice(g.from)), g.head, g.next ?? null, g.where);
     if (g.message !== undefined) {
-      // Only an empty message prefix may carry into the immediately following utterance.
-      const parts = spoken.slice(g.from).split(/(\uE000|\bshall\s+i\s+go\s+ahead\b)/i);
+      // Only an empty message prefix may carry into the immediately following utterance. Either question after a
+      // readback ends it: its words are never the message's.
+      const parts = spoken.slice(g.from).split(/(\uE000|\bshall\s+i\s+go\s+ahead\b|\bsend\s+it\s+now\W+or\s+keep\s+it\s+for\s+later\b)/i);
       let end = g.from;
       for (let i = 0; i < parts.length; i += 2) {
         const readFrom = end;
@@ -223,11 +319,14 @@ export function heard(p: Pick<Proposal, "mustHear">, spoken: string, atSpoken = 
 }
 
 const YES = /\b(yes|yeah|yep|yup|sure|ok|okay|go ahead|go for it|do it|send it|please do|confirm|confirmed|correct|absolutely|definitely|sounds good|make it so)\b/i;
-const NO = /\b(no|nope|don't|do not|wait|hold on|hang on|stop|cancel|never ?mind|not yet|actually|not|maybe|perhaps|I guess|I think|probably|unsure|hm+|but|unless|except|only if|instead|rather)\b/i;
+// "Send it now, or keep it for later?" (a dictated reply, `keepReplies: "ask"`): "Send it now" (or "Send", 7 November) as the whole answer is a yes;
+// inside anything longer ("do you need me to say send now?") it isn't, and "send it later" never is.
+const SEND_NOW = /^\W*(?:yes\W+)?send(?: it)?(?: now)?(?:\W+please)?\W*$/i;
+const NO = /\b(no|nope|don't|do not|wait|hold on|hang on|stop|cancel|never ?mind|not yet|actually|not|maybe|perhaps|I guess|I think|probably|unsure|hm+|but|unless|except|only if|instead|rather|later|keep)\b/i;
 /** The user's own words must agree: the model's judgement alone is not consent (thread text can inject). */
 export const agrees = (said: string) => {
-  const s = messageText(said).replace(/\bno (problem|worries)\b/gi, "");
-  return YES.test(s) && !NO.test(s);
+  const s = messageText(spokenWords(said)).replace(/\bno (problem|worries)\b/gi, "");
+  return (YES.test(s) || SEND_NOW.test(s)) && !NO.test(s);
 };
 
 /** What a spoken message can't contain, or null: the readback's own markers, and more than a voice follow-up holds. */
@@ -287,7 +386,18 @@ export class Proposals {
     return this.d.now?.() ?? Date.now();
   }
 
-  async propose(conversationId: string, input: ProposeInput): Promise<ToolResult> {
+  /**
+   * A change the user asked for, prepared to agree to as its `levels` say (`Level`): read back and asked about, or
+   * (`none`) carried out at once, its result returned.
+   */
+  async propose(conversationId: string, input: ProposeInput, keepReplies: KeepReplies = "send", levels: ConfirmLevels = READBACK_ALL): Promise<ToolResult> {
+    // A reply kept straight away isn't sent, so it needs no readback, and nothing is asked of the computer (it may be asleep).
+    const keeping = keepReplies === "keep" && input.action === "follow_up";
+    const asked = levels[CONFIRM_KEY[input.action]] ?? "readback";
+    // A reply the user's settings ask about ("Send it now, or keep it for later?") is still asked about, whatever its
+    // level: then their "send it now" is the yes.
+    const level: Level = asked === "none" && keepReplies === "ask" && input.action === "follow_up" ? "yes" : asked;
+    const atOnce = !keeping && level === "none";
     const current = this.preparing(conversationId);
     const now = this.now();
     if (input.action !== "settle_subagents" && !this.d.adapter.actions.includes(input.action)) {
@@ -317,7 +427,7 @@ export class Proposals {
       Object.assign(fields, { placeId: start.place.id, place: start.place.name, title: start.title, profile: start.profile, message });
       // Title, place and profile are heard word for word, as one clause up to "with this message"; the message as a follow-up's.
       readback = `${start.head}, with this message: "${message}"`;
-      entities.push({ words: [], need: 0, head: nameTokens(start.head), next: "with" });
+      entities.push(...start.heard);
       const words = messageWords(message);
       messageGroup = { words, need: messageNeed(words.length), from: createdFrom, message };
     } else {
@@ -378,19 +488,21 @@ export class Proposals {
     const actions: Action[] = input.action === "start_work"
       ? [{ kind: "start_work", placeId: fields.placeId!, title: fields.title!, message: fields.message!, profile: fields.profile! }]
       : targets.map((t) => toAction({ action: input.action, fields } as Proposal, t.itemId));
-    const reason = await this.check(actions);
+    const reason = keeping ? null : await this.check(actions);
     if (reason) return { error: reason };
     if (!current()) return { error: "That proposal was stopped or replaced; nothing was proposed." };
+    fields.confirm = level;
 
     // A new proposal replaces any still open in this conversation, so "yes" can't land on a stale one.
     // If it changes nothing but the message, the names and verb already spoken still count (the voice
     // model often starts reading before a revision lands); the message itself never carries over.
+    // One carried out at once asks for no yes, so a change still waiting for one stays open.
     let entitiesFrom = createdFrom;
     const sameEntities = (o: Proposal) =>
       o.action === input.action && o.fields.until === fields.until && o.fields.placeId === fields.placeId &&
       o.fields.title === fields.title && o.fields.profile?.name === fields.profile?.name &&
       JSON.stringify(o.targets.map((t) => t.itemId).sort()) === JSON.stringify(targets.map((t) => t.itemId).sort());
-    for (const old of this.d.store.openProposals(conversationId)) {
+    for (const old of atOnce ? [] : this.d.store.openProposals(conversationId)) {
       if (sameEntities(old)) entitiesFrom = Math.min(entitiesFrom, old.createdFrom);
       this.d.store.putProposal({ ...old, state: "cancelled", result: "superseded" });
     }
@@ -404,15 +516,33 @@ export class Proposals {
       mustHear: [...entities.map((g) => ({ ...g, from: entitiesFrom })), ...(messageGroup ? [messageGroup] : [])],
       createdFrom,
       expiresAt: now + EXPIRY_MS,
-      state: "proposed",
+      // Carried out at once: claimed now, so nothing else can confirm or cancel it meanwhile.
+      state: atOnce ? "executing" : "proposed",
       createdAt: now,
       result: null,
     };
     this.d.store.putProposal(p);
+    if (keeping) {
+      const kept = this.keep(conversationId, p.id);
+      const words = fields.message!.split(/\s+/);
+      const first = words.length <= 6 ? `${fields.message!.replace(/[\s.!?,;:]+$/, "")}.` : `${words.slice(0, 6).join(" ").replace(/[\s.!?,;:]+$/, "")}…`;
+      return { kept: true, kept_id: kept.kept_id, result: `Kept your reply to ${targets[0].handle}, unsent: it's in Not sent on the phone.`, instruction: `Say only "Kept: ${first} It's in Not sent." (no readback: nothing was sent), then carry on with what they want next.` };
+    }
+    if (atOnce) {
+      // The user's settings ask no yes for this: asking for it was enough.
+      const r = await this.execute(p, false);
+      return "error" in r ? r : { ...r, proposal_id: p.id, instruction: "It's been carried out already, with no readback and no question: tell the user this result in a few words, adding nothing that isn't in it. Never call confirm for it." };
+    }
+    const isReply = keepReplies === "ask" && input.action === "follow_up";
+    const ask = level === "tap"
+      ? isReply ? "\"Tap Send on your phone to send it, or I can keep it for later.\"" : "\"Tap Send on your phone to go ahead.\""
+      : isReply ? "\"Send it now, or keep it for later?\"" : "\"Shall I go ahead?\"";
     return {
       proposal_id: p.id,
       readback,
-      instruction: "Say the readback word for word, then ask \"Shall I go ahead?\" and stop. Nothing has happened yet.",
+      instruction: level === "tap"
+        ? `Say the readback word for word, then say ${ask} and stop. Nothing has happened yet: only their tap on Send carries it out, so never call confirm for it.`
+        : `Say the readback word for word, then ask ${ask} and stop. Nothing has happened yet.`,
     };
   }
 
@@ -421,7 +551,7 @@ export class Proposals {
    * dictated start, the place it was dictated for (`placeId`). `head` is the readback up to its message, all heard word
    * for word.
    */
-  newThread(where: { project: string } | { placeId: string }, rawTitle: string, asked: string | null): { place: Place; title: string; profile: LaunchProfile; head: string } | { error: string } {
+  newThread(where: { project: string } | { placeId: string }, rawTitle: string, asked: string | null): { place: Place; title: string; profile: LaunchProfile; head: string; heard: MustHear[] } | { error: string } {
     const profiles = this.d.profiles ?? [];
     const named = asked?.trim().replace(/\s+profile$/i, "");
     const profile = named ? profiles.find((p) => nameKey(p.name) === nameKey(named)) : profiles[0];
@@ -443,7 +573,7 @@ export class Proposals {
     // Two places said alike ("agent-hearth" and "agent hearth" on one machine) can't be told apart by any readback.
     const twin = places.find((o) => o.id !== place.id && sayKey(o.name) === sayKey(place.name));
     if (twin) return { error: tooAlike({ target: place.name, other: twin.name }) };
-    return { place, title, profile, head: `Start a new thread called ${title}, in ${place.name}, with the ${profile.name} profile` };
+    return { place, title, profile, head: `Start a new thread called ${title}, in ${place.name}, with the ${profile.name} profile`, heard: startHeard(title, place, places, profile, profile === profiles[0]) };
   }
 
   /** Whether a dictated draft may be proposed: not if it's been sent or is being sent; its own lost proposal again, here. */
@@ -463,7 +593,7 @@ export class Proposals {
    * A new thread's opening prompt, dictated on the phone and heard back there in full: a start to agree to, read back
    * as one said aloud is, with "your dictated prompt" in place of the message. Sent once, like a dictated reply.
    */
-  async proposeDraftStart(conversationId: string, d: { draftId: string; placeId: string; title: string; profile: string; message: string; words: number; parts: number }): Promise<{ proposal: Proposal } | { error: string }> {
+  async proposeDraftStart(conversationId: string, d: { draftId: string; placeId: string; title: string; profile: string; message: string; words: number; parts: number }, level: Level = "readback"): Promise<{ proposal: Proposal } | { error: string }> {
     const current = this.preparing(conversationId);
     const now = this.now();
     if (!this.d.adapter.actions.includes("start_work")) return { error: "This system can't start work." };
@@ -482,9 +612,10 @@ export class Proposals {
       conversationId,
       action: "start_work",
       targets: [],
-      fields: { placeId: start.place.id, place: start.place.name, title: start.title, profile: start.profile, message: d.message, draftId: d.draftId },
+      fields: { placeId: start.place.id, place: start.place.name, title: start.title, profile: start.profile, message: d.message, draftId: d.draftId, confirm: draftLevel(level) },
       readback: `${start.head}, with your dictated prompt, ${size(d.words, d.parts)}.`,
-      mustHear: [{ words: [], need: 0, from: createdFrom, head: nameTokens(start.head), next: "with" }],
+      // "…, with your dictated prompt": the head's own clause is followed by "with your", not "with this".
+      mustHear: start.heard.map((g) => ({ ...g, from: createdFrom, ...(Array.isArray(g.next) ? { next: ["with", "your"] } : {}) })),
       createdFrom,
       expiresAt: now + EXPIRY_MS,
       state: "proposed",
@@ -502,7 +633,7 @@ export class Proposals {
    * was lost in another conversation, isn't proposed again; one lost in this conversation is that proposal again, so a
    * yes retries it with the same keys.
    */
-  async proposeDraft(conversationId: string, d: { draftId: string; itemId: string; message: string; words: number; parts: number }): Promise<{ proposal: Proposal } | { error: string }> {
+  async proposeDraft(conversationId: string, d: { draftId: string; itemId: string; message: string; words: number; parts: number }, level: Level = "readback"): Promise<{ proposal: Proposal } | { error: string }> {
     const current = this.preparing(conversationId);
     const now = this.now();
     if (!this.d.adapter.actions.includes("follow_up")) return { error: "This system can't take follow-ups." };
@@ -524,7 +655,7 @@ export class Proposals {
       conversationId,
       action: "follow_up",
       targets,
-      fields: { message: d.message, draftId: d.draftId },
+      fields: { message: d.message, draftId: d.draftId, confirm: draftLevel(level) },
       readback: `Send ${saidBefore(targets[0])} your dictated reply, ${size(d.words, d.parts)}.`,
       mustHear: [{ words: [], need: 0, from: createdFrom, head: nameTokens(`Send ${target.handle}`), where: whereTokens(targets[0]), next: "your" }],
       createdFrom,
@@ -535,6 +666,112 @@ export class Proposals {
     };
     this.d.store.putProposal(p);
     return { proposal: p };
+  }
+
+  /**
+   * A dictated reply kept for later as the call opens (the phone's setting `keepReplies: "keep"`), rather than proposed:
+   * nothing is sent, and nothing is asked of the computer (it may be asleep: that's what later is for). Kept as a
+   * proposal closed as kept, for the call's receipt, and as the kept reply the phone lists. Not if it's been sent, or may
+   * have been.
+   */
+  keepDraft(conversationId: string, d: { draftId: string; itemId: string; message: string; words: number; parts: number }): { proposal: Proposal } | { error: string } {
+    const now = this.now();
+    const was = draftState(this.d.store.draftProposals(d.draftId)).state;
+    if (was === "sent") return { error: "That reply has already been sent." };
+    if (was === "unknown") return { error: "That reply may already have gone through. Check T3 before sending it again." };
+    const target = this.d.named().find((n) => n.id === d.itemId);
+    if (!target) return { error: "That thread is settled or gone, so the reply wasn't kept. It's still on your phone." };
+    for (const old of this.d.store.openProposals(conversationId)) this.d.store.putProposal({ ...old, state: "cancelled", result: "superseded" });
+    const targets = [{ itemId: target.id, handle: target.handle, group: target.group }];
+    const p: Proposal = {
+      id: `P-${randomUUID().slice(0, 8)}`, conversationId, action: "follow_up", targets, fields: { message: d.message, draftId: d.draftId },
+      readback: `Send ${saidBefore(targets[0])} your dictated reply, ${size(d.words, d.parts)}.`, mustHear: [], createdFrom: this.d.spoken(conversationId).length,
+      expiresAt: now + EXPIRY_MS, state: "proposed", createdAt: now, result: null,
+    };
+    this.d.store.putProposal(p);
+    this.keep(conversationId, p.id);
+    return { proposal: this.d.store.proposal(p.id)! };
+  }
+
+  /**
+   * The user's "keep it for later" for open proposal `id`, a reply to one thread (`keep`): nothing is sent. The reply is
+   * kept, unsent, for the phone's Not sent (a dictated one without its first line, which goes back on when it's sent),
+   * and the proposal is closed as kept (`KEPT`). The same dictated draft kept again replaces the one kept before.
+   */
+  keep(conversationId: string, id: string): ToolResult {
+    const p = this.d.store.proposal(id);
+    if (!p || p.conversationId !== conversationId) return { error: "No such proposal." };
+    if (p.action !== "follow_up" || p.targets.length !== 1) return { error: "Only a reply to a thread can be kept for later. Say so, and ask whether to go ahead or leave it." };
+    const target = p.targets[0];
+    const said = `Kept your reply to ${target.handle}. It's in Not sent on the phone.`;
+    const instruction = "Say only that it's kept, in Not sent on their phone (\"Kept. It's in Not sent on your phone.\"), then carry on with what they want next.";
+    const keptBefore = p.fields.keptId ? this.d.store.keptReply(p.fields.keptId) : null;
+    if (p.state === "cancelled" && p.result === KEPT) return { kept: true, ...(keptBefore ? { kept_id: keptBefore.id } : {}), result: said, instruction };
+    if (p.state !== "proposed") return { error: `That reply can't be kept: it's already ${p.state}${p.result ? ` (${p.result})` : ""}.` };
+    this.d.store.putProposal({ ...p, state: "cancelled", result: KEPT });
+    // A kept reply proposed to send (`sendKept`) and kept again is the same one, still kept.
+    if (keptBefore) return { kept: true, kept_id: keptBefore.id, result: said, instruction };
+    const { note, text } = dictatedParts(p.fields.message ?? "");
+    const kept = this.d.store.keepReply({
+      id: `K-${randomUUID().slice(0, 8)}`, threadId: target.itemId, threadName: target.handle, project: target.group ?? "", text, note,
+      draftId: p.fields.draftId ?? null, conversationId, keptAt: this.now(),
+    });
+    this.d.log?.(`proposal ${p.id} kept for later`);
+    this.d.track?.("reply_kept", { action: "kept", count: 1 });
+    return { kept: true, kept_id: kept.id, result: said, instruction };
+  }
+
+  /** Kept replies being sent by voice now (`sendKept`): each goes once at a time. */
+  private readonly sendingKept = new Set<string>();
+
+  /**
+   * The user asked to send reply `keptId`, kept for later (the backend's `send_kept`), at their reply level (`levels`):
+   * asking is the yes for "none" and "yes", so it's sent now; "readback" proposes it, to read back and agree to; "tap"
+   * sends nothing (Send on it in Not sent does). Sent, it's no longer kept; the call's receipt is a change like any.
+   */
+  async sendKept(conversationId: string, keptId: string, levels: ConfirmLevels = READBACK_ALL): Promise<ToolResult> {
+    const kept = this.d.store.keptReply(keptId);
+    if (!kept) return { error: "That reply isn't kept any more: it was sent or discarded. Say so." };
+    const level = levels.reply ?? "readback";
+    if (level === "tap") {
+      return { sent: false, result: "Nothing was sent.", instruction: "Nothing was sent: the user's settings send replies only with a tap. Tell them to tap Send on it in Not sent on their phone." };
+    }
+    if (this.sendingKept.has(kept.id)) return { error: "That reply is being sent right now." };
+    if (!this.d.adapter.actions.includes("follow_up")) return { error: "This system can't take follow-ups." };
+    const target = this.d.named().find((n) => n.id === kept.threadId);
+    if (!target) return { error: "That thread is settled or gone, so nothing was sent. Say so: the reply is still in Not sent on their phone." };
+    const targets = [{ itemId: target.id, handle: target.handle, group: target.group }];
+    const message = kept.note ? `${kept.note}\n\n${kept.text}` : kept.text;
+    const current = this.preparing(conversationId);
+    const reason = await this.check([{ kind: "follow_up", itemId: target.id, message }]);
+    if (reason) return { error: reason };
+    if (!current()) return { error: "That was stopped or replaced; nothing was sent." };
+    const now = this.now();
+    const createdFrom = this.d.spoken(conversationId).length;
+    const words = kept.text.split(/\s+/).filter(Boolean).length;
+    // Read back as a dictated reply is: its name, and how long it is (its words are on the phone, in Not sent).
+    const readback = `Send ${saidBefore(targets[0])} your kept reply, ${size(words, 1)}.`;
+    const base = {
+      id: `P-${randomUUID().slice(0, 8)}`, conversationId, action: "follow_up", targets, readback, createdFrom, expiresAt: now + EXPIRY_MS, createdAt: now, result: null,
+      fields: { message, keptId: kept.id, ...(kept.draftId ? { draftId: kept.draftId } : {}), confirm: level },
+    };
+    if (level === "readback") {
+      const clash = lookalike(targets, "Send", "your", this.d.named(), this.d.settled?.() ?? []);
+      if (clash) return { error: tooAlike(clash) };
+      for (const old of this.d.store.openProposals(conversationId)) this.d.store.putProposal({ ...old, state: "cancelled", result: "superseded" });
+      this.d.store.putProposal({ ...base, state: "proposed", mustHear: [{ words: [], need: 0, from: createdFrom, head: nameTokens(`Send ${target.handle}`), where: whereTokens(targets[0]), next: "your" }] });
+      return { proposal_id: base.id, readback, instruction: "Say the readback word for word, then ask \"Shall I go ahead?\" and stop. Nothing has been sent yet." };
+    }
+    this.sendingKept.add(kept.id);
+    try {
+      const p: Proposal = { ...base, state: "executing", mustHear: [] };
+      this.d.store.putProposal(p);
+      this.d.log?.(`kept ${kept.id}: sent by voice as ${p.id}`);
+      const r = await this.execute(p, false);
+      return "error" in r ? r : { ...r, proposal_id: p.id };
+    } finally {
+      this.sendingKept.delete(kept.id);
+    }
   }
 
   /** Stop: every change not yet under way is called off. One already executing finishes and keeps its receipt. */
@@ -565,7 +802,46 @@ export class Proposals {
     }
   }
 
-  async confirm(conversationId: string, id: string): Promise<ToolResult> {
+  /** Changes carried out lately, newest last, for the phone's "done" tone (`/api/updates`). Kept in memory only. */
+  private carried: { id: string; at: number }[] = [];
+
+  /** The changes carried out in the last `withinMs`, with how long ago. */
+  recentlyDone(withinMs = DONE_MS): { id: string; ageMs: number }[] {
+    const now = this.now();
+    this.carried = this.carried.filter((c) => now - c.at <= withinMs);
+    return this.carried.map((c) => ({ id: c.id, ageMs: now - c.at }));
+  }
+
+  /**
+   * The user's yes to proposal `id`: said aloud (`voice`, the backend's confirm, checked against what was heard), or a
+   * tap on the phone's Send in the live call (`tap`: a signed-in tap is the yes, so there's no heard check). Either way
+   * it's carried out the same, with the same checks of the threads, keys and receipt.
+   */
+  async confirm(conversationId: string, id: string, by: "voice" | "tap" = "voice"): Promise<ToolResult> {
+    const r = await this.confirmOnce(conversationId, id, by);
+    const state = this.d.store.proposal(id)?.state;
+    if ("error" in r && state === "proposed") {
+      // On 5 November a refused confirm was answered "Sent." Say it outright: nothing happened.
+      return { ...r, error: `Nothing was done: nothing was sent, started or changed. ${r.error} Never say it was done.` };
+    }
+    return r;
+  }
+
+  /**
+   * Carries out a proposal, claimed already ("executing"): it starts a thread or sends its commands. One that went
+   * through rings the phone's done tone (`recentlyDone`), and a kept reply it sent is no longer kept.
+   */
+  private async execute(p: Proposal, retry: boolean): Promise<ToolResult> {
+    const r = p.action === "start_work" ? await this.start(p, retry) : await this.carryOut(p, retry);
+    const state = this.d.store.proposal(p.id)?.state;
+    if (state === "executed" || state === "partial") {
+      if (!this.carried.some((c) => c.id === p.id)) this.carried.push({ id: p.id, at: this.now() });
+      if (p.fields.keptId) this.d.store.dropKept(p.fields.keptId);
+    }
+    return r;
+  }
+
+  private async confirmOnce(conversationId: string, id: string, by: "voice" | "tap"): Promise<ToolResult> {
     const p = this.d.store.proposal(id);
     if (!p || p.conversationId !== conversationId) return { error: "No such proposal. Propose the change first." };
     const retry = p.state === "unknown";
@@ -604,22 +880,100 @@ export class Proposals {
         return { error: tooAlike(clash) };
       }
     }
-    const spoken = this.d.spoken(conversationId);
-    const user = this.d.lastUserTurn(conversationId);
-    if (!heard(p, spoken, user.atSpoken)) {
-      return { error: `The user has not heard the full readback yet. Say exactly this, then ask again: ${p.readback}` };
-    }
-    // Message groups already used the user's cutoff above; the names and dates must precede it too.
-    if (user.atSpoken <= p.createdFrom || !heard({ mustHear: p.mustHear.filter((g) => g.message === undefined) }, spoken.slice(0, user.atSpoken))) {
-      return { error: `The user has not answered the readback yet. Ask them: ${p.readback} Shall I go ahead?` };
-    }
-    if (!agrees(user.text)) {
-      return { error: `The user has not clearly said yes. Ask them: ${p.readback} Shall I go ahead?` };
+    // A tap on Send is the yes, with the proposal on the screen. A spoken one counts as the user's settings say
+    // (`Level`): any clear yes after it was proposed; only after the readback was heard in full; or never (tap only).
+    // `refused` says why, for the call's receipt.
+    if (by === "voice") {
+      const level = p.fields.confirm ?? "readback";
+      const spoken = this.d.spoken(conversationId);
+      const user = this.d.lastUserTurn(conversationId);
+      if (level === "tap") {
+        return { error: "The user's settings carry this out only with a tap: tell them to tap Send on their phone to go ahead.", refused: "tap Send on your phone" };
+      }
+      if (level === "readback" && !heard(p, spoken, user.atSpoken)) {
+        return { error: `The user has not heard the full readback yet. Say exactly this, then ask again: ${p.readback}`, refused: "Driver hadn't read it back yet" };
+      }
+      // Message groups already used the user's cutoff above; the names and dates must precede it too.
+      if (user.atSpoken <= p.createdFrom || (level === "readback" && !heard({ mustHear: p.mustHear.filter((g) => g.message === undefined) }, spoken.slice(0, user.atSpoken)))) {
+        return { error: `The user has not answered the readback yet. Ask them: ${p.readback} Shall I go ahead?`, refused: "you hadn't answered yet" };
+      }
+      if (!agrees(user.text)) {
+        return { error: `The user has not clearly said yes. Ask them: ${p.readback} Shall I go ahead?`, refused: "you hadn't said yes" };
+      }
     }
     // Claim it before the first await: a second confirm or a cancel now sees "executing".
     this.d.store.putProposal({ ...p, state: "executing" });
-    if (p.action === "start_work") return this.start(p, retry);
+    return this.execute(p, retry);
+  }
 
+  /**
+   * A change the user made with a tap on the phone, signed in: the tap is their yes, so there's no readback. Carried out
+   * as an agreed proposal is (the same checks, keys and receipt), and kept as a tap (`TAP`) for the timeline.
+   */
+  async tap(action: TapAction, target: ProposalTarget, fields: Pick<Proposal["fields"], "until" | "message" | "keptId" | "draftId">, requestId?: string): Promise<Proposal> {
+    const now = this.now();
+    const p: Proposal = {
+      id: tapId(requestId), conversationId: TAP, action, targets: [target], fields,
+      readback: `${action} ${target.handle}, tapped on the phone`, mustHear: [], createdFrom: 0, expiresAt: now, state: "executing", createdAt: now, result: null,
+    };
+    return this.runTap(p, () => this.carryOut(p, false));
+  }
+
+  /**
+   * A new thread started with a tap: a prompt for it, dictated or typed on the phone, sent with Send. Checked as a
+   * dictated start is (`proposeDraftStart`: the place, title and profile), then started once, as a yes would.
+   */
+  async tapStart(start: { placeId: string; title: string; profile: string }, message: string, requestId?: string): Promise<Proposal | { error: string }> {
+    if (!(this.d.places?.() ?? []).some((x) => x.id === start.placeId)) return { error: "That project isn't reachable now (its computer may be asleep), or it's gone, so nothing was started." };
+    const s = this.newThread({ placeId: start.placeId }, start.title, start.profile);
+    if ("error" in s) return { error: "That new thread can't be started from here. Start it in a call instead." };
+    const now = this.now();
+    const p: Proposal = {
+      id: tapId(requestId), conversationId: TAP, action: "start_work", targets: [],
+      // `target`: the new: id as the phone sent it, so a retry is matched on exactly what was tapped.
+      fields: { placeId: s.place.id, place: s.place.name, title: s.title, profile: s.profile, message, target: newThreadTarget(start) },
+      readback: `start ${s.title}, tapped on the phone`, mustHear: [], createdFrom: 0, expiresAt: now, state: "executing", createdAt: now, result: null,
+    };
+    return this.runTap(p, () => this.start(p, false));
+  }
+
+  /** Keeps a tap, claimed already ("executing"), and carries it out; the same tap sent meanwhile joins this run. */
+  private async runTap(p: Proposal, go: () => Promise<ToolResult>): Promise<Proposal> {
+    this.d.store.putProposal(p);
+    const run = go().then(() => this.d.store.proposal(p.id)!);
+    this.tapping.set(p.id, run);
+    try {
+      return await run;
+    } finally {
+      this.tapping.delete(p.id);
+    }
+  }
+
+  /** Taps being carried out now, by id: the same tap sent again joins its run rather than run twice. */
+  private readonly tapping = new Map<string, Promise<Proposal>>();
+
+  /** The tap the phone sent before with this request id, once it's done (its answer was lost, or it's sent twice at once); null if none. */
+  earlierTap(requestId: string): { proposal: Proposal; done: Promise<Proposal> } | null {
+    const p = this.d.store.proposal(tapId(requestId));
+    return p ? { proposal: p, done: this.tapping.get(p.id) ?? Promise.resolve(p) } : null;
+  }
+
+  /** A tap the brain carries out itself (following a thread or not), kept like any tap for the timeline. */
+  noted(action: "follow" | "unfollow", target: ProposalTarget): Proposal {
+    const now = this.now();
+    const p: Proposal = {
+      id: `T-${randomUUID().slice(0, 8)}`, conversationId: TAP, action, targets: [target], fields: {},
+      readback: `${action} ${target.handle}, tapped on the phone`, mustHear: [], createdFrom: 0, expiresAt: now, state: "executed", createdAt: now,
+      result: action === "follow" ? `Following ${target.handle}.` : `Stopped following ${target.handle}.`,
+    };
+    this.d.store.putProposal(p);
+    return p;
+  }
+
+  /** Sends an agreed proposal's commands, claimed already ("executing"), and records how it went. */
+  private async carryOut(p: Proposal, retry: boolean): Promise<ToolResult> {
+    // A tap's outcome is read on the phone, not said by Driver.
+    const tapped = p.conversationId === TAP;
     // Re-read live targets after claiming the proposal, before dispatching any operation.
     let items: WorkItem[];
     try {
@@ -627,7 +981,7 @@ export class Proposals {
     } catch {
       const error = retry
         ? "I couldn't check the threads right now. Part of this may already have gone through; try again when the connection is back."
-        : "I couldn't check the threads just now, so I called this off. Please try again.";
+        : tapped ? "Couldn't reach your threads just now, so nothing was changed. Try again." : "I couldn't check the threads just now, so I called this off. Please try again.";
       this.d.store.putProposal(retry ? p : { ...p, state: "cancelled", result: error });
       return { error };
     }
@@ -643,14 +997,15 @@ export class Proposals {
         continue;
       }
       // Legacy subagent proposals without parentId fail closed; their short expiry bounds this transition.
-      const reason = !connected ? "is on a disconnected machine" : !item ? "no longer exists" : item.settled ? "is already settled" :
+      const reason = !connected ? "is on a disconnected machine" : !item ? "no longer exists" :
+        p.action === "unsettle" ? (item.settled ? null : "isn't settled") : item.settled ? "is already settled" :
         p.action === "settle" && item.status === "running" ? "is working again" :
         p.action === "settle_subagents" && !DONE.has(item.status) ? "is not finished now" :
         p.action === "settle_subagents" && (!t.parentId || item.parentId !== t.parentId) ? "no longer has the same parent" : null;
       if (reason) {
         const error = retry
           ? `${t.handle} ${reason}, so I can't safely retry it right now. Part of this may already have gone through; try again after checking the thread and its connection.`
-          : `${t.handle} ${reason}, so I called this off without sending any commands.`;
+          : tapped ? `${t.handle} ${reason}, so nothing was changed.` : `${t.handle} ${reason}, so I called this off without sending any commands.`;
         this.d.store.putProposal(retry ? p : { ...p, state: "cancelled", result: error });
         return { error };
       }
@@ -684,7 +1039,8 @@ export class Proposals {
     });
     const state = unknown.length ? "unknown" : failures.length === 0 ? "executed" : done === 0 ? "failed" : "partial";
     const result = unknown.length
-      ? `I couldn't confirm whether it went through for ${list([...new Set(unknown)].slice(0, 3))}: the connection dropped. Saying yes again retries it safely.`
+      ? tapped ? `Couldn't tell whether that went through: the connection dropped. Check ${unknown[0]} before trying again.`
+        : `I couldn't confirm whether it went through for ${list([...new Set(unknown)].slice(0, 3))}: the connection dropped. Saying yes again retries it safely.`
       : receiptText(p, done, failures);
     this.d.store.putProposal({ ...p, state, result });
     this.d.log?.(`proposal ${p.id} ${p.action} → ${state} (${done}/${actions.length})`);
@@ -697,6 +1053,8 @@ export class Proposals {
    * conversation by its title, counted as messaged there (so `wait_for` takes it), and starred.
    */
   private async start(p: Proposal, retry: boolean): Promise<ToolResult> {
+    // A tap's outcome is read on the phone, not said by Driver.
+    const tapped = p.conversationId === TAP;
     const f = p.fields;
     const key = `${p.id}:start`;
     const place = (this.d.places?.() ?? []).find((x) => x.id === f.placeId);
@@ -705,7 +1063,7 @@ export class Proposals {
     if (reason) {
       const error = retry
         ? `${f.place} ${reason}, so I can't safely retry it now. The thread may already have been started; check T3 first.`
-        : `${f.place} ${reason}, so I called this off without starting anything.`;
+        : tapped ? `${f.place} ${reason}, so nothing was started.` : `${f.place} ${reason}, so I called this off without starting anything.`;
       this.d.store.putProposal(retry ? p : { ...p, state: "cancelled", result: error });
       return { error };
     }
@@ -718,7 +1076,8 @@ export class Proposals {
       if (prior?.state === "unknown") r.unknown = true;
       this.d.store.finishOperation(key, r.unknown ? "unknown" : "failed", r.error);
       const result = r.unknown
-        ? `I couldn't confirm whether ${f.title} was started: the connection dropped. Saying yes again retries it safely.`
+        ? tapped ? `Couldn't tell whether ${f.title} was started: the connection dropped. Check ${f.place} before trying again.`
+          : `I couldn't confirm whether ${f.title} was started: the connection dropped. Saying yes again retries it safely.`
         : `Nothing was started. ${f.place} said: ${r.error}`;
       this.d.store.putProposal({ ...p, state: r.unknown ? "unknown" : "failed", result });
       this.d.log?.(`proposal ${p.id} start_work → ${r.unknown ? "unknown" : "failed"}`);
@@ -729,7 +1088,7 @@ export class Proposals {
     const result = `Started ${f.title} in ${f.place}${itemId ? ", and starred it" : ""}.`;
     this.d.store.putProposal({ ...p, state: "executed", result, fields: { ...f, ...(itemId ? { itemId } : {}) } });
     if (itemId) {
-      this.d.store.alias(p.conversationId, nameKey(f.title!), itemId);
+      if (!tapped) this.d.store.alias(p.conversationId, nameKey(f.title!), itemId);
       this.d.store.star(itemId, true);
       await this.d.started?.(itemId).catch((e) => this.d.log?.(`proposal ${p.id}: couldn't list the new thread (${String(e)})`));
     }
@@ -744,6 +1103,12 @@ export class Proposals {
   }
 }
 
+/** A dictated reply or prompt is asked about as the call opens, whatever the level: a yes is the least it needs. */
+const draftLevel = (level: Level): Level => (level === "none" ? "yes" : level);
+
+/** A tap's id: from the phone's request id, so the same tap sent again is the same one, with the same keys. */
+const tapId = (requestId?: string) => `T-${requestId ?? randomUUID().slice(0, 8)}`;
+
 function toAction(p: Proposal, itemId: string): Action {
   switch (p.action) {
     case "follow_up":
@@ -752,6 +1117,10 @@ function toAction(p: Proposal, itemId: string): Action {
       return { kind: "snooze", itemId, until: p.fields.until! };
     case "archive":
       return { kind: "archive", itemId };
+    case "unsnooze":
+      return { kind: "unsnooze", itemId };
+    case "unsettle":
+      return { kind: "unsettle", itemId };
     default:
       return { kind: "settle", itemId };
   }
@@ -759,7 +1128,7 @@ function toAction(p: Proposal, itemId: string): Action {
 
 export function receiptText(p: Pick<Proposal, "action" | "targets" | "fields">, done: number, failures: { handle: string; error: string }[]): string {
   const total = p.targets.length;
-  const verb = { follow_up: p.fields.draftId ? "Sent your reply to" : "Sent the message to", settle: "Settled", archive: "Archived", snooze: "Snoozed", settle_subagents: "Settled" }[p.action] ?? "Did";
+  const verb = { follow_up: p.fields.draftId ? "Sent your reply to" : "Sent the message to", settle: "Settled", archive: "Archived", snooze: "Snoozed", settle_subagents: "Settled", unsnooze: "Unsnoozed", unsettle: "Unsettled" }[p.action] ?? "Did";
   const what =
     p.action === "settle_subagents"
       ? `${done} of ${total} finished subagent threads`
@@ -770,4 +1139,31 @@ export function receiptText(p: Pick<Proposal, "action" | "targets" | "fields">, 
   }
   const failed = `Failed for ${list(failures.slice(0, 3).map((f) => f.handle))}: ${failures[0].error}`;
   return done === 0 ? `Nothing changed. ${failed}` : `${verb} ${what}. ${failed}`;
+}
+
+/**
+ * How a reply reached its thread, as `reply_sent.via` (contracts §5): a yes in a call is "voice"; a reply sent from the
+ * phone says how in its request's `via` (Send tapped, held, on the lock screen, or "Driver, send it" in the reader).
+ */
+export type ReplyVia = "tap" | "hold" | "lock_screen" | "voice" | "kept";
+const PHONE_VIAS: ReplyVia[] = ["tap", "hold", "lock_screen", "voice"];
+
+/** A request's `via` as the phone sent it (contracts §3), "kept" for a kept reply, else (an older phone) "tap". */
+export function tapVia(sent: unknown, kept = false): ReplyVia {
+  return kept ? "kept" : PHONE_VIAS.find((v) => v === sent) ?? "tap";
+}
+
+/**
+ * What a change that went through did, for analytics (contracts §5): a reply or a new thread is `reply_sent`, anything
+ * else `thread_action`. `via` "voice": proposed in a call (agreed aloud or with Send); else the phone's tap. Nothing for
+ * one that didn't go through.
+ */
+export function trackChange(track: Track, p: Proposal, via: ReplyVia, dictated = false) {
+  if (p.state !== "executed" && p.state !== "partial") return;
+  if (p.action === "follow_up" || p.action === "start_work") {
+    track("reply_sent", { via, dictated: dictated || !!p.fields.draftId, new_thread: p.action === "start_work" });
+    return;
+  }
+  const action = ({ settle: "settle", settle_subagents: "settle", snooze: "snooze", archive: "archive", unsnooze: "undo", unsettle: "undo", follow: "follow", unfollow: "unfollow" } as Record<string, string>)[p.action];
+  if (action) track("thread_action", { action, via: via === "voice" ? "voice" : "tap", threads: p.targets.length });
 }

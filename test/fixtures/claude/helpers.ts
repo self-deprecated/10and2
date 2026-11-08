@@ -18,7 +18,7 @@ export function harness(t: TestContext, opts: { policy?: Partial<Policy>; accept
   const root = mkdtempSync(join(tmpdir(), "driver-claude-test-")), config = join(root, "config"), cwd = join(root, "project");
   mkdirSync(join(cwd, ".git"), { recursive: true }); mkdirSync(join(config, "sessions"), { recursive: true }); mkdirSync(join(config, "projects"), { recursive: true });
   const logs: string[] = [], clock = { now: Date.now() };
-  const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [cwd], actions: ["follow_up", "settle", "snooze", "archive", "start_work"], maxRuntimeMode: "auto", claude: true, t3: false, ...opts.policy };
+  const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [cwd], actions: ["follow_up", "settle", "snooze", "archive", "start_work"], maxRuntimeMode: "auto", claude: true, t3: false, worktreeBase: "HEAD", ...opts.policy };
   const options = { configDir: config, policy, db: join(root, "db.sqlite"), stateDir: join(root, "state"), hookSocketPath: join(root, "state", "hooks.sock"), claudeBin: fake, readCacheMs: 0, now: () => clock.now, log: (s: string) => logs.push(s), acceptanceTimeoutMs: opts.acceptanceTimeoutMs ?? 1000 };
   const adapter = new ClaudeAdapter(options);
   const all = [adapter];

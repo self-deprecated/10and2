@@ -25,6 +25,7 @@ export function wire(o: { adapter: Adapter; store: Store; classify: Classifier; 
     spoken: (id) => conversations.spoken(id),
     lastUserTurn: (id) => conversations.lastUserTurn(id),
     log,
+    track: o.track,
   });
   // Waits saved before a restart are watched again, so a holding phone still gets its call-back.
   const waits = new Waits({ adapter, log, store, track: o.track });

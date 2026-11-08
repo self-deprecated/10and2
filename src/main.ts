@@ -14,7 +14,7 @@ import { Local } from "./local.ts";
 import { Expired, linkUrl, originOf, pair } from "./pair.ts";
 import { configDirectory, hookSocket, stateDirectory } from "./paths.ts";
 import { addMachine, brainDb, brainEnvPath, brainOrigin, brainPort, DEFAULT_PORT, machines, readBrainEnv, removeMachine, validName, writeBrainEnv } from "./brain.ts";
-import { defaultPolicyPath, loadPolicy, parsePolicy, visible } from "./policy.ts";
+import { defaultPolicyPath, loadPolicy, parsePolicy, validBase, visible } from "./policy.ts";
 import { ACTIONS, VERSION } from "./protocol.ts";
 import { BRAIN, Service } from "./service.ts";
 import { T3Adapter } from "./t3/adapter.ts";
@@ -37,7 +37,7 @@ More
   ${cmd("10and2 run")}                         run in this terminal instead of at login
   ${cmd("10and2 token")}                       a token, for a brain you configure by hand
 
-Setup options: --name=<what Driver calls it>  --yes  --no-autostart  --brain=<url>  --token (a brain of your own)
+Setup options: --name=<what Driver calls it>  --worktree-base=<branch, or HEAD>  --yes  --no-autostart  --brain=<url>  --token (a brain of your own)
 Settings: ${defaultPolicyPath()}
 
 Your own brain ${dim(`(instead of your 10 & 2 account: ${OWN_KEY}, your computer)`)}
@@ -129,7 +129,7 @@ async function setup() {
   }
 
   say(`${bold("10 & 2")} ${dim("·")} connect this computer\n`);
-  const policy = policyFor(origin, existing, await agents("10and2 setup"));
+  const policy = await policyFor(origin, existing, await agents("10and2 setup"));
   const name = await machineName();
   if (byToken && !validName(name)) throw new Error(`Your brain can't call it "${name}": start with a letter or digit (${cmd("--name=")}).`);
   say();
@@ -165,14 +165,27 @@ async function agents(again: string) {
 
 /**
  * A policy the user already has is kept, pointed at this brain; a new one lets 10 & 2 see and do everything the spoken
- * readback and "yes" allow, which is what setup promised. Written once the computer is approved.
+ * readback and "yes" allow, which is what setup promised. Either way, with T3 Code, where its new worktrees start is
+ * asked when the policy doesn't say. Written once the computer is approved.
  */
-function policyFor(origin: string, existing: any, found: { t3: boolean; claude: boolean }) {
+async function policyFor(origin: string, existing: any, found: { t3: boolean; claude: boolean }) {
   const policy = existing ? { ...existing, brain: linkUrl(origin) } : {
     brain: linkUrl(origin), projects: "*", actions: [...ACTIONS], maxRuntimeMode: "full-access", ...found,
   };
+  if (policy.t3 !== false && policy.worktreeBase === undefined) policy.worktreeBase = await worktreeBase();
   parsePolicy(JSON.stringify(policy));
   return policy;
+}
+
+/** A branch fetched from origin by default: a checkout left on older work would otherwise start every new thread stale. */
+async function worktreeBase() {
+  const wanted = flags.get("worktree-base") ?? (flags.has("yes") ? "main"
+    : await ask(`New T3 Code worktrees start from the latest of which branch on origin? ${dim(`(${bold("HEAD")}: whatever each project's checkout is on)`)}`, "main"));
+  if (!validBase(wanted)) throw new Error(`"${wanted}" isn't a branch name; give one, such as ${cmd("main")}, or ${cmd("HEAD")}.`);
+  return wanted;
+}
+function baseText(base: string) {
+  return base === "HEAD" ? "whatever the project's checkout is on" : `the latest ${base} on origin`;
 }
 
 async function machineName() {
@@ -195,6 +208,7 @@ async function startAtLogin(service: Service, question: string) {
 function canDo(policy: any) {
   say();
   say(`  Driver can see ${seesText(policy)}, and can ${mayText(policy)}: each only after you hear it read back and say yes.`);
+  if (policy.t3 !== false && (policy.actions ?? []).includes("start_work")) say(`  New T3 Code worktrees start from ${baseText(policy.worktreeBase ?? "HEAD")}.`);
   say(`  ${dim(`To change that, edit ${defaultPolicyPath()}, then ${cmd("10and2 autostart on")}.`)}`);
   if (policy.claude) say(`  ${dim(`For Claude Code sessions to update instantly: ${cmd("10and2 hooks install")}.`)}`);
 }
@@ -309,7 +323,7 @@ async function runConnector() {
   const t3 = policy.t3
     ? new T3Adapter({
       baseUrl: process.env.T3_URL ?? "http://127.0.0.1:3773", cli: [process.env.T3_CLI ?? "t3"], label: "10and2-connector", log,
-      visible: (root) => visible(policy, root), onRevoked: () => { record({ error: "T3 revoked the connector's session" }); stop(fatalExit); },
+      visible: (root) => visible(policy, root), worktreeBase: policy.worktreeBase, onRevoked: () => { record({ error: "T3 revoked the connector's session" }); stop(fatalExit); },
     })
     : null;
   // Claude Code has no command ids, so a lost outcome is never sent again (the ledger reports it unknown).
@@ -366,7 +380,10 @@ async function status() {
   say();
   note(`Sees   ${seesText(policy)}`);
   note(`Can    ${mayText(policy)}, after your spoken yes`);
-  if (policy.actions.includes("start_work")) note(`       New work runs with at most ${policy.maxRuntimeMode}`);
+  if (policy.actions.includes("start_work")) {
+    note(`       New work runs with at most ${policy.maxRuntimeMode}`);
+    if (policy.t3) note(`       New T3 Code worktrees start from ${baseText(policy.worktreeBase)}`);
+  }
   if (policy.claude) {
     const h = await hooksStatus(claudeDir()).catch(() => null);
     if (!h?.installed) note(dim(`Claude Code updates within seconds; ${cmd("10and2 hooks install")} makes it instant`));
@@ -504,7 +521,7 @@ async function brainSetup(service: Service, path: string) {
   say();
 
   const origin = `http://127.0.0.1:${port}`;
-  const policy = policyFor(origin, existing, found);
+  const policy = await policyFor(origin, existing, found);
   // This computer's own connector, linked to it over loopback with a token only the two of them know.
   const token = randomBytes(32).toString("base64url");
   const vars = addMachine({

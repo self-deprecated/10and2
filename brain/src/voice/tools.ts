@@ -8,24 +8,27 @@ import { headTail, type Briefing } from "../briefing.ts";
 import { nameKey, pick, spokenTitle, withGroup, type Named } from "../handles.ts";
 import { START_GRACE_MS } from "../waits.ts";
 import { newThreadTarget } from "../drafts.ts";
-import type { Proposals, ProposeAction, ToolResult } from "../proposals.ts";
+import type { ConfirmLevels, KeepReplies, Proposals, ProposeAction, ToolResult } from "../proposals.ts";
 import type { Proposal, Store } from "../store.ts";
 import { ago, describe as errorText } from "../util.ts";
 import type { Waits } from "../waits.ts";
 import { holdsAfter, type EndReason } from "./endReason.ts";
 import { asOf } from "./prompts.ts";
 
+/** How many settled threads `list` names at once, newest first. */
+const SETTLED_SHOWN = 12;
+
 export const TOOLS = [
   {
     name: "list",
     description:
-      "List open threads, newest first, by state: waiting (needs the user), ready (done, not applied), running, snoozed, starred, all. Without rundown, the newest 12. With rundown true (the user wants a summary or rundown of all their threads, or of a project's): every one of them, grouped by project, each with a one-line summary and how long ago it last replied.",
+      "List open threads, newest first, by state: waiting (needs the user), ready (done, not applied), running, snoozed, starred, all; or settled threads (filter settled: the user settled them, so they're not in the briefing), newest first. Without rundown, the newest 12. With rundown true (the user wants a summary or rundown of all their threads, or of a project's): every one of them, grouped by project, each with a one-line summary and how long ago it last replied.",
     parameters: {
       type: "object",
       additionalProperties: false,
       required: ["filter", "project", "rundown"],
       properties: {
-        filter: { enum: ["waiting", "ready", "running", "snoozed", "starred", "all"] },
+        filter: { enum: ["waiting", "ready", "running", "snoozed", "starred", "all", "settled"] },
         project: { type: ["string", "null"], description: "Only this project's threads, in the user's words; null for every project" },
         rundown: { type: "boolean", description: "Every matching thread grouped by project with a one-line summary, rather than the newest 12" },
       },
@@ -44,7 +47,7 @@ export const TOOLS = [
   {
     name: "propose",
     description:
-      "Prepare a change; nothing happens until confirm. Returns a readback to say word for word. Actions: follow_up (send `message` to one thread; to a thread waiting on a question, the message is the answer), settle, snooze (needs `until`), archive, settle_subagents (all finished subagent threads; no handles), start_work (start a new thread in `project` called `title`, its agent told `message`; no handles; `profile` only when the user asks for one).",
+      "Prepare a change. Returns a readback to say word for word, and nothing happens until confirm; or, when the user's settings ask no yes for it, carries it out at once and returns its result. Actions: follow_up (send `message` to one thread; to a thread waiting on a question, the message is the answer), settle, snooze (needs `until`), archive, settle_subagents (all finished subagent threads; no handles), start_work (start a new thread in `project` called `title`, its agent told `message`; no handles; `profile` only when the user asks for one).",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -69,6 +72,16 @@ export const TOOLS = [
     name: "cancel",
     description: "Drop a proposal the user declined or changed.",
     parameters: { type: "object", additionalProperties: false, required: ["proposal_id"], properties: { proposal_id: { type: "string" } } },
+  },
+  {
+    name: "keep",
+    description: "Keep a reply waiting for the user's yes for later, unsent, instead of sending it: when they say to keep it, save it or send it later. It goes to Not sent on their phone, where they can change it and send it.",
+    parameters: { type: "object", additionalProperties: false, required: ["proposal_id"], properties: { proposal_id: { type: "string" } } },
+  },
+  {
+    name: "send_kept",
+    description: "Send a reply the user kept for later (Not sent on their phone), when they ask to send it now: kept_id from the kept replies listed in your instructions, or a keep result. As the user's settings say, it's sent at once, read back to agree to first, or needs their tap on Send: say what its result says.",
+    parameters: { type: "object", additionalProperties: false, required: ["kept_id"], properties: { kept_id: { type: "string" } } },
   },
   {
     name: "remember",
@@ -126,6 +139,16 @@ export const TOOLS = [
         title: { type: ["string", "null"], description: "A new thread: a short title of a few words" },
         profile: { type: ["string", "null"], description: "A new thread: a launch profile's name, or null for the default" },
       },
+    },
+  },
+  {
+    name: "flag",
+    description: "Flag this moment of the call for review, when the user asks to flag it, debug it, or says something went wrong here, in any words. Says so when Driver has flagged it already.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: ["note"],
+      properties: { note: { type: ["string", "null"], description: "What the user said went wrong, in their words, if they said" } },
     },
   },
   {
@@ -213,9 +236,14 @@ export function recordNames(deps: Pick<ToolDeps, "briefing" | "store">, conversa
  * The thread the user named, or the error to give back: ambiguous, settled, or no match. A name Driver used earlier in
  * this conversation still means its thread, so a thread renamed in the meantime is still found.
  */
-function find(spoken: string, deps: ToolDeps, conversationId: string): { handle: string; item: WorkItem } | { error: string } {
+function find(spoken: string, deps: ToolDeps, conversationId: string, settledToo = false): { handle: string; item: WorkItem } | { error: string } {
   const named = namedItems(deps.briefing);
   const r = pick(spoken, named, namedItems(deps.briefing, true), deps.store.aliasFor(conversationId, nameKey(spoken)));
+  if (r.kind === "settled" && settledToo) {
+    const hit = r.item as Named & { item: WorkItem };
+    deps.store.alias(conversationId, nameKey(hit.handle), hit.id);
+    return { handle: hit.handle, item: hit.item };
+  }
   if (r.kind === "match") {
     const hit = r.item as Named & { item: WorkItem };
     deps.store.alias(conversationId, nameKey(hit.handle), hit.id);
@@ -386,20 +414,44 @@ export async function runTool(
     readingVoice?: string;
     /** Whether the user has said anything in this session: `end_session` is refused until they have. */
     userSpoke?: () => boolean;
+    /** The user's latest turn only asked to flag the moment ("debug this"): `end_session` is refused. */
+    onlyFlagged?: () => boolean;
     /**
      * A call opened to send a dictated reply, before the user has answered it: nothing else may be proposed, since a new
      * proposal replaces the open one and their yes would then find the reply gone.
      */
     awaitingDraft?: () => boolean;
+    /** What a reply Driver words for a thread does (the phone's setting): ask, kept at once, or sent on a yes. */
+    keepReplies?: KeepReplies;
+    /** How the user agrees to each kind of change (the phone's setting); absent: every change read back and heard. */
+    confirm?: ConfirmLevels;
+    /** Flags this moment for review (the session's own flagging, once per user turn); absent: nothing can be flagged. */
+    flag?: (note: string | null) => Promise<ToolResult>;
+    /** The threads this tool call found by name, for the call's receipts (callview.ts). */
+    about?: (threads: { itemId: string; handle: string; group: string }[]) => void;
   },
   deps: ToolDeps,
 ): Promise<ToolResult> {
   const now = Date.now();
+  const about = (...found: { handle: string; item: WorkItem }[]) => ctx.about?.(found.map((f) => ({ itemId: f.item.id, handle: f.handle, group: f.item.group })));
   switch (name) {
     case "list": {
       const view = deps.briefing.view();
       const project = typeof args.project === "string" && projectKey(args.project) ? projectKey(args.project) : null;
       const inProject = (group: string) => !project || projectKey(group).startsWith(project);
+      // Settled threads, newest first: on 5 November "check the settled threads" got "I can't see settled threads here".
+      if (args.filter === "settled") {
+        const settled = namedItems(deps.briefing, true).filter((n) => inProject(n.group)).sort((a, b) => (a.item.updatedAt < b.item.updatedAt ? 1 : -1));
+        if (project && !settled.length) return { error: `No settled thread is in a project called "${args.project}". Ask the user which project they mean.` };
+        const shown = settled.slice(0, SETTLED_SHOWN);
+        for (const n of shown) deps.store.alias(ctx.conversationId, nameKey(n.handle), n.id);
+        return {
+          count: settled.length,
+          threads: shown.map((n) => ({ handle: n.handle, group: n.group, updated: ago(n.item.updatedAt, now) })),
+          ...(settled.length > shown.length ? { more: settled.length - shown.length } : {}),
+          instruction: "These threads are settled. details tells what one said; Driver doesn't change settled threads.",
+        };
+      }
       if (project && !view.cards.some((c) => inProject(c.group)) && !view.snoozed.some((s) => inProject(s.group))) {
         const groups = [...new Set(view.cards.map((c) => c.group))];
         return { error: `No open thread is in a project called "${args.project}". Projects with open threads: ${groups.join(", ")}. Ask the user which they mean.` };
@@ -435,8 +487,10 @@ export async function runTool(
       };
     }
     case "details": {
-      const found = find(String(args.handle ?? ""), deps, ctx.conversationId);
+      // A settled thread can be looked into, never changed.
+      const found = find(String(args.handle ?? ""), deps, ctx.conversationId, true);
       if ("error" in found) return found;
+      about(found);
       const item = await live(found.item, deps);
       const told = await describe(item, found.handle, deps, now, args.full === true);
       // Heard once it's being said: then it isn't news later.
@@ -451,6 +505,7 @@ export async function runTool(
       const found = asked.map((h) => find(h, deps, ctx.conversationId));
       const missing = found.find((f) => "error" in f);
       if (missing) return missing;
+      about(...(found as Exclude<(typeof found)[number], { error: string }>[]).filter((f, i, all) => all.findIndex((o) => o.item.id === f.item.id) === i));
       const entries: { item: WorkItem; handle: string; since: number; patient: boolean; heardQuestion?: string | null }[] = [];
       const idle: string[] = [];
       for (const f of found as Exclude<(typeof found)[number], { error: string }>[]) {
@@ -528,11 +583,23 @@ export async function runTool(
         project: args.project ?? null,
         title: args.title ?? null,
         profile: args.profile ?? null,
-      });
-    case "confirm":
+      }, ctx.keepReplies, ctx.confirm);
+    case "confirm": {
+      // A yes the brain carried out itself (VoiceSession's `yesHeard`): done, and the voice model is being told.
+      const p = deps.store.proposal(String(args.proposal_id ?? ""));
+      if (p?.conversationId === ctx.conversationId && p.fields.heardYes && p.state !== "proposed") {
+        return { done: true, already: true, result: p.result ?? "It's being carried out now.", instruction: "Driver carried this out on the user's yes and is telling them the result: don't say it again or call confirm again. Answer anything else they said, or reply with nothing." };
+      }
       return deps.proposals.confirm(ctx.conversationId, String(args.proposal_id ?? ""));
+    }
     case "cancel":
       return deps.proposals.cancel(ctx.conversationId, String(args.proposal_id ?? ""));
+    case "keep":
+      return deps.proposals.keep(ctx.conversationId, String(args.proposal_id ?? ""));
+    case "send_kept":
+      return deps.proposals.sendKept(ctx.conversationId, String(args.kept_id ?? ""), ctx.confirm);
+    case "flag":
+      return ctx.flag ? ctx.flag(typeof args.note === "string" ? args.note : null) : { error: "Driver can't flag moments here. Say so in a few words." };
     case "remember": {
       const note = String(args.note ?? "").trim();
       if (!note) return { error: "Nothing to remember." };
@@ -543,6 +610,7 @@ export async function runTool(
     case "star": {
       const found = find(String(args.handle ?? ""), deps, ctx.conversationId);
       if ("error" in found) return found;
+      about(found);
       const on = args.starred !== false;
       setStar(deps, found.item, on);
       const name = withGroup(found.handle, found.item.group);
@@ -553,6 +621,7 @@ export async function runTool(
       const generation = deps.waits.generation;
       const found = find(String(args.handle ?? ""), deps, ctx.conversationId);
       if ("error" in found) return found;
+      about(found);
       const replies = (await deps.adapter.replies?.(found.item.id).catch(() => null)) ?? null;
       if (!replies) return { error: `${found.handle}'s replies couldn't be read just now. Say so.` };
       if (!replies.length) return { error: `${found.handle} has no finished reply to read yet. Say so, and offer to wait for it.` };
@@ -599,6 +668,7 @@ export async function runTool(
       if ("error" in found) return found;
       if (!deps.adapter.actions.includes("follow_up")) return { error: "This system can't take replies. Say so." };
       if (deps.waits.generation !== generation) return { error: "The user stopped Driver; nothing will be recorded." };
+      about(found);
       deps.store.saveHandoff(ctx.conversationId, { handle: found.handle, dictate: { itemId: found.item.id } });
       ctx.requestEnd({ kind: "dictating", handle: found.handle });
       return { dictating: true, instruction: `Say only "Go ahead after the tone." or a line as short.` };
@@ -608,6 +678,9 @@ export async function runTool(
       // before the user said a word: Driver said "Welcome back. Goodbye." and hung up on their "Oh! Don't".
       if (ctx.userSpoke && !ctx.userSpoke()) {
         return { error: "The user hasn't said anything in this call yet, so it doesn't end. Ask them, in a few words, what they'd like to do." };
+      }
+      if (ctx.onlyFlagged?.()) {
+        return { error: "The user only asked Driver to flag this moment for review; the call goes on. Don't say goodbye: answer anything else they said, or wait for them." };
       }
       ctx.requestEnd({ kind: "goodbye" });
       const working = await starredWorking(deps);

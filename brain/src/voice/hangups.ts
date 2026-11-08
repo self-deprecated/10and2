@@ -6,6 +6,7 @@
 import type { Store } from "../store.ts";
 import { describe } from "../util.ts";
 import type { Track } from "../analytics.ts";
+import type { Calls } from "../calls.ts";
 
 /** After the first failed hang-up, wait 5 s, then 15 s, then 60 s, then every 5 minutes. */
 export const RETRY_MS = [5_000, 15_000, 60_000, 300_000];
@@ -25,13 +26,16 @@ export class Hangups {
   private readonly retryMs: number[];
   /** Usage analytics: every failed hang-up, and the confirmation after one (the billing alert's events). */
   private readonly track: Track;
+  /** 10 & 2 Ops' registry: told when a session OpenAI hadn't confirmed is confirmed over. */
+  private readonly calls?: Calls;
 
-  constructor(deps: { store: Store; hangup: (sessionId: string) => Promise<void>; log: (m: string) => void; retryMs?: number[]; track?: Track }) {
+  constructor(deps: { store: Store; hangup: (sessionId: string) => Promise<void>; log: (m: string) => void; retryMs?: number[]; track?: Track; calls?: Calls }) {
     this.store = deps.store;
     this.hangup = deps.hangup;
     this.log = deps.log;
     this.retryMs = deps.retryMs ?? RETRY_MS;
     this.track = deps.track ?? (() => {});
+    this.calls = deps.calls;
   }
 
   /**
@@ -55,8 +59,11 @@ export class Hangups {
     void this.attempt(sessionId);
   }
 
-  /** At start: every session a previous run didn't see confirmed over (a crash, a failed hang-up) is hung up again. */
-  resume() {
+  /**
+   * At start: every session a previous run didn't see confirmed over (a crash, a failed hang-up) is hung up again, except
+   * those taken back (`taken`: the server reattached them, still live).
+   */
+  resume(taken: ReadonlySet<string> = new Set()) {
     let ids: string[];
     try {
       ids = this.store.unclosedSessions();
@@ -64,6 +71,7 @@ export class Hangups {
       return this.log(`voice: COULDN'T READ WHICH SESSIONS MAY STILL BILL (${describe(e)})`);
     }
     for (const id of ids) {
+      if (taken.has(id)) continue;
       this.record(id, () => this.store.endSession(id, null, { kind: "restarted" }));
       this.close(id);
     }
@@ -125,7 +133,13 @@ export class Hangups {
     const c = this.confirmed.get(sessionId);
     if (!c) return;
     c.timer = null;
-    if (this.record(sessionId, () => this.store.sessionClosed(sessionId))) return void this.confirmed.delete(sessionId);
+    if (this.record(sessionId, () => this.store.sessionClosed(sessionId))) {
+      this.confirmed.delete(sessionId);
+      try {
+        this.calls?.report({ kind: "closed", sessionId, at: Date.now() });
+      } catch {}
+      return;
+    }
     c.failures++;
     c.timer = setTimeout(() => this.saveClosed(sessionId), this.retryMs[Math.min(c.failures - 1, this.retryMs.length - 1)]);
     c.timer.unref();

@@ -15,7 +15,7 @@ export interface Files {
   /** The files directly under `dir`, with their size and when they were last written. */
   list(dir: string): Promise<FileInfo[]>;
   remove(path: string): Promise<void>;
-  /** A stream that appends to the file (a session's recording): line by line on disk, in one piece in R2 when it ends. */
+  /** A stream that appends to the file (a session's recording): line by line on disk; in R2, the whole so far every 15 s and when it ends. */
   writer(path: string): Writable;
   /** Where a person reviewing a flag finds the file: a path on Lattice, an R2 key in the cloud. */
   where(path: string): string;
@@ -70,7 +70,7 @@ export type Bucket = {
 };
 
 /** One user's files in the bucket, every key under `prefix` (`users/<Clerk user id>/`), so no path can leave it. */
-export function bucketFiles(bucket: Bucket, prefix: string): Files {
+export function bucketFiles(bucket: Bucket, prefix: string, saveEveryMs = 15_000): Files {
   const key = (p: string) => {
     if (p.split("/").some((part) => part === ".." || part === "")) throw new Error(`bad path ${p}`);
     return prefix + p;
@@ -96,14 +96,30 @@ export function bucketFiles(bucket: Bucket, prefix: string): Files {
     remove: (p) => bucket.delete(key(p)),
     writer(p) {
       const k = key(p);
-      const parts: Buffer[] = [];
+      let parts: Buffer[] = [];
+      let savedAt = -Infinity;
+      // Puts one after another, so an older copy never lands after a newer one.
+      let saving: Promise<unknown> = Promise.resolve();
+      const save = () => {
+        const body = Buffer.concat(parts);
+        parts = [body];
+        saving = saving.then(() => bucket.put(k, body)).catch(() => {});
+        return saving;
+      };
       return new Writable({
         write(chunk, _enc, done) {
           parts.push(Buffer.from(chunk));
+          // Saved as it goes, not only at the end: on 5 November Cloudflare reset a brain 11 minutes into a call and its
+          // recording, held only in memory until the call ended, was lost with it.
+          if (Date.now() - savedAt >= saveEveryMs) {
+            savedAt = Date.now();
+            void save();
+          }
           done();
         },
         final(done) {
-          bucket.put(k, Buffer.concat(parts)).then(() => done(), done);
+          const body = Buffer.concat(parts);
+          saving.then(() => bucket.put(k, body)).then(() => done(), done);
         },
       });
     },

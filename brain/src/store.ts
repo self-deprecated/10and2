@@ -26,6 +26,12 @@ export type Card = {
 export type CardReply = ReplyRef & { watermark: string };
 export type CardState = "needs_decision" | "ready_to_apply" | "blocked" | "running" | "done_unreviewed" | "stale";
 
+/**
+ * The conversation every change made by a tap on the phone is kept under (`Proposals.tap`): never a real one (those ids
+ * are at least 8 characters), so taps stay out of every conversation's changes, and the timeline finds them all here.
+ */
+export const TAP = "tap";
+
 export type ProposalState = "proposed" | "executing" | "executed" | "partial" | "failed" | "unknown" | "cancelled" | "expired";
 /** `group`: the project the readback said it was in (proposals since targets kept it). */
 export type ProposalTarget = { itemId: string; handle: string; group?: string; parentId?: string };
@@ -37,15 +43,17 @@ export type Proposal = {
   /**
    * `draftId`: a reply the user dictated on the phone (drafts.ts), sent as `message`. A `start_work` has no targets: it
    * starts `title` in place `placeId` (said `place`) with `profile`, and once started, `itemId` is its new thread.
+   * `keptId`: a reply kept for later, sent by this. `confirm`: how the user must agree to it (proposals.ts `Level`);
+   * none (a proposal made before levels): the readback heard, then a yes.
    */
-  fields: { message?: string; until?: string; draftId?: string; placeId?: string; place?: string; title?: string; profile?: LaunchProfile; itemId?: string };
+  fields: { message?: string; until?: string; draftId?: string; placeId?: string; place?: string; title?: string; profile?: LaunchProfile; itemId?: string; target?: string; keptId?: string; confirm?: "none" | "yes" | "readback" | "tap"; /** Carried out by the brain on the user's spoken yes (`VoiceSession.yesHeard`). */ heardYes?: boolean };
   readback: string;
   /**
    * What the user must have heard: for each group, at least `need` of its words, spoken after `from`; or, with `head`,
    * the readback's action and names word for word, then perhaps `where` (the project), followed by `next` (or a clause
    * break when null). See `saysHead`.
    */
-  mustHear: { words: string[]; need: number; from: number; head?: string[]; where?: string[]; next?: string | null; message?: string; sequence?: string[] }[];
+  mustHear: { words: string[]; need: number; from: number; head?: string[]; where?: string[]; next?: string | string[] | null; message?: string; sequence?: string[] }[];
   /** Offset into the conversation's assistant transcript when this proposal was made. */
   createdFrom: number;
   expiresAt: number;
@@ -65,7 +73,20 @@ export type OperationState = "running" | "done" | "failed" | "unknown";
  * What a conversation hung up to hand the phone (`/api/wait`): a thread's name, and which reply to read out
  * (`read_aloud`) or which thread to dictate a reply to (`dictate`).
  */
-export type Handoff = { handle: string; reply: { itemId: string; messageId: string } } | { handle: string; dictate: { itemId: string } };
+export type Handoff =
+  | { handle: string; reply: { itemId: string; messageId: string } }
+  | { handle: string; dictate: { itemId: string } }
+  /** The session reached its cap: the phone carries the call on in a new one, at once. */
+  | { handle: string; rollover: true };
+
+/**
+ * A reply kept for later in a call (`keep`), unsent: what the phone's Not sent lists, until it's sent or discarded.
+ * `threadName` and `project` as they were when it was kept. `note`: a dictated reply's first line, saying it was
+ * dictated, which goes before `text` when it's sent. `draftId`: the phone's draft it was, if it was dictated.
+ */
+export type KeptReply = {
+  id: string; threadId: string; threadName: string; project: string; text: string; note: string | null; draftId: string | null; conversationId: string; keptAt: number;
+};
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS cards (
@@ -92,7 +113,7 @@ CREATE TABLE IF NOT EXISTS aliases (conversation_id TEXT NOT NULL, name TEXT NOT
 CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER,
   billed_seconds REAL, end_reason TEXT, closed_at INTEGER, hangup_failed_at INTEGER,
-  fast INTEGER NOT NULL DEFAULT 0, answers INTEGER NOT NULL DEFAULT 0);
+  fast INTEGER NOT NULL DEFAULT 0, answers INTEGER NOT NULL DEFAULT 0, resume TEXT);
 CREATE TABLE IF NOT EXISTS waits (conversation_id TEXT PRIMARY KEY, wait TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS untold (conversation_id TEXT PRIMARY KEY, at INTEGER NOT NULL, replies TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS reads (
@@ -101,6 +122,9 @@ CREATE TABLE IF NOT EXISTS reads (
 CREATE TABLE IF NOT EXISTS handoffs (conversation_id TEXT PRIMARY KEY, handoff TEXT NOT NULL, at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS readings (
   id TEXT PRIMARY KEY, item_id TEXT NOT NULL, message_id TEXT NOT NULL, style TEXT NOT NULL, segments TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS kept (
+  id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, thread_name TEXT NOT NULL, project TEXT NOT NULL, text TEXT NOT NULL, note TEXT,
+  draft_id TEXT UNIQUE, conversation_id TEXT NOT NULL, kept_at INTEGER NOT NULL);
 `;
 
 export class Store {
@@ -139,6 +163,12 @@ export class Store {
     if (!sessionCols.includes("answers")) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN fast INTEGER NOT NULL DEFAULT 0; ALTER TABLE sessions ADD COLUMN answers INTEGER NOT NULL DEFAULT 0;");
     }
+    // What a brain restarted mid-call needs to take the session back (`liveSessions`).
+    if (!(this.db.prepare("PRAGMA table_info(sessions)").all() as any[]).some((c) => c.name === "resume")) this.db.exec("ALTER TABLE sessions ADD COLUMN resume TEXT");
+    // What the phone showed of each call as it ended (callview.ts `final`): the call's record in History.
+    if (!(this.db.prepare("PRAGMA table_info(sessions)").all() as any[]).some((c) => c.name === "view")) this.db.exec("ALTER TABLE sessions ADD COLUMN view TEXT");
+    // What Driver said that didn't happen, with its correction (`correctLastTurn`).
+    if (!(this.db.prepare("PRAGMA table_info(turns)").all() as any[]).some((c) => c.name === "corrected")) this.db.exec("ALTER TABLE turns ADD COLUMN corrected TEXT");
   }
 
   // --- cards and briefing ---
@@ -177,14 +207,27 @@ export class Store {
       "INSERT INTO conversations VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET last_active = excluded.last_active",
     ).run(id, now, now);
   }
-  addTurn(conversationId: string, role: "user" | "assistant", text: string, now = Date.now()) {
+  /** `corrected`: what in it Driver said that didn't happen, and the correction it made (session.ts `Conversations.correct`). */
+  addTurn(conversationId: string, role: "user" | "assistant", text: string, now = Date.now(), corrected?: { said: string; note: string }[]) {
     if (!text.trim()) return;
-    this.db.prepare("INSERT INTO turns (conversation_id, role, text, at) VALUES (?, ?, ?, ?)").run(conversationId, role, text.trim(), now);
+    this.db.prepare("INSERT INTO turns (conversation_id, role, text, at, corrected) VALUES (?, ?, ?, ?, ?)")
+      .run(conversationId, role, text.trim(), now, corrected?.length ? JSON.stringify(corrected) : null);
   }
+  /** Driver's latest turn said `said`, which didn't happen: kept with its correction, as `addTurn`'s `corrected`. */
+  correctLastTurn(conversationId: string, said: string, note: string) {
+    const r = this.db.prepare("SELECT id, corrected FROM turns WHERE conversation_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1").get(conversationId) as any;
+    if (!r) return;
+    const corrected = [...(r.corrected ? JSON.parse(r.corrected) : []), { said, note }];
+    this.db.prepare("UPDATE turns SET corrected = ? WHERE id = ?").run(JSON.stringify(corrected), r.id);
+  }
+  /**
+   * The conversation's latest turns, oldest first, as history for a new session: what Driver said that didn't happen
+   * is given as its correction ("[That was wrong: nothing was sent.]"), so it's never carried on as fact.
+   */
   recentTurns(conversationId: string, limit: number): { role: "user" | "assistant"; text: string }[] {
-    return (this.db.prepare("SELECT role, text FROM turns WHERE conversation_id = ? ORDER BY id DESC LIMIT ?").all(conversationId, limit) as any[])
+    return (this.db.prepare("SELECT role, text, corrected FROM turns WHERE conversation_id = ? ORDER BY id DESC LIMIT ?").all(conversationId, limit) as any[])
       .reverse()
-      .map((r) => ({ role: r.role, text: r.text }));
+      .map((r) => ({ role: r.role, text: r.corrected ? withCorrections(r.text, JSON.parse(r.corrected)) : r.text }));
   }
 
   /** Every turn of a conversation with when it was said, oldest first (a flag's file). */
@@ -224,6 +267,18 @@ export class Store {
          FROM conversations c ORDER BY t DESC LIMIT 1`,
     ).get() as any;
     return r && r.t >= since ? r.id : null;
+  }
+  /**
+   * When each conversation was last in use: its last session's end (or start, while one is live) or its last turn,
+   * whichever is later. `last_active` alone moves only when a session starts.
+   */
+  lastActivity(): Map<string, number> {
+    return new Map((this.db.prepare(
+      `SELECT c.id, MAX(c.last_active,
+         COALESCE((SELECT MAX(COALESCE(ended_at, started_at)) FROM sessions WHERE conversation_id = c.id), 0),
+         COALESCE((SELECT MAX(at) FROM turns WHERE conversation_id = c.id), 0)) AS t
+       FROM conversations c`,
+    ).all() as any[]).map((r) => [r.id, Number(r.t)]));
   }
   conversation(id: string): { startedAt: number; lastActive: number } | null {
     const r = this.db.prepare("SELECT created_at, last_active FROM conversations WHERE id = ?").get(id) as any;
@@ -318,9 +373,14 @@ export class Store {
     this.db.exec("DELETE FROM memory");
     this.set("memoryClearedAt", String(now));
   }
-  /** Changes carried out since `since`, in any conversation, newest last. */
+  /** Changes Driver carried out since `since`, in any conversation (not the user's taps), newest last. */
   changesSince(since: number, limit: number): Proposal[] {
-    return (this.db.prepare("SELECT * FROM proposals WHERE created_at >= ? AND state IN ('executed', 'partial') ORDER BY created_at DESC LIMIT ?").all(since, limit) as any[]).reverse().map(rowToProposal);
+    return (this.db.prepare("SELECT * FROM proposals WHERE created_at >= ? AND state IN ('executed', 'partial') AND conversation_id != ? ORDER BY created_at DESC LIMIT ?").all(since, TAP, limit) as any[]).reverse().map(rowToProposal);
+  }
+
+  /** Every proposal and tap in one of `states`, oldest first: the timeline's calls and taps. */
+  proposalsIn(states: readonly string[]): Proposal[] {
+    return (this.db.prepare(`SELECT * FROM proposals WHERE state IN (${states.map(() => "?").join(", ")}) ORDER BY created_at`).all(...states) as any[]).map(rowToProposal);
   }
 
   // --- aliases: every name Driver gave a thread in a conversation keeps meaning that thread there ---
@@ -457,6 +517,38 @@ export class Store {
     this.db.prepare("DELETE FROM readings WHERE created_at < ?").run(before);
   }
 
+  // --- kept replies: replies kept for later in a call, unsent ---
+  /** Keeps `k`; the same dictated draft kept again replaces the one kept before, under its id. Returns what's kept. */
+  keepReply(k: KeptReply): KeptReply {
+    const old = k.draftId ? this.keptByDraft(k.draftId) : null;
+    const row = old ? { ...k, id: old.id } : k;
+    this.db.prepare(
+      `INSERT INTO kept VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET
+       thread_id = excluded.thread_id, thread_name = excluded.thread_name, project = excluded.project, text = excluded.text,
+       note = excluded.note, conversation_id = excluded.conversation_id, kept_at = excluded.kept_at`,
+    ).run(row.id, row.threadId, row.threadName, row.project, row.text, row.note, row.draftId, row.conversationId, row.keptAt);
+    return row;
+  }
+  keptReply(id: string): KeptReply | null {
+    const r = this.db.prepare("SELECT * FROM kept WHERE id = ?").get(id);
+    return r ? rowToKept(r) : null;
+  }
+  keptByDraft(draftId: string): KeptReply | null {
+    const r = this.db.prepare("SELECT * FROM kept WHERE draft_id = ?").get(draftId);
+    return r ? rowToKept(r) : null;
+  }
+  /** Every kept reply, newest first. */
+  keptReplies(): KeptReply[] {
+    return (this.db.prepare("SELECT * FROM kept ORDER BY kept_at DESC, rowid DESC").all() as any[]).map(rowToKept);
+  }
+  /** False when there's no such kept reply. */
+  editKept(id: string, text: string): boolean {
+    return Number(this.db.prepare("UPDATE kept SET text = ? WHERE id = ?").run(text, id).changes) === 1;
+  }
+  dropKept(id: string) {
+    this.db.prepare("DELETE FROM kept WHERE id = ?").run(id);
+  }
+
   // --- sessions: every GPT-Live session the brain created, and whether OpenAI has confirmed it's over ---
   startSession(id: string, conversationId: string, now = Date.now(), fast = false) {
     this.db.prepare("INSERT OR IGNORE INTO sessions (id, conversation_id, started_at, fast) VALUES (?, ?, ?, ?)").run(id, conversationId, now, fast ? 1 : 0);
@@ -488,6 +580,32 @@ export class Store {
     this.db.prepare("UPDATE sessions SET hangup_failed_at = COALESCE(hangup_failed_at, ?) WHERE id = ?").run(now, id);
   }
   /** Sessions OpenAI hasn't confirmed over: open ones, and ones whose hang-up hasn't gone through yet. */
+  /** How to take session `id` back if the brain restarts while it's live: its settings, as the server made it. */
+  saveResume(id: string, resume: unknown) {
+    this.db.prepare("UPDATE sessions SET resume = ? WHERE id = ?").run(JSON.stringify(resume), id);
+  }
+  /** What conversation `conversationId`'s latest session was made with (`saveResume`), or null. */
+  lastResume(conversationId: string): any {
+    const r = this.db.prepare("SELECT resume FROM sessions WHERE conversation_id = ? AND resume IS NOT NULL ORDER BY started_at DESC LIMIT 1").get(conversationId) as any;
+    return r ? JSON.parse(r.resume) : null;
+  }
+  /** What the phone showed of session `id`'s call as it ended (its agenda and receipts). */
+  saveCallView(id: string, view: unknown) {
+    this.db.prepare("UPDATE sessions SET view = ? WHERE id = ?").run(JSON.stringify(view), id);
+  }
+  /**
+   * A conversation's latest call record (callview.ts `CallRecord`), or null: a call carried on in a new session (a
+   * rollover, a reconnect) keeps one record, kept again as each of its sessions ends.
+   */
+  callView<T>(conversationId: string): T | null {
+    const r = this.db.prepare("SELECT view FROM sessions WHERE conversation_id = ? AND view IS NOT NULL ORDER BY started_at DESC LIMIT 1").get(conversationId) as any;
+    return r ? JSON.parse(r.view) : null;
+  }
+  /** Sessions the brain never ended, started since `since`, that it can take back: each with its settings. */
+  liveSessions(since: number): { id: string; conversationId: string; startedAt: number; resume: any }[] {
+    return (this.db.prepare("SELECT id, conversation_id, started_at, resume FROM sessions WHERE closed_at IS NULL AND ended_at IS NULL AND resume IS NOT NULL AND started_at >= ? ORDER BY started_at").all(since) as any[])
+      .map((r) => ({ id: r.id, conversationId: r.conversation_id, startedAt: r.started_at, resume: JSON.parse(r.resume) }));
+  }
   unclosedSessions(): string[] {
     return (this.db.prepare("SELECT id FROM sessions WHERE closed_at IS NULL ORDER BY started_at").all() as any[]).map((r) => r.id);
   }
@@ -528,6 +646,18 @@ export class Store {
     return new Map((this.db.prepare("SELECT * FROM untold").all() as any[]).map((r) => [r.conversation_id, { at: r.at, replies: JSON.parse(r.replies) }]));
   }
 }
+
+/** A turn with each claim that didn't happen replaced by its correction (appended when the words can't be found). */
+function withCorrections(text: string, corrected: { said: string; note: string }[]): string {
+  let out = text;
+  for (const c of corrected) out = c.said && out.includes(c.said) ? out.replace(c.said, `[${c.note}]`) : `${out} [${c.note}]`;
+  return out;
+}
+
+const rowToKept = (r: any): KeptReply => ({
+  id: r.id, threadId: r.thread_id, threadName: r.thread_name, project: r.project, text: r.text, note: r.note ?? null, draftId: r.draft_id ?? null,
+  conversationId: r.conversation_id, keptAt: r.kept_at,
+});
 
 function rowToProposal(r: any): Proposal {
   return {

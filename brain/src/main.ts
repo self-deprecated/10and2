@@ -10,6 +10,7 @@ import { syncVisits } from "./reads.ts";
 import { modelRewriter } from "./reading.ts";
 import { openAiSpeech, Speech } from "./voice/speech.ts";
 import { modelClassifier, modelOpener } from "./briefing.ts";
+import { modelBriefingWriter } from "./briefing-reading.ts";
 import { startServer, type DemoWorlds, type ServerDeps } from "./server.ts";
 import { wire } from "./world.ts";
 import { demoWorld, demoWriter } from "./demo/world.ts";
@@ -59,7 +60,10 @@ setInterval(prune, 3600_000).unref();
 /** What the real brain and every demo world have in common. */
 const common = {
   log, speech, files, openSocket: nodeSocket, brainRev: rev, profiles: cfg.launchProfiles, recordings: cfg.recordSessions ? recordings : undefined, analytics,
+  // The one consent (contracts §5), taken by the server from each request as it arrives; in memory on Lattice.
+  consent: analytics.consent,
   rewrite: modelRewriter(llm, cfg.rewriteModel), rewriteChunkChars: cfg.rewriteChunkChars, leadInColdHours: cfg.leadInColdHours,
+  writeBriefing: modelBriefingWriter(llm, cfg.openerModel),
 };
 // A moment flagged in a call ("debug this"), for agents to review: next to the database, pointing at the recordings.
 const flagsIn = (dir: string, s: Store) => new Flags(files, { store: s, log, dir });

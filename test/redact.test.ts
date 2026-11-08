@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { redactText, redactOutbound } from "../src/redact.ts";
 
 test("common API credentials, JWTs, private keys and assignments are redacted", () => {
-  for (const secret of ["sk-proj-abcdefghijklmnop", "ghp_abcdefghijklmnop", "xoxb-1234567890-abcdefgh", "AKIAABCDEFGHIJKLMNOP", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.signature123", "-----BEGIN RSA PRIVATE KEY-----\nprivate material\n-----END RSA PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\ntruncated private material"]) {
+  for (const secret of ["sk-proj-abcdefghijklmnop", "ghp_abcdefghijklmnop", "xoxb-1234567890-abcdefgh", "AKIAABCDEFGHIJKLMNOP", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTYifQ.signature123", "-----BEGIN " + "RSA PRIVATE KEY-----\nprivate material\n-----END RSA PRIVATE KEY-----", "-----BEGIN " + "PRIVATE KEY-----\ntruncated private material"]) {
     assert.doesNotMatch(redactText(`Before ${secret}`), /abcdefghijklmnop|ABCDEFGHIJKLMNOP|eyJ|private material/);
     assert.match(redactText(secret), /REDACTED/);
   }

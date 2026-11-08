@@ -15,6 +15,7 @@ export function makeLlm(apiKey: string) {
         input: call.input,
         reasoning: { effort: call.effort },
         text: { format: { type: "json_schema", name, strict: true, schema: schema as Record<string, unknown> } },
+        ...(call.fast ? { service_tier: "priority" as const } : {}),
         store: false,
       });
       return JSON.parse(res.output_text) as T;

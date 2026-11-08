@@ -42,6 +42,9 @@ test('"*" sees everything; actions and the ceiling are what it says', () => {
   assert.equal(visible(p, "/anywhere"), true);
   assert.equal(allows(p, "settle"), true);
   assert.equal(allows(p, "archive"), false);
+  assert.equal(allows(p, "unsettle"), true, "undoing a settle wherever settling is allowed");
+  assert.equal(allows(p, "unsnooze"), false, "and a snooze only where snoozing is");
+  assert.throws(() => parsePolicy(JSON.stringify({ ...base, actions: ["unsnooze"] })), /actions must be a list of/, "a policy names only the five");
   assert.equal(withinCeiling(p, { runtimeMode: "auto" }), true);
   assert.equal(withinCeiling(p, { runtimeMode: "full-access" }), false);
 });
@@ -63,6 +66,15 @@ test("T3 is read unless turned off, and a machine must read something", () => {
   assert.equal(claudeOnly.claude, true);
   assert.throws(() => parsePolicy(JSON.stringify({ ...base, t3: false })), /nothing to connect/);
   assert.throws(() => parsePolicy(JSON.stringify({ ...base, t3: "yes" })), /t3 must be/);
+});
+
+test("new worktrees start from the checkout unless the policy names a branch, and only a branch name or HEAD", () => {
+  assert.equal(parsePolicy(JSON.stringify(base)).worktreeBase, "HEAD");
+  assert.equal(parsePolicy(JSON.stringify({ ...base, worktreeBase: "main" })).worktreeBase, "main");
+  assert.equal(parsePolicy(JSON.stringify({ ...base, worktreeBase: "release/2.0" })).worktreeBase, "release/2.0");
+  for (const bad of ["", "-f", "main..dev", "main@origin", "a b", "trunk()", "x/", 3]) {
+    assert.throws(() => parsePolicy(JSON.stringify({ ...base, worktreeBase: bad })), /worktreeBase/, String(bad));
+  }
 });
 
 

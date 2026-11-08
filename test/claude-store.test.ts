@@ -19,3 +19,15 @@ for (const kind of ["settle", "snooze", "archive"] as const) test(`${kind} overl
     assert.deepEqual(store.overlay("session"), committed);
   } finally { store.close(); }
 });
+
+test("unsettle and unsnooze clear what settle and snooze kept", () => {
+  const store = new Store(":memory:");
+  try {
+    store.completeOverlay("k1", "h1", "session", "settle", "now");
+    store.completeOverlay("k2", "h2", "session", "unsettle", "then");
+    assert.deepEqual({ ...store.overlay("session") }, { sessionId: "session", settledAt: null, snoozedAt: null, snoozedUntil: null, archived: 0 });
+    store.completeOverlay("k3", "h3", "session", "snooze", "now", "later");
+    store.completeOverlay("k4", "h4", "session", "unsnooze", "then");
+    assert.deepEqual({ ...store.overlay("session") }, { sessionId: "session", settledAt: null, snoozedAt: null, snoozedUntil: null, archived: 0 });
+  } finally { store.close(); }
+});

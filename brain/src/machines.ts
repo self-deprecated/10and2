@@ -29,6 +29,14 @@ export class Machines implements Adapter {
 
   get actions(): Adapter["actions"] { return [...new Set(this.machines.flatMap((m) => [...m.adapter.actions]))]; }
 
+  actionsFor(itemId: string): Adapter["actions"] {
+    try {
+      return this.route(itemId).m.adapter.actions;
+    } catch {
+      return [];
+    }
+  }
+
   private id(m: Machine, id: string): string {
     return m.local ? id : `${m.name}${SEP}${id}`;
   }
@@ -79,12 +87,12 @@ export class Machines implements Adapter {
     return lists.flat();
   }
 
-  report(id: string): Promise<Report> {
+  async report(id: string): Promise<Report> {
     const r = this.route(id);
     return r.m.adapter.report(r.id);
   }
 
-  replies(id: string): Promise<PastReply[]> {
+  async replies(id: string): Promise<PastReply[]> {
     const r = this.route(id);
     return r.m.adapter.replies?.(r.id) ?? Promise.resolve([]);
   }

@@ -1,6 +1,7 @@
 // Configuration from the environment. Secrets come only from the environment, never from files here.
 import { parseConnectors } from "./connectors.ts";
 import type { LaunchProfile } from "./adapter.ts";
+import { BACKEND_MODELS, LIVE_MODELS } from "./models.ts";
 
 const env = process.env;
 
@@ -92,8 +93,8 @@ export function loadConfig(o: { cloud?: boolean } = {}) {
     connectors: o.cloud ? [] : parseMachines(env, parseDemo(env.DRIVER_DEMO ?? "")),
     /** What threads started by voice run with; voice picks one by name and nothing more. */
     launchProfiles: parseProfiles(env.DRIVER_LAUNCH_PROFILES ?? ""),
-    liveModel: env.DRIVER_LIVE_MODEL ?? "gpt-live-1",
-    backendModel: env.DRIVER_BACKEND_MODEL ?? "gpt-6-luna",
+    liveModel: env.DRIVER_LIVE_MODEL ?? LIVE_MODELS[0],
+    backendModel: env.DRIVER_BACKEND_MODEL ?? BACKEND_MODELS[0],
     classifyModel: env.DRIVER_CLASSIFY_MODEL ?? "gpt-6.1-sol",
     openerModel: env.DRIVER_OPENER_MODEL ?? "gpt-6-luna",
     voice: env.DRIVER_VOICE ?? "marin",
