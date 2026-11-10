@@ -29,8 +29,10 @@ function userTexts(body) {
   const out = [];
   const text = (c) => typeof c === "string" ? c : Array.isArray(c) ? c.map((p) => p?.text ?? p?.content ?? "").filter((t) => typeof t === "string").join("\n") : "";
   for (const m of body.messages ?? []) if (m?.role === "user") out.push(text(m.content));
-  // Anthropic's system-reminder blocks ride along in user content; only the user's own words count.
-  if (Array.isArray(body.messages)) for (let i = 0; i < out.length; i++) out[i] = out[i].replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
+  // Anthropic's system-reminder blocks ride along in user content; only the user's own words count. OpenCode before
+  // 1.17.9 wraps words sent to a busy session in one ("The user sent the following message: …"): those are the user's.
+  const opencodeQueued = /<system-reminder>\s*The user sent the following message:\s*([\s\S]*?)\s*Please address this message and continue with your tasks\.\s*<\/system-reminder>/g;
+  if (Array.isArray(body.messages)) for (let i = 0; i < out.length; i++) out[i] = out[i].replace(opencodeQueued, "$1").replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
   const input = body.input;
   if (typeof input === "string") out.push(input);
   else if (Array.isArray(input)) for (const m of input) if (m?.role === "user" || m?.type === "message" && m?.role === "user") out.push(text(m.content));

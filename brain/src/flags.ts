@@ -7,9 +7,9 @@ import { describe } from "./util.ts";
 
 /**
  * Filler before a command: "okay, debug this", and the sounds speech-to-text writes before one ("Hmm. Debug this",
- * "Tsk. Debug this": on 7 November neither flagged).
+ * "Tsk. Debug this": on 7 November neither flagged; "Also debug this", on 10 November, waited 6 s for the backend's flag).
  */
-const LEAD = /^(?:(?:ok(?:ay)?|alright|all right|right|so|well|hey|driver|please|just|and|now|h+m+|m+h?m+|tsk|uh+|um+|er+|ah+|oh+)\b[\s,.!]*)*/i;
+const LEAD = /^(?:(?:ok(?:ay)?|yeah|yes|yep|alright|all right|right|so|well|hey|driver|please|just|and|also|now|h+m+|m+h?m+|tsk|uh+|um+|er+|ah+|oh+)\b[\s,.!]*)*/i;
 /** What may follow the keyword: "debug this", "flag that one", "mark it for review". */
 const WHAT = String.raw`[\s,]+(?:(?:this|that|it)(?: one| moment| bit| part| conversation| call)?|for review)\b`;
 /**
@@ -35,8 +35,27 @@ export const asksToFlag = (said: string) => {
   return MISHEARD.test(s) || s.split(/(?<=[.!?;])\s*/).some((sentence) => FLAG_COMMAND.test(sentence.trim().replace(LEAD, "")));
 };
 
-/** `brainRev`, `phoneBuild`: what was running (unknown for a flag made after the fact: the recording's header says). */
-export type Flag = { conversationId: string; sessionId: string; at: number; said: string; brainRev?: string; phoneBuild?: string | null; configVersion?: number | null };
+/**
+ * What the user said was wrong in the turn that flagged it, if anything: the words after the command, in its sentence
+ * and the ones after ("Debug this, it said sent": "it said sent"), at least three of them. "Debug this again. Yeah,
+ * debug this" and "Well, I'm waiting. Debug." say nothing, so Driver asks.
+ */
+export const issueIn = (said: string): string | null => {
+  const sentences = said.trim().split(/(?<=[.!?;])\s*/).map((s) => s.trim().replace(LEAD, ""));
+  const at = sentences.findIndex((s) => FLAG_COMMAND.test(s));
+  if (at === -1) return null;
+  const rest = [sentences[at].replace(FLAG_COMMAND, ""), ...sentences.slice(at + 1).filter((s) => !FLAG_COMMAND.test(s))]
+    .join(" ")
+    .replace(/^[\s,.:;!-]+/, "")
+    .trim();
+  return (rest.match(/[\w'’]+/g) ?? []).length >= 3 ? rest : null;
+};
+
+/**
+ * `brainRev`, `phoneBuild`: what was running (unknown for a flag made after the fact: the recording's header says).
+ * `issue`: what the user said went wrong, in their next turn, when Driver asked.
+ */
+export type Flag = { conversationId: string; sessionId: string; at: number; said: string; issue?: string; brainRev?: string; phoneBuild?: string | null; configVersion?: number | null };
 
 const iso = (ms: number | null | undefined) => (ms ? new Date(ms).toISOString() : "–");
 /** A file name that sorts by when the moment was: `20261102-071754-live_u0_Efgadp3o.md` (UTC). */
@@ -72,6 +91,17 @@ export class Flags {
     const list = this.open.get(f.sessionId) ?? [];
     list.push(f);
     this.open.set(f.sessionId, list);
+    return this.write(f);
+  }
+
+  /**
+   * What the user said went wrong, asked after the session's latest flag: added to that flag, which is written again.
+   * Null when the session has no flag open, or the file can't be written.
+   */
+  explain(sessionId: string, issue: string): Promise<string | null> {
+    const f = this.open.get(sessionId)?.at(-1);
+    if (!f) return Promise.resolve(null);
+    f.issue = issue;
     return this.write(f);
   }
 
@@ -124,6 +154,7 @@ export class Flags {
       "",
       `> ${f.said.trim().replace(/\s+/g, " ")}`,
       "",
+      ...(f.issue ? ["## What went wrong, in the user's words", "", "Driver asked what went wrong; this is the user's answer.", "", `> ${f.issue.trim().replace(/\s+/g, " ")}`, ""] : []),
       "## Where to look",
       "",
       `- Conversation \`${f.conversationId}\`; flagged in session \`${f.sessionId}\`.`,

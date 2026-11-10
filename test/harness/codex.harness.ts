@@ -51,66 +51,79 @@ test("Codex: list, read, steer idle and busy, answer a question, continue a clos
     try { execFileSync("codex", ["app-server", "daemon", "stop"], { env: { ...process.env, ...env }, stdio: "ignore", timeout: 90_000 }); } catch { /* none */ }
   });
 
-  // A session open in its terminal (which starts Codex's daemon), which has run one turn.
-  tui.start("codex", cwd, env);
-  await wait("the terminal to be ready", () => tui.screen().includes("Ask Codex to do anything"));
-  await submit("First words TUIONE");
-  await wait("its first reply", () => tui.screen().includes("ACK First words TUIONE"));
-  await adapter.start();
-  await wait("it to be listed", async () => (await adapter.list()).some((i) => i.title === "First words TUIONE"));
-  const id = (await adapter.list()).find((i) => i.title === "First words TUIONE")!.id;
-  assert.equal((await adapter.report(id)).text, "ACK First words TUIONE");
+  // Each feature is its own subtest, so an older Codex can pass some and fail others (src/versions.ts).
+  let id = "";
   const follow = (key: string, message: string): Promise<any> => adapter.execute({ kind: "follow_up", itemId: id, message } as Action, key);
   const status = async () => (await adapter.list()).find((i) => i.id === id)?.status;
 
-  // Idle and open in the terminal: a new turn there, which the terminal shows.
-  assert.equal(await adapter.check({ kind: "follow_up", itemId: id, message: "x" }), null);
-  assert.deepEqual(await follow("idle", "Idle words IDLEONE"), { ok: true });
-  await wait("the terminal to show the message and its reply", () => tui.screen().includes("› Idle words IDLEONE") && tui.screen().includes("ACK Idle words IDLEONE"));
-  assert.ok(mock.saw("Idle words IDLEONE"));
+  await t.test("read: a session open in its terminal is listed and read", async () => {
+    // The terminal starts Codex's daemon.
+    tui.start("codex", cwd, env);
+    await wait("the terminal to be ready", () => tui.screen().includes("Ask Codex to do anything"));
+    await submit("First words TUIONE");
+    await wait("its first reply", () => tui.screen().includes("ACK First words TUIONE"));
+    await adapter.start();
+    await wait("it to be listed", async () => (await adapter.list()).some((i) => i.title === "First words TUIONE"));
+    id = (await adapter.list()).find((i) => i.title === "First words TUIONE")!.id;
+    assert.equal((await adapter.report(id)).text, "ACK First words TUIONE");
+  });
 
-  // Busy: steered into the turn that's streaming a slow reply.
-  await submit("Slow work SLOW6 BUSYONE");
-  await wait("the slow turn to start", () => mock.saw("SLOW6 BUSYONE"));
-  await wait("it to show as running", async () => await status() === "running");
-  assert.deepEqual(await follow("busy", "Steer words STEERONE"), { ok: true });
-  await wait("the model to get the steer", () => mock.saw("Steer words STEERONE"), 60_000);
-  await wait("the terminal to show the steer's reply", () => tui.screen().includes("ACK Steer words STEERONE"), 60_000);
-  await wait("the turn to end", async () => await status() === "completed", 60_000);
+  await t.test("follow up: an idle open session gets a new turn its terminal shows", async () => {
+    assert.equal(await adapter.check({ kind: "follow_up", itemId: id, message: "x" }), null);
+    assert.deepEqual(await follow("idle", "Idle words IDLEONE"), { ok: true });
+    await wait("the terminal to show the message and its reply", () => tui.screen().includes("› Idle words IDLEONE") && tui.screen().includes("ACK Idle words IDLEONE"));
+    assert.ok(mock.saw("Idle words IDLEONE"));
+  });
 
-  // Codex's own question (plan mode offers its request_user_input tool), read out and answered by voice.
-  tui.key("BTab");
-  await wait("plan mode", () => tui.screen().includes("Plan mode"));
-  await submit("Please ASKQ now");
-  await wait("the question to be read", async () => /Which one\? Options: Alpha \/ Beta\./.test((await adapter.report(id)).question ?? ""), 60_000);
-  assert.equal(await status(), "waiting");
-  assert.deepEqual(await follow("answer", "Beta, please"), { ok: true });
-  await wait("the answer to reach the model", () => tui.screen().includes(`ACK RESULT {"answers":{"pick":{"answers":["Beta"]}}}`), 60_000);
-  await wait("the question to be gone", async () => (await adapter.report(id)).question === null);
+  await t.test("steer: a busy open session is steered mid-turn", async () => {
+    await submit("Slow work SLOW6 BUSYONE");
+    await wait("the slow turn to start", () => mock.saw("SLOW6 BUSYONE"));
+    await wait("it to show as running", async () => await status() === "running");
+    assert.deepEqual(await follow("busy", "Steer words STEERONE"), { ok: true });
+    await wait("the model to get the steer", () => mock.saw("Steer words STEERONE"), 60_000);
+    await wait("the terminal to show the steer's reply", () => tui.screen().includes("ACK Steer words STEERONE"), 60_000);
+    await wait("the turn to end", async () => await status() === "completed", 60_000);
+  });
 
-  // Nothing has it open once the terminal is gone and Codex unloads it (about a minute later): continued in the daemon.
-  tui.stop();
-  await wait("Codex to unload it", () => (adapter as any).threads.get(id)?.status?.type === "notLoaded", 150_000);
-  assert.deepEqual(await follow("closed", "Closed words CLOSEDONE"), { ok: true });
-  await wait("the model to get it", () => mock.saw("Closed words CLOSEDONE"), 60_000);
-  await wait("its reply to be read", async () => (await adapter.report(id)).text === "ACK Closed words CLOSEDONE", 60_000);
+  await t.test("answer: Codex's question (plan mode's request_user_input) is answered", async () => {
+    tui.key("BTab");
+    await wait("plan mode", () => tui.screen().includes("Plan mode"));
+    await submit("Please ASKQ now");
+    await wait("the question to be read", async () => /Which one\? Options: Alpha \/ Beta\./.test((await adapter.report(id)).question ?? ""), 60_000);
+    assert.equal(await status(), "waiting");
+    assert.deepEqual(await follow("answer", "Beta, please"), { ok: true });
+    await wait("the answer to reach the model", () => tui.screen().includes(`ACK RESULT {"answers":{"pick":{"answers":["Beta"]}}}`), 60_000);
+    await wait("the question to be gone", async () => (await adapter.report(id)).question === null);
+  });
 
-  // New work in the checkout, named.
-  const profile: LaunchProfile = { name: "Normal", runtimeMode: "auto", workspace: "root", interactionMode: "default" };
-  const place = adapter.places()[0]!.id;
-  const started = await adapter.execute({ kind: "start_work", placeId: place, title: "Harness start", message: "Start words STARTONE", profile }, "start");
-  assert.equal(started.ok, true, JSON.stringify(started));
-  await wait("the model to get the new work", () => mock.saw("Start words STARTONE"), 60_000);
-  const newId = (started as { itemId: string }).itemId;
-  await wait("it to be listed by its name", async () => (await adapter.list()).some((i) => i.id === newId && i.title === "Harness start"), 60_000);
-  await wait("its reply to be read", async () => (await adapter.report(newId)).text === "ACK Start words STARTONE", 60_000);
+  await t.test("continue: a session nothing has open is continued in the daemon", async () => {
+    // Nothing has it open once the terminal is gone and Codex unloads it (about a minute later).
+    tui.stop();
+    await wait("Codex to unload it", () => (adapter as any).threads.get(id)?.status?.type === "notLoaded", 150_000);
+    assert.deepEqual(await follow("closed", "Closed words CLOSEDONE"), { ok: true });
+    await wait("the model to get it", () => mock.saw("Closed words CLOSEDONE"), 60_000);
+    await wait("its reply to be read", async () => (await adapter.report(id)).text === "ACK Closed words CLOSEDONE", 60_000);
+  });
 
-  // New work in a fresh worktree inside the project (the brain's default profiles ask for one).
-  const build: LaunchProfile = { name: "Build", runtimeMode: "auto", workspace: "worktree", interactionMode: "default" };
-  const inWorktree = await adapter.execute({ kind: "start_work", placeId: place, message: "Worktree words WTONE", profile: build }, "start-wt");
-  assert.equal(inWorktree.ok, true, JSON.stringify(inWorktree));
-  await wait("the model to get the worktree's work", () => mock.saw("Worktree words WTONE"), 60_000);
-  const wtId = (inWorktree as { itemId: string }).itemId;
-  await wait("its reply to be read", async () => (await adapter.report(wtId)).text === "ACK Worktree words WTONE", 60_000);
-  assert.deepEqual(adapter.places().map((p) => p.id), [place], "the worktree isn't a project of its own");
+  await t.test("start: new work in the checkout, named", async () => {
+    const profile: LaunchProfile = { name: "Normal", runtimeMode: "auto", workspace: "root", interactionMode: "default" };
+    const place = adapter.places()[0]!.id;
+    const started = await adapter.execute({ kind: "start_work", placeId: place, title: "Harness start", message: "Start words STARTONE", profile }, "start");
+    assert.equal(started.ok, true, JSON.stringify(started));
+    await wait("the model to get the new work", () => mock.saw("Start words STARTONE"), 60_000);
+    const newId = (started as { itemId: string }).itemId;
+    await wait("it to be listed by its name", async () => (await adapter.list()).some((i) => i.id === newId && i.title === "Harness start"), 60_000);
+    await wait("its reply to be read", async () => (await adapter.report(newId)).text === "ACK Start words STARTONE", 60_000);
+  });
+
+  await t.test("start in a worktree: new work in a fresh worktree inside the project", async () => {
+    const build: LaunchProfile = { name: "Build", runtimeMode: "auto", workspace: "worktree", interactionMode: "default" };
+    const place = adapter.places()[0]!.id;
+    const inWorktree = await adapter.execute({ kind: "start_work", placeId: place, message: "Worktree words WTONE", profile: build }, "start-wt");
+    assert.equal(inWorktree.ok, true, JSON.stringify(inWorktree));
+    await wait("the model to get the worktree's work", () => mock.saw("Worktree words WTONE"), 60_000);
+    const wtId = (inWorktree as { itemId: string }).itemId;
+    await wait("its reply to be read", async () => (await adapter.report(wtId)).text === "ACK Worktree words WTONE", 60_000);
+    assert.deepEqual(adapter.places().map((p) => p.id), [place], "the worktree isn't a project of its own");
+  });
 });

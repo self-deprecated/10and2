@@ -16,7 +16,7 @@ import { datedLine, driveBlock, historyLine } from "../drives.ts";
 import { ago, describe, realClock, type Clock, type Timer } from "../util.ts";
 import { endsWithGoodbye, initialEndState, step, type EndInput, type EndState } from "./endPolicy.ts";
 import { deliberate, reasonText, type EndReason } from "./endReason.ts";
-import { asksToFlag, type Flags } from "../flags.ts";
+import { asksToFlag, issueIn, type Flags } from "../flags.ts";
 import { fill, type Prompts } from "./sections.ts";
 import { median, type Calls } from "../calls.ts";
 import type { Track } from "../analytics.ts";
@@ -396,9 +396,12 @@ export function buildSessionConfig(opts: SessionOptions, deps: ToolDeps, convers
   // A new call that waits for the user (speak-first switched off) has no note for either model, as before 3 November.
   const silentNew = opening.kind === "new" && opts.speakFirstNew === false;
   const text = silentNew ? null : openingNote(opening, changes, name, opts.prompts);
-  // A new call's note is the user's turn, which the voice model answers by speaking first. As a developer message,
-  // GPT-Live often began with a burst of another language (eval, 4 November: 2 of 8 runs, none of 8 as the user's).
-  const note = text ? [{ type: "message", role: opening.kind === "new" ? "user" : "developer", content: [{ type: "input_text", text }] }] : [];
+  // The note of a call Driver opens by speaking (a new call, a call-back, back from a reading or a dictation) is the
+  // user's turn, which the voice model answers. As a developer message, GPT-Live often began with a burst of another
+  // language (eval, 4 November: 2 of 8 runs, none of 8 as the user's), and every burst in a recording since was at a
+  // return from a dictation: "一肖中特" on 2 November, Khmer and Burmese on 8 November, Georgian on 10 November.
+  const speaksFirst = opening.kind === "new" || opening.kind === "callback" || opening.kind === "reading" || opening.kind === "draft";
+  const note = text ? [{ type: "message", role: speaksFirst ? "user" : "developer", content: [{ type: "input_text", text }] }] : [];
   const turns = history.map((t) =>
     t.role === "user"
       ? { type: "message", role: "user", content: [{ type: "input_text", text: t.text.slice(0, 500) }] }
@@ -489,6 +492,14 @@ const BACKCHANNEL = /^(?:(?:m+-?h+m+|uh-?huh|h+m+|m+)\W*){1,3}$/i;
  * starts the dictation itself (`dictateUnheeded`). A hand-off comes with the voice model's first words or before them.
  */
 const DICTATE_UNHEEDED_MS = 3000;
+/**
+ * "Debug this" with nothing after it for this long, and no answer: the brain ends the turn itself, flags it and has
+ * Driver answer. GPT-Live sometimes keeps listening after "debug this", and the brain flags a turn only once it's over,
+ * so Driver waited for a note that never came: 10 and 22 s on 10 November ("I'm waiting on the confirmation to come
+ * back"), and 6 of the 9 silences in the recordings since 3 November followed "debug this". Driver's first words came
+ * within 3.2 s of the user's last in 99 of 100 turns (PostHog `turn_answered`, 30 days to 10 November).
+ */
+const FLAG_UNHEEDED_MS = 4000;
 
 /**
  * The user's turn asks to dictate and says nothing about where (no thread named, not a reply): "let's dictate another
@@ -685,6 +696,8 @@ export class VoiceSession {
   private outRequested = false;
   /** The user turn the brain or the flag tool last flagged (`counts.userTurns` then): one flag per turn. */
   private flaggedTurn = -1;
+  /** Driver flagged a moment and asked what went wrong: the user's next turn says, and is added to the flag. */
+  private issueAsked = false;
   /**
    * The claim check: what Driver did in this session (each change, keep, star and flag, by when), the time it judges
    * claims from (the start of the user's latest turn that asked anything: "mm-hmm" over Driver doesn't move it), what
@@ -1005,6 +1018,7 @@ export class VoiceSession {
     this.judgeClaims();
     this.tellArrivals();
     if (this.dictateAsked && this.clock.now() - this.dictateAsked.at >= DICTATE_UNHEEDED_MS) void this.dictateUnheeded();
+    this.flagUnheeded();
     this.advance({
       type: "tick", busy: this.toolsRunning > 0 || this.pending.size > 0,
       maxMs: this.deps.maxMs, idleMs: this.deps.idleMs, stallMs: this.deps.stallMs,
@@ -1292,11 +1306,24 @@ export class VoiceSession {
   }
 
   /**
+   * The user said "debug this" and has been quiet since (`FLAG_UNHEEDED_MS`, and no sound on their microphone), with no
+   * word from Driver and nothing handed to the backend: their turn is over. It's flagged, and Driver asked to answer.
+   */
+  private flagUnheeded() {
+    const now = this.clock.now();
+    if (!this.deps.flags || !this.userSaid || this.ended || this.endState.closing || this.backendBusy) return;
+    if (now - this.endState.lastUserDelta < FLAG_UNHEEDED_MS || now - this.userSoundAt < SOUND_HOLD_MS) return;
+    if (!asksToFlag(vocabularyOf(this.deps.store).correct(this.userSaid))) return;
+    this.log(`"debug this" unanswered ${this.since()}: flagging it, and asking Driver to answer`);
+    this.endUserTurn(true);
+  }
+
+  /**
    * The user's turn is over: "debug this" flags the moment for review, with what they said, and the voice model is told
    * quietly, since it may say "Flagged." only then (on 2 November it said so for a turn the brain hadn't flagged). A turn
    * that asks anything (not "mm-hmm" over Driver) is where the claim check counts what Driver did from.
    */
-  private endUserTurn() {
+  private endUserTurn(nudge = false) {
     const said = vocabularyOf(this.deps.store).correct(this.userSaid);
     this.userSaid = "";
     // Only a turn with words in it changes what the user last asked; "debug this" alone (no goodbye) never ends the call.
@@ -1313,22 +1340,29 @@ export class VoiceSession {
       const names = namedItems(this.deps.briefing).map((n) => n.handle);
       this.dictateAsked = this.deps.promptsBack && asksToDictate(said, names) ? { turn: this.counts.userTurns, at: this.clock.now() } : null;
     }
+    // The answer to "what went wrong?" (not a listening sound, nor another flag): it goes in the flag.
+    if (this.issueAsked && spokenWords(said) && !BACKCHANNEL.test(spokenWords(said)) && !asksToFlag(said)) {
+      this.issueAsked = false;
+      void this.explainFlag(spokenWords(said));
+    }
     if (!this.deps.flags || !said.trim() || !asksToFlag(said)) return;
     try {
       this.deps.conversations.flush(this.ids.conversationId);
     } catch (e) {
       return this.log(`couldn't flag it (${describe(e)})`);
     }
-    void this.flagMoment(said, true);
+    void this.flagMoment(said, true, !issueIn(said), nudge);
   }
 
   /**
    * Flags this moment for review, once per user turn (the brain's matcher, or the backend's `flag` tool): written at
    * once, with a receipt in the call. `tell`: the voice model is told, to say "Flagged." (the tool's answer says it
-   * instead).
+   * instead). `ask`: the user didn't say what went wrong, so Driver asks, and their next turn is added to the flag.
    */
-  private flagMoment(said: string, tell: boolean): Promise<string | null> {
+  private flagMoment(said: string, tell: boolean, ask: boolean, nudge = false): Promise<string | null> {
+    const at = this.clock.now();
     this.flaggedTurn = this.counts.userTurns;
+    this.issueAsked = false;
     this.didNow("flagged");
     return this.deps.flags!.flag({ ...this.ids, at: Date.now(), said, ...this.deps.versions }).then((path) => {
       this.deps.record?.({ type: "flag", said, file: path });
@@ -1337,10 +1371,22 @@ export class VoiceSession {
         this.track("debug_flagged", { flag: path.split("/").pop() ?? null, recording: this.deps.recordingRef ?? null, after_fact: false });
         this.report({ kind: "flagged", sessionId: this.ids.sessionId, at: Date.now(), file: path });
         this.receipt({ kind: "flag", text: "Flagged this moment for review" });
-        if (tell) this.conn.send({ type: "session.thinking.append", content: fill("call.flagged"), delegation_id: null });
+        this.issueAsked = ask;
+        if (tell) this.conn.send({ type: "session.thinking.append", content: fill(ask ? "call.flagged.ask" : "call.flagged"), delegation_id: null });
+      }
+      // `nudge`: the voice model wasn't answering (`flagUnheeded`), and still isn't, nor the user speaking again.
+      if (nudge && !this.ended && !this.endState.closing && !this.userSaid && this.endState.lastAssistantDelta < at && !this.backendBusy) {
+        this.conn.send({ type: "response.create" });
       }
       return path;
     });
+  }
+
+  /** What the user said went wrong, when Driver asked after a flag: added to the flag's file. */
+  private async explainFlag(issue: string) {
+    const path = await this.deps.flags!.explain(this.ids.sessionId, issue);
+    this.deps.record?.({ type: "flag_issue", said: issue, file: path });
+    this.log(path ? `added what went wrong to the flag: ${path}` : "couldn't add what went wrong to the flag");
   }
 
   /**
@@ -1354,9 +1400,15 @@ export class VoiceSession {
     }
     const user = spokenWords(this.deps.conversations.lastUserTurn(this.ids.conversationId).text);
     const said = [user, note?.trim() ? `(Noted: ${note.trim().slice(0, 500)})` : ""].filter(Boolean).join(" ") || "Flagged in the call.";
-    const path = await this.flagMoment(said, false);
+    const ask = !note?.trim() && !issueIn(user);
+    const path = await this.flagMoment(said, false, ask);
     return path
-      ? { flagged: true, result: "Flagged this moment for review.", instruction: "Say \"Flagged.\" once, then answer anything else they said." }
+      ? {
+          flagged: true, result: "Flagged this moment for review.",
+          instruction: ask
+            ? "Say \"Flagged.\" once and ask them, in a few words, what went wrong: Driver adds their answer to the flag. Answer anything else they said."
+            : "Say \"Flagged.\" once, then answer anything else they said.",
+        }
       : { error: "The flag couldn't be written just now, so nothing was flagged. Say so in a few words." };
   }
 

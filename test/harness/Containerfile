@@ -6,13 +6,18 @@ ARG CLAUDE_CODE=2.1.321
 ARG CODEX=0.167.0
 ARG OPENCODE=1.19.5
 ARG PI=1.5.1
+# T3 Code: upstream's npm `t3`, which runs its threads with the Codex above.
+ARG T3=0.1.8
 RUN npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUDE_CODE}" \
     ${CODEX:+"@openai/codex@${CODEX}"} ${OPENCODE:+"opencode-ai@${OPENCODE}"} ${PI:+"@earendil-works/pi-coding-agent@${PI}"} \
+    ${T3:+"t3@${T3}"} \
   && npm cache clean --force
 # OpenCode installs its plugin package into its config folder from npm before it loads any plugin, and waits for it: put
 # there ahead of time (opencode.harness.ts copies this into its own config folder), since the tests have no network.
 RUN if [ -n "$OPENCODE" ]; then mkdir -p /opt/opencode-config && cd /opt/opencode-config \
     && npm install --no-fund --no-audit --save-exact "@opencode-ai/plugin@${OPENCODE}" && npm cache clean --force; fi
 USER node
+# `t3` downloads T3 Code's executable into ~/.t3 the first time it runs: done here, while there's network.
+RUN if [ -n "$T3" ]; then t3 --version; fi
 ENV TENANDTWO_HARNESS=1 DISABLE_AUTOUPDATER=1
 WORKDIR /work/connector

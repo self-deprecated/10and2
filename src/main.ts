@@ -16,6 +16,7 @@ import { configDirectory, hookSocket, stateDirectory } from "./paths.ts";
 import { addMachine, brainDb, brainEnvPath, brainOrigin, brainPort, DEFAULT_PORT, machines, readBrainEnv, removeMachine, validName, writeBrainEnv } from "./brain.ts";
 import { AGENTS, type Agent, defaultPolicyPath, loadPolicy, parsePolicy, validBase, visible } from "./policy.ts";
 import { describeFound, detect, NAMES, ORDER, type Found } from "./agents.ts";
+import { versionWarning } from "./versions.ts";
 import { applyChoice, applyFlags, capsFor, CAP_SHORT, CEILING_LABEL, chooseInteractively, choiceOf, startingChoice, summary, type Choice } from "./choose.ts";
 import { VERSION } from "./protocol.ts";
 import { BRAIN, Service } from "./service.ts";
@@ -218,7 +219,16 @@ async function chooseAgents(again: string, existing: any | null): Promise<{ foun
   if (!flags.has("yes") && process.stdin.isTTY && process.stdout.isTTY) choice = await chooseInteractively(found, choice);
   else for (const f of found) (f.installed && choice.on[f.agent] ? ok : note)(f.installed && choice.on[f.agent] ? `${f.name} ${dim(`· ${describeFound(f)}`)}` : dim(`${f.name} ${f.installed ? "· off" : "not found"}`));
   if (!AGENTS.some((a) => choice.on[a])) throw new Error(`Every coding agent is switched off, so there's nothing to connect. Run ${cmd(again)} again and switch one on.`);
+  warnOld(found.filter((f) => choice.on[f.agent]));
   return { found, choice };
+}
+
+/** An agent older than what Driver needs, and how to update it (versions.ts). */
+function warnOld(found: Found[]) {
+  for (const f of found) {
+    const w = f.installed ? versionWarning(f.agent, f.name, f.version) : null;
+    if (w) warn(w.replace(/: (\S.*)$/, (_, c: string) => `: ${cmd(c)}`));
+  }
 }
 
 /**
@@ -455,6 +465,7 @@ async function runConnector() {
   });
   link.start();
   log(`connector ${VERSION}: linking to ${origin}`);
+  void detect().then((found) => { for (const f of found) { const w = policy[f.agent] && f.installed ? versionWarning(f.agent, f.name, f.version) : null; if (w) log(`${f.agent}: ${w}`); } }, () => {});
   void t3?.start().catch((e) => { log(`t3: ${describe(e)}; not restarting`); record({ error: `T3 Code: ${describe(e)}` }); stop(fatalExit); });
   void claude?.start().then(() => log("claude: reading sessions"), (e) => log(`claude: ${describe(e)}`));
   void codex?.start().then(() => log("codex: reading sessions"), (e) => log(`codex: ${describe(e)}`));
@@ -505,6 +516,7 @@ async function status() {
     const caps = capsFor(choice, a).map((c) => CAP_SHORT[c]).join(" · ") || "read only";
     note(`${NAMES[a].padEnd(12)} ${choice.on[a] ? `on    ${caps}` : dim("off")}`);
   }
+  warnOld((await detect()).filter((f) => choice.on[f.agent]));
   if (policy.actions.includes("start_work")) {
     note(`New work runs with at most ${CEILING_LABEL[policy.maxRuntimeMode]}`);
     if (policy.t3) note(`New T3 Code worktrees start from ${baseText(policy.worktreeBase)}`);

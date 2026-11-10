@@ -420,6 +420,23 @@ async function describe(item: WorkItem, handle: string, deps: ToolDeps, now: num
   };
 }
 
+/**
+ * Tools that act on the user's behalf (send, start, read aloud, hang up), refused while the user hasn't said anything
+ * in this call, with what didn't happen. In a call Driver opens (a dictation, a reading or a wait coming back), the
+ * voice model often hands off before the user speaks, and the backend then acts on the opening's note alone:
+ * - 2 November, back from a reading: `end_session` 1.3 s in; Driver said "Welcome back. Goodbye." over the user's "Oh! Don't".
+ * - 8 November, a dictation back with nothing said: `dictate` again, twice, 15 billed seconds each.
+ * - 10 November, a new thread's prompt dictated to keep for later: `send_kept` 1.4 s in started it in "agent" (a word
+ *   the prompt used), unasked; and back from readings, `read_aloud` of the same reply three calls running, each cut off.
+ */
+const BEFORE_THE_USER: Readonly<Record<string, string>> = {
+  send_kept: "nothing was sent or started: it stays kept, in Not sent on their phone.",
+  read_aloud: "nothing is read.",
+  dictate: "nothing is dictated.",
+  hold: "it doesn't go on hold.",
+  end_session: "it doesn't end.",
+};
+
 export async function runTool(
   name: string,
   args: any,
@@ -437,7 +454,7 @@ export async function runTool(
     /** How the phone reads replies aloud (its settings), and in which of OpenAI's voices, when it uses one. */
     readingStyle?: ReadingStyle;
     readingVoice?: string;
-    /** Whether the user has said anything in this session: `end_session` is refused until they have. */
+    /** Whether the user has said anything in this session: the tools in `BEFORE_THE_USER` are refused until they have. */
     userSpoke?: () => boolean;
     /** The user's latest turn only asked to flag the moment ("debug this"): `end_session` is refused. */
     onlyFlagged?: () => boolean;
@@ -464,6 +481,8 @@ export async function runTool(
 ): Promise<ToolResult> {
   const now = Date.now();
   const about = (...found: { handle: string; item: WorkItem }[]) => ctx.about?.(found.map((f) => ({ itemId: f.item.id, handle: f.handle, group: f.item.group })));
+  const unasked = ctx.userSpoke && !ctx.userSpoke() ? BEFORE_THE_USER[name] : undefined;
+  if (unasked) return { error: `The user hasn't said anything in this call yet, so ${unasked} Ask them, in a few words, what they'd like to do.` };
   switch (name) {
     case "list": {
       const view = deps.briefing.view();
@@ -699,12 +718,6 @@ export async function runTool(
       return { reading: true, handle: found.handle, instruction: "Reply with nothing at all: Driver has hung up, and the phone is reading it." };
     }
     case "dictate": {
-      // Never before the user has spoken in this call. On 8 November a dictation came back to the call with nothing said
-      // (the wake word alone while recording), the voice model handed off at once, and the backend dictated again: twice,
-      // 15 billed seconds each, with the user never asked what they wanted.
-      if (ctx.userSpoke && !ctx.userSpoke()) {
-        return { error: "The user hasn't said anything in this call yet, so nothing is dictated. Ask them, in a few words, what they'd like to do." };
-      }
       // The phone's recording tone is the cue, so the voice model says nothing (8 November: "Go ahead after the tone." and
       // the 2.5 s of quiet after it were most of the 3 s before the tone). Stop while this runs wins: nothing is handed to the phone.
       const generation = deps.waits.generation;
@@ -739,19 +752,11 @@ export async function runTool(
       return { dictating: true, instruction: DICTATING };
     }
     case "hold": {
-      if (ctx.userSpoke && !ctx.userSpoke()) {
-        return { error: "The user hasn't said anything in this call yet, so it doesn't go on hold. Ask them, in a few words, what they'd like to do." };
-      }
       deps.store.saveHandoff(ctx.conversationId, { handle: "", hold: true });
       ctx.requestEnd({ kind: "paused", handOff: true });
       return { holding: true, instruction: HOLDING };
     }
     case "end_session": {
-      // Never on a call the user hasn't spoken in. On 2 November, back from a reading, the backend called it 1.3 s in,
-      // before the user said a word: Driver said "Welcome back. Goodbye." and hung up on their "Oh! Don't".
-      if (ctx.userSpoke && !ctx.userSpoke()) {
-        return { error: "The user hasn't said anything in this call yet, so it doesn't end. Ask them, in a few words, what they'd like to do." };
-      }
       if (ctx.onlyFlagged?.()) {
         return { error: "The user only asked Driver to flag this moment for review; the call goes on. Don't say goodbye: answer anything else they said, or wait for them." };
       }

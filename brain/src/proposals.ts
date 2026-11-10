@@ -468,6 +468,8 @@ export class Proposals {
         const bad = badMessage(message);
         if (bad) return { error: bad };
         if (!one) return { error: "Follow up one thread at a time." };
+        const repeat = this.sentAlready(conversationId, targets[0], message, now);
+        if (repeat) return { error: repeat };
         fields.message = message;
         const words = messageWords(message);
         // Keep the 40% gist for interruptions, but preserve word order and every negation.
@@ -755,6 +757,28 @@ export class Proposals {
     else if (!(p.state === "cancelled" && p.result === KEPT)) return { error: `That prompt can't be kept: it's already ${p.state}${p.result ? ` (${p.result})` : ""}.` };
     if (!kept) return { error: "That prompt isn't kept any more: it was started or discarded. Say so." };
     return { kept: true, kept_id: kept.id, result: "Kept your prompt for a new thread. It's in Not sent on the phone.", instruction };
+  }
+
+  /** Follow-ups whose repeat the backend was told of once already (`sentAlready`): conversation, thread and words. */
+  private readonly repeatsTold = new Set<string>();
+
+  /**
+   * The same words went to this thread earlier in this conversation (in the last half hour): the backend is told so
+   * once, to say so and ask; proposed again after that, it's proposed as usual, since the user wants it sent again. On
+   * 10 November the backend proposed "Stop; this was sent to the wrong place." a minute after sending "Stop, this was
+   * sent to the wrong place.", for "That wasn't sent to the right place", and the user's "Send it" sent it twice.
+   */
+  private sentAlready(conversationId: string, target: { itemId: string; handle: string; group?: string }, message: string, now: number): string | null {
+    const words = messageWords(message).join(" ");
+    const sent = this.d.store.proposalsFor(conversationId).findLast((p) =>
+      p.action === "follow_up" && p.state === "executed" && p.targets[0]?.itemId === target.itemId && now - p.createdAt < 30 * 60_000 &&
+      messageWords(String(p.fields.message ?? "")).join(" ") === words);
+    const key = `${conversationId}|${target.itemId}|${words}`;
+    if (!sent || this.repeatsTold.has(key)) return null;
+    this.repeatsTold.add(key);
+    const minutes = Math.round((now - sent.createdAt) / 60_000);
+    const ago = minutes < 1 ? "just now" : minutes === 1 ? "a minute ago" : `${minutes} minutes ago`;
+    return `Nothing was proposed: ${saidBefore(target)} was sent these same words ${ago}. Say so, and ask whether they want it sent again; only if they do, propose it again.`;
   }
 
   /** Kept replies being sent by voice now (`sendKept`): each goes once at a time. */
