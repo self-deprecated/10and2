@@ -49,7 +49,12 @@ export type Report = {
 };
 
 /** Where new work can start: a project, named as it's said, with where it is ("driver, on Quartz"). */
-export type Place = { id: string; name: string; /** When an item there was last active, if any. */ activeAt: string | null };
+/**
+ * Where new work can start. `folder`: the end of its checkout's path ("mono/nix"), and `repo`: its repository's name
+ * ("mono-nix"), from connectors 0.7.0 on: other names the user may say for it, and how two places with one name are told
+ * apart (places.ts).
+ */
+export type Place = { id: string; name: string; /** When an item there was last active, if any. */ activeAt: string | null; folder?: string; repo?: string };
 
 /**
  * What new work runs with. Voice only ever names a profile; this is the most it can ask for. `workspace`: a fresh

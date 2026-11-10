@@ -6,6 +6,7 @@ import { mentionsThread, tellsAbout, UTTERANCE, withGroup } from "../handles.ts"
 import { agrees, KEPT, READBACK_ALL, spokenWords, trackChange, type ConfirmLevels, type KeepReplies, type ToolResult, type UserTurn } from "../proposals.ts";
 import type { Proposal, Seen, Store } from "../store.ts";
 import { isNewThread } from "../drafts.ts";
+import { spokenPlaces } from "../places.ts";
 import type { WatchedReplies } from "../updates.ts";
 import type { LiveConn, SessionConfig } from "./live.ts";
 import { asOf, backendInstructions, briefed, briefingBlock, frontendInstructions, keptNote, launchNote, type Recent } from "./prompts.ts";
@@ -153,7 +154,11 @@ export type DictatedOut = { handle: string; proposalId: string | null; readback:
  */
 export type NewThreadOut = { keptId: string; words: number; place: string | null; suggested: string[] };
 /** A reply the user was dictating when they went back to the conversation: saved on the phone, not sent. */
-export type KeptDraft = { handle: string; parts: number };
+/**
+ * A reply left unsent when the user came back to the call: its thread and parts, and once the brain has kept it
+ * (`keepLeftUnsent`, server.ts), its kept id and words; else it's still only on the phone (an older phone).
+ */
+export type KeptDraft = { handle: string; parts: number; keptId?: string; words?: number };
 export type Opening =
   | { kind: "new" }
   | { kind: "resume" }
@@ -232,9 +237,12 @@ export function openingNote(opening: Opening, changeList: string[], name: Name =
       return fill("opening.reading", {
         read: [hold, read].filter(Boolean).join("\n"),
         meanwhile: meanwhile(news),
-        kept: kept ? fill("opening.reading.kept", { name: name(kept.handle), parts: `${kept.parts} ${kept.parts === 1 ? "part" : "parts"}`, name_mid: name(kept.handle, true) }) : "",
+        kept: !kept ? ""
+          : kept.keptId ? fill("opening.reading.kept-here", { name: name(kept.handle), size: wordsOf(kept.words ?? 0) })
+          : fill("opening.reading.kept", { name: name(kept.handle), parts: `${kept.parts} ${kept.parts === 1 ? "part" : "parts"}`, name_mid: name(kept.handle, true) }),
         speak: said.trim()
           ? fill("opening.reading.answer", { then })
+          : kept?.keptId ? fill("opening.reading.ask-kept", { name: name(kept.handle, true), then })
           : fill("opening.reading.ask", { about: fill(opening.read.length ? "opening.reading.ask.about" : "opening.reading.ask.next"), then }),
         changes,
       }).trimStart();
@@ -285,6 +293,9 @@ function readOut(read: ReadOut[], name: Name): string {
  */
 export function backendNote(opening: Opening, name: Name = (h) => h): string | null {
   if (opening.kind === "rejoin" || opening.kind === "continue") return fill("backend-note.new-call");
+  if (opening.kind === "reading" && opening.kept?.keptId) {
+    return fill("backend-note.reading.kept", { what: fill("opening.draft.reply", { name: name(opening.kept.handle, true) }), kept: opening.kept.keptId, size: wordsOf(opening.kept.words ?? 0) });
+  }
   if (opening.kind === "new" || opening.kind === "callback" || opening.kind === "reading") return fill("backend-note.spoke-first");
   if (opening.kind !== "draft") return null;
   const { handle, proposalId, readback, newThread, keep } = opening.draft;
@@ -410,7 +421,7 @@ export function buildSessionConfig(opts: SessionOptions, deps: ToolDeps, convers
       type: "responses",
       responses: {
         model: opts.backendModel,
-        instructions: backendInstructions(block, now, silentNew ? null : backendNote(opening, name), deps.adapter.actions.includes("start_work") ? launchNote(deps.adapter.places?.() ?? [], deps.profiles ?? []) : null, preload(deps.briefing, now).block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL, keptFor(deps, now.getTime()), words),
+        instructions: backendInstructions(block, now, silentNew ? null : backendNote(opening, name), deps.adapter.actions.includes("start_work") ? launchNote(spokenPlaces(deps.adapter.places?.() ?? []), deps.profiles ?? []) : null, preload(deps.briefing, now).block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL, keptFor(deps, now.getTime()), words),
         tools: TOOLS.map((t) => ({ type: "function", strict: true, ...t })),
         // Never "required": it would loop on the answering response.
         tool_choice: "auto",
@@ -472,6 +483,24 @@ type Arrival = { itemId: string; handle: string; group: string; at: string; summ
  * keeps counting from the turn before. "Yes" and "okay" may answer a readback, so they're turns of their own.
  */
 const BACKCHANNEL = /^(?:(?:m+-?h+m+|uh-?huh|h+m+|m+)\W*){1,3}$/i;
+
+/**
+ * How long after the voice model starts answering a request to dictate it has to hand it to the backend before Driver
+ * starts the dictation itself (`dictateUnheeded`). A hand-off comes with the voice model's first words or before them.
+ */
+const DICTATE_UNHEEDED_MS = 3000;
+
+/**
+ * The user's turn asks to dictate and says nothing about where (no thread named, not a reply): "let's dictate another
+ * one", "go into dictation mode", "10 & 2, dictate". A short turn only, never one that calls it off ("don't dictate"),
+ * and never "dictates" or "dictated" in passing. `threads`: the briefing's names.
+ */
+export function asksToDictate(said: string, threads: string[]): boolean {
+  const words = spokenWords(said).toLowerCase();
+  if (!/\bdictat(?:e|ing|ion)\b/.test(words) || words.split(" ").length > 15) return false;
+  if (/\b(?:don'?t|do not|stop|no more|not now|never|repl(?:y|ies)|respond|answer)\b/.test(words)) return false;
+  return !threads.some((t) => mentionsThread(said, t, threads.filter((o) => o !== t)));
+}
 
 /** What a claim said, and the truth when it didn't happen: "sent", "nothing was sent." */
 const CORRECTIONS: Record<Claim, [string, string]> = {
@@ -627,6 +656,12 @@ export class VoiceSession {
    * the backend hung up on "Debug this again. Yeah, debug this", though its instructions say those words call no tool.
    */
   private onlyFlagged = false;
+  /**
+   * The user's latest turn asked to dictate (`asksToDictate`) and the voice model began answering it, at `at`, with no
+   * hand-off to the backend yet. On 9 November it said "Go ahead, I'm listening." and "Okay." and handed nothing over,
+   * for 38 s, until the user asked a third time.
+   */
+  private dictateAsked: { turn: number; at: number } | null = null;
   /** When the user's microphone last carried speech-loud sound, and since when news has waited for them to be quiet. */
   private userSoundAt = 0;
   private heldSince = 0;
@@ -969,6 +1004,7 @@ export class VoiceSession {
     if (this.outAt && this.clock.now() - this.outAt > 8000) this.endForCredits();
     this.judgeClaims();
     this.tellArrivals();
+    if (this.dictateAsked && this.clock.now() - this.dictateAsked.at >= DICTATE_UNHEEDED_MS) void this.dictateUnheeded();
     this.advance({
       type: "tick", busy: this.toolsRunning > 0 || this.pending.size > 0,
       maxMs: this.deps.maxMs, idleMs: this.deps.idleMs, stallMs: this.deps.stallMs,
@@ -996,6 +1032,7 @@ export class VoiceSession {
       case "session.input_transcript.delta":
         if (!this.userSaid) {
           this.counts.userTurns++;
+          this.dictateAsked = null;
           this.userTurnAt = this.clock.now();
           // Words of Driver's either side of the user's are separate sentences.
           this.voiceSaid += " ";
@@ -1041,6 +1078,7 @@ export class VoiceSession {
       }
       case "session.delegation.created":
         this.endUserTurn();
+        this.dictateAsked = null;
         this.backendBusy = true;
         this.delegatedAt = this.clock.now();
         this.rounds = this.roundTools = 0;
@@ -1160,23 +1198,7 @@ export class VoiceSession {
         };
         let threw = false;
         const about: About[] = [];
-        const result = await runTool(call.name, args, {
-            conversationId: this.ids.conversationId,
-            memory: this.deps.memory ?? true,
-            whenSaid: (handle, said, summaryIn) => this.expect(handle, said, undefined, summaryIn),
-            readingStyle: this.deps.readingStyle,
-            readingVoice: this.deps.readingVoice,
-            requestEnd: (reason) => this.advance({ type: "tool_requested_end", reason }),
-            watch: (threads) => this.watch(threads),
-            userSpoke: () => this.endState.userWords.trim() !== "",
-            onlyFlagged: () => this.onlyFlagged,
-            keepReplies: this.deps.keepReplies,
-            confirm: this.deps.confirm,
-            awaitingDraft: () => this.deps.opening === "draft" && this.endState.userWords.trim() === "",
-            promptsBack: this.deps.promptsBack,
-            about: (threads) => about.push(...threads),
-            flag: (note) => this.flagFromTool(note),
-          }, this.deps).catch(
+        const result = await runTool(call.name, args, this.toolContext(about), this.deps).catch(
           (e) => {
             threw = true;
             this.deps.analytics?.exception("session", e, { tool: call.name });
@@ -1213,6 +1235,62 @@ export class VoiceSession {
     }
   }
 
+  /** What a tool runs with in this session; `about` collects the threads it was about, for its receipt. */
+  private toolContext(about: About[]): Parameters<typeof runTool>[2] {
+    return {
+      conversationId: this.ids.conversationId,
+      memory: this.deps.memory ?? true,
+      whenSaid: (handle, said, summaryIn) => this.expect(handle, said, undefined, summaryIn),
+      readingStyle: this.deps.readingStyle,
+      readingVoice: this.deps.readingVoice,
+      requestEnd: (reason) => this.advance({ type: "tool_requested_end", reason }),
+      watch: (threads) => this.watch(threads),
+      userSpoke: () => this.endState.userWords.trim() !== "",
+      onlyFlagged: () => this.onlyFlagged,
+      keepReplies: this.deps.keepReplies,
+      confirm: this.deps.confirm,
+      awaitingDraft: () => this.deps.opening === "draft" && this.endState.userWords.trim() === "",
+      promptsBack: this.deps.promptsBack,
+      about: (threads) => about.push(...threads),
+      flag: (note) => this.flagFromTool(note),
+    };
+  }
+
+  /**
+   * The user asked to dictate and the voice model, answering, handed nothing to the backend (`dictateAsked`): Driver
+   * starts a new thread's dictation itself, as the backend's `dictate` with nothing else would, and hangs up for the phone
+   * to record. Never while the backend or a tool is working, a hand-off or end is under way, or the voice model asked
+   * the user something of its own ("A reply, or a new thread?"): the user answers that.
+   */
+  private async dictateUnheeded() {
+    const asked = this.dictateAsked;
+    this.dictateAsked = null;
+    if (!asked || asked.turn !== this.counts.userTurns || this.ended || this.endState.closing || this.endState.endRequestedAt) return;
+    if (this.backendBusy || this.toolsRunning > 0 || this.pending.size > 0 || this.voiceSaid.includes("?")) return;
+    const args = { handle: null, project: null, profile: null };
+    const about: About[] = [];
+    this.toolsRunning++;
+    try {
+      const result = await runTool("dictate", args, this.toolContext(about), this.deps);
+      this.counts.toolCalls++;
+      this.toolCalled("dictate", args, result, false, 0, {});
+      this.log(`asked to dictate, nothing handed to the backend in ${DICTATE_UNHEEDED_MS / 1000} s: Driver started it → ${JSON.stringify(result).slice(0, 200)}`);
+      this.deps.record?.({ type: "tool", callId: "brain", name: "dictate", args, result });
+      try {
+        this.deps.view?.tool("dictate", args, result, about);
+      } catch (e) {
+        this.log(`couldn't add its receipt (${describe(e)})`);
+      }
+      // The hand-off hangs up at once, as after the backend's own `dictate`.
+      if ((result as { dictating?: boolean }).dictating) this.advance({ type: "tool_answered" });
+    } catch (e) {
+      this.log(`couldn't start the dictation (${describe(e)})`);
+    } finally {
+      this.toolsRunning--;
+      this.advance({ type: "activity" });
+    }
+  }
+
   /**
    * The user's turn is over: "debug this" flags the moment for review, with what they said, and the voice model is told
    * quietly, since it may say "Flagged." only then (on 2 November it said so for a turn the brain hadn't flagged). A turn
@@ -1231,6 +1309,10 @@ export class VoiceSession {
       this.corrected.clear();
     }
     if (spokenWords(said) && agrees(said)) void this.yesHeard();
+    if (spokenWords(said)) {
+      const names = namedItems(this.deps.briefing).map((n) => n.handle);
+      this.dictateAsked = this.deps.promptsBack && asksToDictate(said, names) ? { turn: this.counts.userTurns, at: this.clock.now() } : null;
+    }
     if (!this.deps.flags || !said.trim() || !asksToFlag(said)) return;
     try {
       this.deps.conversations.flush(this.ids.conversationId);

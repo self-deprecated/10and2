@@ -75,7 +75,7 @@ export const TOOLS = [
   },
   {
     name: "keep",
-    description: "Keep a reply waiting for the user's yes for later, unsent, instead of sending it: when they say to keep it, save it or send it later. It goes to Not sent on their phone, where they can change it and send it.",
+    description: "Keep a reply waiting for the user's yes for later, unsent, instead of sending it: when they say to keep it, save it or send it later. It goes to Not sent on their phone, where they can change it and send it. proposal_id: the proposal's id, or the kept id (K-…) of a reply or dictated prompt that's kept already, which it confirms.",
     parameters: { type: "object", additionalProperties: false, required: ["proposal_id"], properties: { proposal_id: { type: "string" } } },
   },
   {
@@ -699,6 +699,12 @@ export async function runTool(
       return { reading: true, handle: found.handle, instruction: "Reply with nothing at all: Driver has hung up, and the phone is reading it." };
     }
     case "dictate": {
+      // Never before the user has spoken in this call. On 8 November a dictation came back to the call with nothing said
+      // (the wake word alone while recording), the voice model handed off at once, and the backend dictated again: twice,
+      // 15 billed seconds each, with the user never asked what they wanted.
+      if (ctx.userSpoke && !ctx.userSpoke()) {
+        return { error: "The user hasn't said anything in this call yet, so nothing is dictated. Ask them, in a few words, what they'd like to do." };
+      }
       // The phone's recording tone is the cue, so the voice model says nothing (8 November: "Go ahead after the tone." and
       // the 2.5 s of quiet after it were most of the 3 s before the tone). Stop while this runs wins: nothing is handed to the phone.
       const generation = deps.waits.generation;
@@ -722,7 +728,9 @@ export async function runTool(
         return { dictating: true, instruction: DICTATING };
       }
       const found = find(String(args.handle ?? ""), deps, ctx.conversationId);
-      if ("error" in found) return found;
+      // 9 November: "I want to dictate a message" reached dictate with a thread made of a misheard word, and Driver asked
+      // which thread, when it may have been a new one.
+      if ("error" in found) return ctx.promptsBack ? { error: `${found.error} If they didn't name one, ask whether it's a reply to a thread or a new thread.` } : found;
       if (!deps.adapter.actions.includes("follow_up")) return { error: "This system can't take replies. Say so." };
       if (deps.waits.generation !== generation) return { error: "The user stopped Driver; nothing will be recorded." };
       about(found);

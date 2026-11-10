@@ -15,6 +15,16 @@ export function typedUser(r: any): string | null {
 const textOf = (r: any): string => Array.isArray(r.message?.content) ? r.message.content.filter((b: any) => b?.type === "text" && typeof b.text === "string").map((b: any) => b.text).join("\n") : "";
 const later = (a: string | null, b: string | null) => !a ? b : !b ? a : a > b ? a : b;
 
+export type Asked = { question: string; options: string[]; multiSelect: boolean };
+/** An AskUserQuestion call's questions and option labels (descriptions and anything else dropped), or null. */
+export function asked(tool: any): Asked[] | null {
+  if (tool?.name !== "AskUserQuestion" || !Array.isArray(tool.input?.questions)) return null;
+  const out = tool.input.questions.flatMap((q: any) => typeof q?.question !== "string" ? [] : [{
+    question: q.question.slice(0, 2000), multiSelect: q.multiSelect === true,
+    options: Array.isArray(q.options) ? q.options.map((o: any) => o?.label).filter((l: unknown): l is string => typeof l === "string").map((l: string) => l.slice(0, 500)) : [] }]);
+  return out.length ? out : null;
+}
+
 /** Keeps only the projection Driver needs. Raw records and tool inputs never survive a parsing step. */
 export class Transcript {
   readonly path: string;
@@ -38,6 +48,13 @@ export class Transcript {
   outcome: ItemStatus = "idle";
   progress: string | null = null;
   tool: { id: string | null; name: string } | null = null;
+  /**
+   * What Claude asks with its AskUserQuestion tool while that's the last tool it called: each question and its options'
+   * labels, the only tool input kept, since it's Claude asking the user something.
+   */
+  asking: Asked[] | null = null;
+  /** When an AskUserQuestion was last answered (Claude Code writes the call and its result only once it is). */
+  answeredAt: string | null = null;
   prompt: string | null = null;
   runId: string | null = null;
   /** The permission mode the session last ran with (a mode switch, or the user's latest message), if it says. */
@@ -104,14 +121,14 @@ export class Transcript {
     if (prompt !== null) {
       this.updatedAt = later(this.updatedAt, at); this.wroteAt = at;
       this.prompt = prompt; this.runId = r.promptId ?? r.uuid ?? null;
-      this.progress = null; this.tool = null; this.outcome = "idle";
+      this.progress = null; this.tool = null; this.asking = null; this.outcome = "idle";
     }
     if (r.type === "assistant") {
       this.updatedAt = later(this.updatedAt, at);
       const text = textOf(r);
       if (text) this.progress = text;
       const tool = Array.isArray(r.message?.content) ? r.message.content.findLast((b: any) => b?.type === "tool_use" && typeof b.name === "string") : null;
-      if (tool) this.tool = { id: typeof tool.id === "string" ? tool.id : null, name: tool.name };
+      if (tool) { this.tool = { id: typeof tool.id === "string" ? tool.id : null, name: tool.name }; this.asking = asked(tool); }
       if (r.isApiErrorMessage || r.is_api_error_message || r.error) this.end("failed", at);
       else if (r.isAbortedMidStream) this.end("cancelled", at);
       else if (["end_turn", "stop_sequence", "refusal"].includes(r.message?.stop_reason)) {
@@ -120,6 +137,9 @@ export class Transcript {
       } else this.outcome = "idle";
     }
     if (r.type === "user" && (r.interruptedMessageId || r.interruptedByShutdown)) this.end("cancelled", at);
+    // A question's (or a plan's) answer, from the terminal or a hook, arrives as its tool result.
+    if (["AskUserQuestion", "ExitPlanMode"].includes(this.tool?.name ?? "") && r.type === "user" && Array.isArray(r.message?.content)
+      && r.message.content.some((b: any) => b?.type === "tool_result" && b.tool_use_id === this.tool?.id)) { this.asking = null; this.answeredAt = later(this.answeredAt, at ?? new Date().toISOString()); }
     if (r.type === "system" && ["turn_duration", "api_error", "stop_hook_summary"].includes(r.subtype)) {
       this.updatedAt = later(this.updatedAt, at);
       if (r.subtype === "api_error") this.end("failed", at);
@@ -132,7 +152,7 @@ export class Transcript {
   }
   private end(status: ItemStatus, at: string | null) {
     this.outcome = status; this.lastRunAt = later(this.lastRunAt, at); this.updatedAt = later(this.updatedAt, at);
-    this.progress = null; this.tool = null;
+    this.progress = null; this.tool = null; this.asking = null;
   }
   replies(): PastReply[] { return [...this.past.values()].sort((a, b) => b.at.localeCompare(a.at)); }
   get reply(): PastReply | null { return this.replies()[0] ?? null; }

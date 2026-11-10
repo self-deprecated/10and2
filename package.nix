@@ -19,19 +19,19 @@ in
     version = (lib.importJSON ./package.json).version;
     src = lib.fileset.toSource {
       root = ./.;
-      fileset = lib.fileset.unions [./src ./build.mjs ./package.json ./package-lock.json];
+      fileset = lib.fileset.unions [./src ./extensions ./build.mjs ./package.json ./package-lock.json];
     };
     postUnpack = ''
       cp -r ${brain} $sourceRoot/brain
       chmod -R u+w $sourceRoot/brain
     '';
     nodejs = nodejs_24;
-    npmDepsHash = "sha256-g+b2KyMgaeptiPaBwezV1ds7sZJeUbzDyiyhWU3Mmk4=";
+    npmDepsHash = "sha256-/8PEQipSLzN/v9952Ue+ApoSRb0H3iqvl2YAX6j/Q/I=";
     # The same bundled files npm publishes (`npm run build`): no TypeScript or node_modules at runtime.
     installPhase = ''
       runHook preInstall
       mkdir -p $out/lib/10and2 $out/bin
-      cp -r dist $out/lib/10and2/
+      cp -r dist extensions $out/lib/10and2/
       makeWrapper ${lib.getExe nodejs_24} $out/bin/10and2 \
         --add-flags --disable-warning=ExperimentalWarning \
         --add-flags $out/lib/10and2/dist/10and2.js

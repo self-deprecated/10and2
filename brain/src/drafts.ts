@@ -46,6 +46,19 @@ export function parseNewThread(itemId: string): NewThread | null {
 }
 
 /**
+ * The same new thread, to start in `placeId` (picked on the phone, in Not sent): its own id kept, so the same pick sent
+ * again is the same target. Null when `target` isn't a new thread's.
+ */
+export function placedTarget(target: string, placeId: string): string | null {
+  const t = parseNewThread(target);
+  if (!t) return null;
+  // Its own id (`n`); the shape from before 8 November has none, so the old target stands in for it.
+  let id: unknown;
+  try { id = JSON.parse(Buffer.from(target.slice(4), "base64url").toString("utf8")).n; } catch {}
+  return newThreadTarget({ placeId, profile: t.profile }, typeof id === "string" && id ? id : target.slice(4, 20));
+}
+
+/**
  * What a new thread is called until the work system has named it: "your new thread in driver". The voice and the
  * receipts say it; T3 Code and Claude Code name the thread from its first prompt.
  */

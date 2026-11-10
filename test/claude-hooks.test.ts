@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { installHooks, uninstallHooks, hooksStatus, relayHook } from "../src/claude/hooks.ts";
 import { harness, until, pause } from "./fixtures/claude/helpers.ts";
 
-test("hooks merge idempotently, back up settings, never add PermissionRequest, remove only their handlers", async (t) => {
+test("hooks merge idempotently, back up settings, add PermissionRequest only for AskUserQuestion, remove only their handlers", async (t) => {
   const h = harness(t), path = join(h.config, "settings.json");
   const original = { theme: "dark", permissions: { defaultMode: "auto" }, hooks: {
     Notification: [{ matcher: "permission_prompt", hooks: [{ type: "command", command: "someone-elses-hook" }] }],
@@ -16,7 +16,10 @@ test("hooks merge idempotently, back up settings, never add PermissionRequest, r
   assert.equal((await hooksStatus(h.config)).installed, true);
   const installed = readFileSync(path, "utf8"), backups = readdirSync(h.config).filter((n) => n.includes("driver-backup"));
   assert.equal(backups.length, 1); assert.deepEqual(JSON.parse(readFileSync(join(h.config, backups[0]!), "utf8")), original);
-  assert.deepEqual(JSON.parse(installed).hooks.PermissionRequest, original.hooks.PermissionRequest);
+  // The user's own PermissionRequest hook stays first and unchanged; 10 & 2's matches only AskUserQuestion.
+  const permission = JSON.parse(installed).hooks.PermissionRequest;
+  assert.deepEqual(permission[0], original.hooks.PermissionRequest[0]);
+  assert.deepEqual(permission.slice(1).map((e: any) => e.matcher), ["AskUserQuestion|ExitPlanMode"]);
   await installHooks(h.config, "driver-connector"); assert.equal(readFileSync(path, "utf8"), installed);
   assert.equal(readdirSync(h.config).filter((n) => n.includes("driver-backup")).length, 1);
   const s = JSON.parse(installed); s.hooks.Stop[0].hooks.push({ type: "command", command: "cohabiting-hook" }); writeFileSync(path, JSON.stringify(s));
@@ -29,7 +32,7 @@ test("hooks merge idempotently, back up settings, never add PermissionRequest, r
 
 test("malformed settings are preserved, and missing settings can be installed", async (t) => {
   const h = harness(t), path = join(h.config, "settings.json");
-  await installHooks(h.config, "'/path with spaces/driver'"); assert.equal((await hooksStatus(h.config)).events.length, 4);
+  await installHooks(h.config, "'/path with spaces/driver'"); assert.equal((await hooksStatus(h.config)).events.length, 5);
   writeFileSync(path, "{broken"); await assert.rejects(installHooks(h.config, "driver")); assert.equal(readFileSync(path, "utf8"), "{broken");
 });
 

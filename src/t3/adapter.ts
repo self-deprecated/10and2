@@ -7,6 +7,7 @@ import { issueSession, revokeSession, CONNECTOR_SCOPES, type Cli, type T3Session
 import { ConnectionError, RpcClient, RpcError } from "./rpc.ts";
 import { execFile } from "node:child_process";
 import { describe } from "../util.ts";
+import { worktreeStart } from "../work.ts";
 
 const M = {
   subscribeShell: "orchestration.subscribeShell",
@@ -44,7 +45,13 @@ export type ShellThread = {
   modelSelection?: unknown;
 };
 /** The root is used only for the local policy: no path leaves the machine through Driver. */
-type Project = { id: string; title: string; defaultModelSelection?: unknown; workspaceRoot?: string };
+type Project = { id: string; title: string; defaultModelSelection?: unknown; workspaceRoot?: string; repositoryIdentity?: { name?: string } | null };
+
+/**
+ * The end of a checkout's path, as a place's `folder` ("mono/nix" of /home/jmo/Development/mono/nix): enough to tell two
+ * projects of one name apart and to say it ("mono nix"), never the whole path. claude/adapter.ts has the same.
+ */
+export const folderOf = (root: string) => root.replace(/[/\\]+$/, "").split(/[/\\]/).filter(Boolean).slice(-2).join("/");
 
 const ACTIVE = new Set(["preparing", "queued", "starting", "running", "waiting"]);
 const FINISHED = new Set(["completed", "interrupted", "failed", "cancelled", "rolled_back"]);
@@ -144,19 +151,6 @@ export function toCommand(action: Action, commandId: string): Record<string, unk
     case "start_work":
       throw new Error("start_work is launched, not dispatched");
   }
-}
-
-/**
- * Where a new worktree of the project in `root` starts, given the policy's `worktreeBase`: null when the folder isn't in
- * a git repository, which has nothing to branch, so the work runs in the folder itself; "HEAD" when the repository has
- * no branch of that name here or from origin (a project whose main branch is named otherwise); else `base`.
- */
-export async function worktreeStart(root: string, base: string): Promise<string | null> {
-  const git = (...args: string[]) => new Promise<boolean>((done) => execFile("git", ["-C", root, ...args], { timeout: 10_000 }, (e) => done(!e)));
-  if (!await git("rev-parse", "--is-inside-work-tree")) return null;
-  if (base === "HEAD") return base;
-  const has = (ref: string) => git("rev-parse", "--verify", "--quiet", `${ref}^{commit}`);
-  return await has(`refs/remotes/origin/${base}`) || await has(`refs/heads/${base}`) ? base : "HEAD";
 }
 
 /**
@@ -360,7 +354,11 @@ export class T3Adapter implements Adapter {
       if (t.archivedAt || t.deletedAt) continue;
       if ((active.get(t.projectId) ?? "") < t.updatedAt) active.set(t.projectId, t.updatedAt);
     }
-    return [...this.projectInfo.values()].filter((p) => this.projectVisible(p.id)).map((p) => ({ id: p.id, name: p.title, activeAt: active.get(p.id) ?? null }));
+    return [...this.projectInfo.values()].filter((p) => this.projectVisible(p.id)).map((p) => ({
+      id: p.id, name: p.title, activeAt: active.get(p.id) ?? null,
+      // Other names the user may say for it, and what tells two of one name apart (brain/src/places.ts).
+      ...(p.workspaceRoot ? { folder: folderOf(p.workspaceRoot) } : {}), ...(p.repositoryIdentity?.name ? { repo: p.repositoryIdentity.name } : {}),
+    }));
   }
 
   /** The model new work in a project runs on: the project's default, else that of its most recently active thread. */
@@ -587,7 +585,7 @@ export class T3Adapter implements Adapter {
 
   private setProject(p: Project) {
     this.projects.set(p.id, p.title);
-    this.projectInfo.set(p.id, { id: p.id, title: p.title, defaultModelSelection: p.defaultModelSelection ?? null, workspaceRoot: p.workspaceRoot });
+    this.projectInfo.set(p.id, { id: p.id, title: p.title, defaultModelSelection: p.defaultModelSelection ?? null, workspaceRoot: p.workspaceRoot, repositoryIdentity: p.repositoryIdentity ?? null });
     if (this.loaded && this.opts.visible) this.emit([...this.threads.values()].filter((t) => t.projectId === p.id).map((t) => t.id), false);
   }
 

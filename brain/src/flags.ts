@@ -15,10 +15,11 @@ const WHAT = String.raw`[\s,]+(?:(?:this|that|it)(?: one| moment| bit| part| con
 /**
  * "Debug.", "debug this", "Driver, debug that: it didn't say the options", "flag this for review" yes; "debug the login
  * thread", "what's the debug flag" no. It must open a sentence of the turn (after any filler): "debug" alone or with
- * this/that/it/for review after it, "flag" and "mark" only with them. "Flag" alone isn't one: on 2 November it was the
- * end of "did you do a debug flag?", split into a turn of its own.
+ * this/that/it/for review after it, "flag" and "mark" only with them, and with nothing more in the sentence: "Mark it
+ * with a star" (answering a thread's question, 4 November) and "flag it as urgent" are about the thread. "Flag" alone
+ * isn't one: on 2 November it was the end of "did you do a debug flag?", split into a turn of its own.
  */
-const FLAG_COMMAND = new RegExp(String.raw`^(?:debug(?:[\s,.!:;-]*$|${WHAT})|(?:flag|mark)${WHAT})`, "i");
+const FLAG_COMMAND = new RegExp(String.raw`^(?:debug(?:[\s,.!:;-]*$|${WHAT})|(?:flag|mark)${WHAT}(?: for review)?[\s,.!:;-]*$)`, "i");
 /**
  * How speech-to-text heard "debug" said on its own, on 2 November: "The bug", "De bug", "D bug". Only as the whole
  * turn: "the bug in the login thread" is about a bug.

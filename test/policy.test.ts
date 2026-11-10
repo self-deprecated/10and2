@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, symlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { allows, parsePolicy, visible, withinCeiling } from "../src/policy.ts";
+import { allows, answers, ceilingFor, parsePolicy, steers, visible, withinCeiling } from "../src/policy.ts";
 
 const base = { brain: "wss://brain.example/connector" };
 
@@ -101,4 +101,32 @@ test("plaintext endpoints use parsed loopback hosts and never accept user-info",
   for (const brain of ["ws://127.0.0.1:80@evil.example/", "ws://localhost@evil.example/", "ws://localhost.evil/", "ws://[::2]/", "wss://user:pass@remote.example/", "ws://localhost:bad/"]) {
     assert.throws(() => parsePolicy(JSON.stringify({ brain })), /brain/);
   }
+});
+
+test("agents: each on or off, or narrowed; the older top-level booleans still read the same", () => {
+  const brain = "wss://b.example/connector";
+  const p = parsePolicy(JSON.stringify({ brain, projects: "*", actions: ["follow_up", "settle", "snooze", "archive", "start_work"], maxRuntimeMode: "full-access",
+    agents: { claude: true, codex: { steer: false, actions: ["follow_up", "settle"], maxRuntimeMode: "auto" }, pi: { answer: false }, opencode: false, t3: false } }));
+  assert.deepEqual([p.t3, p.claude, p.codex, p.opencode, p.pi], [false, true, true, false, true]);
+  assert.equal(steers(p, "claude"), true);
+  assert.equal(steers(p, "codex"), false, "codex can't steer");
+  assert.equal(answers(p, "pi"), false);
+  assert.equal(answers(p, "codex"), true);
+  assert.equal(allows(p, "start_work", "codex"), false, "its own list only narrows");
+  assert.equal(allows(p, "start_work", "claude"), true);
+  assert.equal(allows(p, "unsettle", "codex"), true, "undoing follows doing");
+  assert.equal(ceilingFor(p, "codex"), "auto");
+  assert.equal(ceilingFor(p, "claude"), "full-access");
+  assert.equal(withinCeiling(p, { runtimeMode: "full-access" }, "codex"), false);
+
+  const narrow = parsePolicy(JSON.stringify({ brain, actions: ["settle"], steer: false, agents: { claude: { actions: ["follow_up", "settle"] } } }));
+  assert.equal(allows(narrow, "follow_up", "claude"), false, "an agent never gets more than the machine");
+  assert.equal(steers(narrow, "claude"), false);
+
+  const old = parsePolicy(JSON.stringify({ brain, claude: true, t3: false }));
+  assert.deepEqual([old.t3, old.claude, old.codex, old.steer, old.answer], [false, true, false, true, true]);
+
+  assert.throws(() => parsePolicy(JSON.stringify({ brain, agents: { cursor: true } })), /no agent called "cursor"/);
+  assert.throws(() => parsePolicy(JSON.stringify({ brain, agents: { claude: { steer: "no" } } })), /agents.claude.steer must be true or false/);
+  assert.throws(() => parsePolicy(JSON.stringify({ brain, agents: { t3: false, claude: false } })), /every coding agent is off/);
 });

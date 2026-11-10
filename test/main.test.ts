@@ -32,7 +32,8 @@ test("hooks install, report and uninstall in the Claude Code settings they're po
   assert.equal(settings.theme, "dark");
   assert.ok(JSON.stringify(settings.hooks.Stop).includes("my-own-hook"));
   assert.ok(JSON.stringify(settings.hooks.Stop).includes("10and2 hook"));
-  assert.equal(settings.hooks.PermissionRequest, undefined);
+  // The one PermissionRequest hook is limited to Claude's own questions, and waits rather than running in the background.
+  assert.deepEqual(settings.hooks.PermissionRequest.map((e: any) => [e.matcher, e.hooks[0].async, e.hooks[0].timeout]), [["AskUserQuestion|ExitPlanMode", undefined, 21600]]);
   assert.equal(run("uninstall").status, 0);
   assert.deepEqual(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")), own);
   assert.match(run("status").stdout, /aren't installed/);

@@ -41,7 +41,7 @@ test("live Claude: cold follow-up and deterministic new work have positive accep
   }
   adapter = new ClaudeAdapter({ configDir, db: join(cwd, "overlay.sqlite"), stateDir: join(cwd, "runs"), hookSocketPath: join(cwd, "runs", "hooks.sock"), claudeBin: wrapper,
     log: (message) => t.diagnostic(message), policy: { brain: "wss://unused.invalid/connector", projects: [cwd], claude: true,
-      actions: ["follow_up", "start_work"], maxRuntimeMode: "approval-required", t3: false, worktreeBase: "HEAD" } });
+      actions: ["follow_up", "start_work"], maxRuntimeMode: "approval-required", t3: false, codex: false, opencode: false, pi: false, steer: true, answer: true, limits: {}, worktreeBase: "HEAD" } });
   await adapter.start();
   assert.deepEqual(await adapter.execute({ kind: "follow_up", itemId: initialId, message: "reply with the word B" }, "live-follow"), { ok: true });
   await until(() => !readRegistry(configDir).some((r) => r.sessionId === initialId), 15_000);

@@ -36,7 +36,7 @@ const normal = (word: string) => NUMBERS[word] ?? word;
 /** Every spelling of `phrase`, in normal form, longest first. */
 export function spellings(phrase: string): string[][] {
   const base = tokens(phrase).map((t) => normal(t.word));
-  const extra = base.join(" ") === "10 and 2" ? ["10 2", "1002", "10 02", "10 n 2", "tenant 2"] : [];
+  const extra = base.join(" ") === "10 and 2" ? ["10 2", "102", "1002", "10 02", "10 n 2", "tenant 2"] : [];
   const all = [phrase, ...extra].map((s) => tokens(s).map((t) => normal(t.word))).filter((s) => s.length);
   const unique = [...new Map(all.map((s) => [s.join(" "), s])).values()];
   return unique.sort((a, b) => b.length - a.length);

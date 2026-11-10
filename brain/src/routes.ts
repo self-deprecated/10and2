@@ -20,7 +20,7 @@
 export type Access = "signed_in" | "anonymous" | "pairing" | "connector" | "webhook" | "internal";
 
 /** What an id in a request names, in the account it belongs to. */
-export type IdKind = "thread" | "kept" | "proposal" | "reading" | "conversation" | "draft" | "device" | "run" | "message";
+export type IdKind = "thread" | "kept" | "proposal" | "reading" | "conversation" | "draft" | "device" | "run" | "message" | "place";
 
 /**
  * A field of a request that names something in the caller's account: the path's `:id`, a query parameter, or a body
@@ -64,6 +64,8 @@ const pathId = (kind: IdKind): IdField => ({ in: "path", field: "id", kind });
 /** A reply dictated to one of the caller's threads, heard back and kept: what a draft's ids are read in. */
 const DICTATED = { mode: "reading", heardBack: true, keepReplies: "keep", draft: JSON.stringify({ id: "draft-<fresh>", itemId: "<own:thread>", parts: [{ text: "Ship it tonight." }] }) };
 /** The same, its words said while a reading's first paragraph played (`readingId` and `paragraph`), which it quotes. */
+/** A reply left unsent, back to the call to be kept (`keptDraft`), in place of the kept reply it carried on with. */
+const LEFT_UNSENT = { mode: "reading", keptItemId: "<own:thread>", keptParts: 1, keptDraft: JSON.stringify({ id: "draft-<fresh>", itemId: "<own:thread>", parts: [{ text: "Ship it tonight." }] }) };
 const QUOTING = { ...DICTATED, draft: JSON.stringify({ id: "draft-<fresh>", itemId: "<own:thread>", parts: [{ text: "Ship it tonight.", readingId: "f".repeat(24), paragraph: 0 }] }) };
 /** A snooze's time: tomorrow, as the phone sends it. */
 const TOMORROW = new Date(Date.now() + 86_400_000).toISOString();
@@ -138,6 +140,9 @@ export const ROUTES: Route[] = [
       body("draft.id", "draft", { with: DICTATED }),
       body("draft.itemId", "thread", { with: DICTATED }),
       body("draft.parts.0.readingId", "reading", { with: QUOTING }),
+      body("keptDraft.id", "draft", { with: LEFT_UNSENT }),
+      body("keptDraft.itemId", "thread", { with: LEFT_UNSENT }),
+      body("keptId", "kept", { with: LEFT_UNSENT }),
     ] },
   { method: "POST", path: "/api/session/stop", access: "signed_in", by: "brain", where: "both", body: { cancelWaits: false } },
   { method: "GET", path: "/api/wait", access: "signed_in", by: "brain", where: "both", query: "conversation=c-0123456789&wait=0", ids: [query("conversation", "conversation")] },
@@ -175,12 +180,16 @@ export const ROUTES: Route[] = [
     idempotent: { key: "requestId" },
   },
   {
-    method: "POST", path: "/api/reply", access: "signed_in", by: "brain", where: "both", body: { id: "t-12", text: "Run it tonight.", requestId: REQUEST_ID }, ids: [body("id", "thread"), body("keptId", "kept"), body("messageId", "message", { with: { id: "<own:thread>" }, unused: "the brain quotes `quote`, never looks the message up" })],
+    method: "POST", path: "/api/reply", access: "signed_in", by: "brain", where: "both", body: { id: "t-12", text: "Run it tonight.", requestId: REQUEST_ID }, ids: [body("id", "thread"), body("keptId", "kept"), body("messageId", "message", { with: { id: "<own:thread>" }, unused: "the brain quotes `quote`, never looks the message up" }),
+      // A new thread's prompt with no project (`new:` and {"n":"iso00001"}), started where Not sent's picker says.
+      body("placeId", "place", { with: { id: "new:eyJuIjoiaXNvMDAwMDEifQ", requestId: "<fresh>" } })],
     idempotent: { key: "requestId" },
   },
 
   // Kept replies.
   { method: "GET", path: "/api/kept", access: "signed_in", by: "brain", where: "both" },
+  // Where a new thread can start, as Driver says them: Not sent's project picker.
+  { method: "GET", path: "/api/places", access: "signed_in", by: "brain", where: "both" },
   {
     method: "POST", path: "/api/kept/send", access: "signed_in", by: "brain", where: "both", body: { items: [{ keptId: "K-0123456789", requestId: REQUEST_ID }] }, ids: [body("items.0.keptId", "kept")],
     idempotent: { key: "items[].requestId" },

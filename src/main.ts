@@ -14,30 +14,41 @@ import { Local } from "./local.ts";
 import { Expired, linkUrl, originOf, pair } from "./pair.ts";
 import { configDirectory, hookSocket, stateDirectory } from "./paths.ts";
 import { addMachine, brainDb, brainEnvPath, brainOrigin, brainPort, DEFAULT_PORT, machines, readBrainEnv, removeMachine, validName, writeBrainEnv } from "./brain.ts";
-import { defaultPolicyPath, loadPolicy, parsePolicy, validBase, visible } from "./policy.ts";
-import { ACTIONS, VERSION } from "./protocol.ts";
+import { AGENTS, type Agent, defaultPolicyPath, loadPolicy, parsePolicy, validBase, visible } from "./policy.ts";
+import { describeFound, detect, NAMES, ORDER, type Found } from "./agents.ts";
+import { applyChoice, applyFlags, capsFor, CAP_SHORT, CEILING_LABEL, chooseInteractively, choiceOf, startingChoice, summary, type Choice } from "./choose.ts";
+import { VERSION } from "./protocol.ts";
 import { BRAIN, Service } from "./service.ts";
 import { T3Adapter } from "./t3/adapter.ts";
 import { ClaudeAdapter, hooksStatus, installHooks, relayHook, uninstallHooks } from "./claude/index.ts";
+import { CodexAdapter, defaultCodexHome } from "./codex/adapter.ts";
+import { PiAdapter } from "./pi/adapter.ts";
+import { installPiExtension, piAgentDir, piExtensionStatus, uninstallPiExtension } from "./pi/extension.ts";
+import { runPiTurn } from "./pi/turn.ts";
+import { installOpenCodePlugin, OpenCodeAdapter, openCodePluginStatus, uninstallOpenCodePlugin } from "./opencode/index.ts";
 import { describe } from "./util.ts";
 import { accent, ago, ask, bad, bold, Cancelled, cmd, confirm, dim, keys, note, ok, say, secret, spinner, warn } from "./ui.ts";
 
 const DEFAULT_ORIGIN = "https://10and2.selfdep.com";
 /** Someone running their own brain needs to know which key to make (Jordan, 5 Nov: the CLI may say OpenAI). */
 const OWN_KEY = "your OpenAI key"; // provider-name-ok: see above
-const usage = () => `${bold("10and2")} ${VERSION} ${dim("·")} connects this computer's coding agents (T3 Code, Claude Code) to 10 & 2
+const usage = () => `${bold("10and2")} ${VERSION} ${dim("·")} connects this computer's coding agents (Claude Code, Codex, Pi, OpenCode, T3 Code) to 10 & 2
 
   ${cmd("10and2 setup")}     connect this computer (opens your browser to approve it)
   ${cmd("10and2 status")}    whether it's connected, and what Driver can see and do here
+  ${cmd("10and2 agents")}    choose which coding agents to connect, and what Driver may do
   ${cmd("10and2 revoke")}    disconnect this computer
 
 More
   ${cmd("10and2 autostart on|off|status")}     start at login
-  ${cmd("10and2 hooks install|uninstall|status")}  Claude Code sessions update instantly
+  ${cmd("10and2 hooks install|uninstall|status")}  Driver answers Claude Code's questions; updates are instant
+  ${cmd("10and2 pi install|uninstall|status")}     Driver reaches the Pi sessions you have open
+  ${cmd("10and2 opencode install|uninstall|status")}  Driver reaches the OpenCode sessions you have open
   ${cmd("10and2 run")}                         run in this terminal instead of at login
   ${cmd("10and2 token")}                       a token, for a brain you configure by hand
 
 Setup options: --name=<what Driver calls it>  --worktree-base=<branch, or HEAD>  --yes  --no-autostart  --brain=<url>  --token (a brain of your own)
+Choosing without a terminal: --agents=claude,pi  --off=codex  --read-only  --no-steer  --no-answer  --no-start  --no-tidy  (--no-steer=codex: that agent only)
 Settings: ${defaultPolicyPath()}
 
 Your own brain ${dim(`(instead of your 10 & 2 account: ${OWN_KEY}, your computer)`)}
@@ -66,15 +77,55 @@ const account = (origin: string, secret?: string) => !paired(secret) ? `your bra
 // `--help` or `-h` anywhere only prints the help: `10and2 setup --help` must never start a pairing.
 const wantsHelp = command !== "hook" && (flags.has("help") || argv.includes("-h"));
 
+/** The flags that choose agents and permissions without a terminal (choose.ts `applyFlags`). */
+const CHOOSING = ["agents", "off", "no-steer", "no-answer", "no-start", "no-follow-up", "no-tidy", "read-only"];
+/** What each command takes after its name: at most how many words, and which flags. */
+const TAKES: Record<string, { words: number; flags: string[] }> = {
+  setup: { words: 0, flags: ["brain", "token", "name", "worktree-base", "yes", "no-autostart", ...CHOOSING] },
+  agents: { words: 0, flags: ["yes", "worktree-base", ...CHOOSING] },
+  run: { words: 0, flags: ["wait-for-credential", "fatal-exit"] },
+  status: { words: 0, flags: ["verbose"] },
+  revoke: { words: 0, flags: ["yes"] },
+  autostart: { words: 1, flags: [] },
+  hooks: { words: 1, flags: [] },
+  pi: { words: 1, flags: [] },
+  opencode: { words: 1, flags: [] },
+  "pi-turn": { words: 0, flags: [] },
+  brain: { words: 3, flags: ["port", "code", "name", "yes", "no-autostart", ...CHOOSING] },
+  token: { words: 0, flags: [] },
+};
+
+/**
+ * An argument the command wouldn't read, said before it does anything: `10and2 setup 10and2-stg.selfdep.com` once
+ * paired with the default address, the word ignored. `hook` is Claude Code's and stays silent.
+ */
+function unread(): string | null {
+  const takes = TAKES[command ?? ""];
+  if (!takes || wantsHelp) return null;
+  const word = positional[1 + takes.words];
+  if (word !== undefined) {
+    if (command === "setup") return `${cmd("10and2 setup")} doesn't take "${word}". To connect to 10 & 2 at another address: ${cmd(`10and2 setup --brain=${word}`)}`;
+    return `${cmd(`10and2 ${command}`)} doesn't take "${word}". ${cmd("10and2 help")} lists what each command takes.`;
+  }
+  const flag = [...flags.keys()].find((f) => !takes.flags.includes(f));
+  return flag === undefined ? null : `${cmd(`10and2 ${command}`)} has no ${cmd(`--${flag}`)}. ${cmd("10and2 help")} lists what each command takes.`;
+}
+
 try {
+  const refused = unread();
+  if (refused) { fail(`✗ ${refused}`, 64); process.exit(); }
   switch (wantsHelp ? "help" : command) {
     case "setup": await setup(); break;
+    case "agents": await agentsCommand(); break;
     case "run": await runConnector(); break;
     case "status": await status(); break;
     case "revoke": await revoke(); break;
     case "autostart": await autostart(); break;
     case "hook": await relayHook(process.stdin, hookSocket()); break; // Claude Code runs this; it must stay silent
     case "hooks": await hooks(); break;
+    case "pi": piCommand(); break;
+    case "opencode": await openCodeCommand(); break;
+    case "pi-turn": process.exitCode = await runPiTurn(); break; // the connector runs this; it must stay silent
     case "brain": await brain(); break;
     case "token": {
       const token = randomBytes(32).toString("base64url");
@@ -129,7 +180,8 @@ async function setup() {
   }
 
   say(`${bold("10 & 2")} ${dim("·")} connect this computer\n`);
-  const policy = await policyFor(origin, existing, await agents("10and2 setup"));
+  const { found, choice } = await chooseAgents("10and2 setup", existing);
+  const policy = await policyFor(origin, existing, choice);
   const name = await machineName();
   if (byToken && !validName(name)) throw new Error(`Your brain can't call it "${name}": start with a letter or digit (${cmd("--name=")}).`);
   say();
@@ -141,26 +193,32 @@ async function setup() {
     say(`\n  On your brain's computer, run this so it accepts this one:`);
     say(`    ${cmd(`10and2 brain add ${name} ${sha256(credential)}`)}\n`);
   } else ok(`Approved ${dim(`· its key is in ${store === "file" ? "a file only you can read" : where(store)}`)}`);
+  await offerHelpers(choice);
 
   const started = await startAtLogin(new Service(), "Keep it connected, starting at login?");
   // A brain of your own accepts this computer only once it's been added there.
   if (started && !byToken) await connected(origin, credential);
   else if (!started) note(`To connect: ${cmd("10and2 run")} in a terminal you keep open, or ${cmd("10and2 autostart on")}.`);
   else note(`It connects once your brain accepts it; ${cmd("10and2 status")} says when.`);
-  canDo(policy);
+  canDo(policy, choice, found);
   if (started && !byToken) say(`\n  ${bold("Next:")} open 10 & 2 on your phone and tap Start.`);
 }
 
-/** Which coding agents are here; refuses when there are none, since there'd be nothing to connect. */
-async function agents(again: string) {
-  const [t3, claudeCli] = await Promise.all([installed(process.env.T3_CLI ?? "t3"), installed("claude")]);
-  const claude = claudeCli || existsSync(join(claudeDir(), "projects"));
-  if (!t3 && !claude) {
-    throw new Error(`Neither T3 Code nor Claude Code is on this computer (no ${cmd("t3")} or ${cmd("claude")} on your PATH), so there's nothing to connect. Install one, then run ${cmd(again)} again.`);
+/**
+ * Which coding agents are here, which of them to connect, and what Driver may do with them: the two screens at a
+ * terminal (docs/launch/mockups/connector-setup), else everything found and allowed, narrowed by flags. Refuses when no
+ * agent is found or every one is switched off, since there'd be nothing to connect.
+ */
+async function chooseAgents(again: string, existing: any | null): Promise<{ found: Found[]; choice: Choice }> {
+  const found = await detect();
+  if (!found.some((f) => f.installed)) {
+    throw new Error(`No coding agent Driver works with is on this computer (Claude Code, Codex, Pi, OpenCode or T3 Code), so there's nothing to connect. Install one, then run ${cmd(again)} again.`);
   }
-  (t3 ? ok : note)(t3 ? "T3 Code" : dim("T3 Code not found"));
-  (claude ? ok : note)(claude ? "Claude Code" : dim("Claude Code not found"));
-  return { t3, claude };
+  let choice = applyFlags(startingChoice(existing, found), flags);
+  if (!flags.has("yes") && process.stdin.isTTY && process.stdout.isTTY) choice = await chooseInteractively(found, choice);
+  else for (const f of found) (f.installed && choice.on[f.agent] ? ok : note)(f.installed && choice.on[f.agent] ? `${f.name} ${dim(`· ${describeFound(f)}`)}` : dim(`${f.name} ${f.installed ? "· off" : "not found"}`));
+  if (!AGENTS.some((a) => choice.on[a])) throw new Error(`Every coding agent is switched off, so there's nothing to connect. Run ${cmd(again)} again and switch one on.`);
+  return { found, choice };
 }
 
 /**
@@ -168,11 +226,9 @@ async function agents(again: string) {
  * readback and "yes" allow, which is what setup promised. Either way, with T3 Code, where its new worktrees start is
  * asked when the policy doesn't say. Written once the computer is approved.
  */
-async function policyFor(origin: string, existing: any, found: { t3: boolean; claude: boolean }) {
-  const policy = existing ? { ...existing, brain: linkUrl(origin) } : {
-    brain: linkUrl(origin), projects: "*", actions: [...ACTIONS], maxRuntimeMode: "full-access", ...found,
-  };
-  if (policy.t3 !== false && policy.worktreeBase === undefined) policy.worktreeBase = await worktreeBase();
+async function policyFor(origin: string, existing: any, choice: Choice) {
+  const policy: any = applyChoice(existing ? { ...existing, brain: linkUrl(origin) } : { brain: linkUrl(origin), projects: "*" }, choice);
+  if (choice.on.t3 && policy.worktreeBase === undefined) policy.worktreeBase = await worktreeBase();
   parsePolicy(JSON.stringify(policy));
   return policy;
 }
@@ -205,12 +261,63 @@ async function startAtLogin(service: Service, question: string) {
   return s.running;
 }
 
-function canDo(policy: any) {
+function canDo(policy: any, choice: Choice, found: Found[]) {
   say();
-  say(`  Driver can see ${seesText(policy)}, and can ${mayText(policy)}: each only after you hear it read back and say yes.`);
-  if (policy.t3 !== false && (policy.actions ?? []).includes("start_work")) say(`  New T3 Code worktrees start from ${baseText(policy.worktreeBase ?? "HEAD")}.`);
-  say(`  ${dim(`To change that, edit ${defaultPolicyPath()}, then ${cmd("10and2 autostart on")}.`)}`);
-  if (policy.claude) say(`  ${dim(`For Claude Code sessions to update instantly: ${cmd("10and2 hooks install")}.`)}`);
+  for (const line of summary(choice, found)) say(`  ${line}`);
+  if (policy.projects !== "*") say(`  It sees ${seesText(policy)}.`);
+  if (choice.on.t3 && choice.caps.start_work) say(`  New T3 Code worktrees start from ${baseText(policy.worktreeBase ?? "HEAD")}.`);
+  if (choice.caps.steer && AGENTS.some((a) => choice.on[a] && a !== "t3")) say(`  ${dim("Messages reach a session open in a terminal between its steps, or as its next turn.")}`);
+  say(`  ${dim(`${cmd("10and2 agents")} changes this.`)}`);
+}
+
+/**
+ * `10and2 agents`: the same two screens as setup, on this computer's settings, without pairing again; saved, and the
+ * connector restarted if it runs at login so the change applies at once.
+ */
+async function agentsCommand() {
+  const raw = readPolicyFile();
+  if (!raw) throw new Error(`This computer isn't set up yet: ${cmd("10and2 setup")} connects it.`);
+  const { found, choice } = await chooseAgents("10and2 agents", raw);
+  const next: any = applyChoice(raw, choice);
+  if (choice.on.t3 && next.worktreeBase === undefined) next.worktreeBase = await worktreeBase();
+  parsePolicy(JSON.stringify(next));
+  writePrivate(defaultPolicyPath(), JSON.stringify(next, null, 2) + "\n");
+  ok(`Saved ${dim(`· ${defaultPolicyPath()}`)}`);
+  await offerHelpers(choice);
+  say();
+  for (const line of summary(choice, found)) say(`  ${line}`);
+  const service = new Service();
+  if (service.supported && (await service.state()).running) { await service.restart(); ok("The connector restarted with it"); }
+  else note(dim(`It applies when the connector next starts (${cmd("10and2 run")}, or ${cmd("10and2 autostart on")}).`));
+}
+
+/**
+ * What each connected agent needs for Driver to answer its questions and reach its open sessions (Claude Code's hooks,
+ * the Pi extension), asked for once. Each edits the agent's own settings, so it's only added here, when asked, or by
+ * its own command; off a terminal, or with --yes, they're added.
+ */
+async function offerHelpers(choice: Choice) {
+  const wants = (a: Agent) => choice.on[a] && choice.caps.follow_up && !(choice.off[a] ?? []).includes("follow_up");
+  const helpers: { name: string; add: () => Promise<void>; undo: string }[] = [];
+  if (wants("claude") && !(await hooksStatus(claudeDir()).catch(() => null))?.installed) {
+    helpers.push({ name: "Claude Code hooks", undo: "10and2 hooks uninstall", add: () => installHooks(claudeDir(), process.env.TENANDTWO_COMMAND || "10and2") });
+  }
+  if (wants("pi") && piExtensionStatus(piAgentDir()).state !== "installed") {
+    helpers.push({ name: "Pi extension", undo: "10and2 pi uninstall", add: async () => { installPiExtension(piAgentDir()); } });
+  }
+  if (wants("opencode") && !(await openCodePluginStatus().catch(() => null))?.current) {
+    helpers.push({ name: "OpenCode plugin", undo: "10and2 opencode uninstall", add: async () => { await installOpenCodePlugin(); } });
+  }
+  if (!helpers.length) return;
+  const names = helpers.map((h) => h.name).join(" and ");
+  if (!flags.has("yes") && !await confirm(`Let Driver answer questions and reach open sessions? It adds the ${names}`, true)) {
+    note(dim(`Not added. ${helpers.map((h) => cmd(h.undo.replace("uninstall", "install"))).join(" and ")} adds ${helpers.length > 1 ? "them" : "it"} later.`));
+    return;
+  }
+  for (const h of helpers) {
+    try { await h.add(); ok(`${h.name} added ${dim(`· ${cmd(h.undo)} removes ${h.name.endsWith("s") ? "them" : "it"}`)}`); }
+    catch (e) { warn(`Couldn't add the ${h.name} (${describe(e)}). ${cmd(h.undo.replace("uninstall", "install"))} tries again.`); }
+  }
 }
 
 function sha256(s: string) { return createHash("sha256").update(s).digest("hex"); }
@@ -274,14 +381,10 @@ function plural(n: number, one: string) { return `${n.toLocaleString("en-US")} $
 function sizeText(st: { threads: number; projects: number }) { return `${plural(st.threads, "thread")} in ${plural(st.projects, "project")}`; }
 function words(list: string[]) { return list.length < 2 ? list.join("") : `${list.slice(0, -1).join(", ")} and ${list.at(-1)}`; }
 function seesText(p: any) {
-  const where = words([p.t3 !== false && "T3 Code", p.claude && "Claude Code"].filter(Boolean) as string[]);
+  const on = choiceOf(p).on;
+  const where = words(ORDER.filter((a) => on[a]).map((a) => NAMES[a]));
   const what = p.projects === "*" ? "every project" : Array.isArray(p.projects) && p.projects.length ? `only ${words(p.projects)}` : "no projects";
   return `${what} in ${where}`;
-}
-function mayText(p: any) {
-  const order = ["follow_up", "start_work", "settle", "snooze", "archive"];
-  const acts = order.filter((a) => (p.actions ?? []).includes(a)).map((a) => a.replace("_", " "));
-  return acts.length ? words(acts) : "only listen in (no changes)";
 }
 
 function launch() {
@@ -330,7 +433,20 @@ async function runConnector() {
   const claude = policy.claude
     ? new ClaudeAdapter({ policy, configDir: claudeDir(), db: join(stateDirectory(), "claude.db"), stateDir: join(stateDirectory(), "claude"), hookSocketPath: hookSocket(), log })
     : null;
-  const adapter = new Local([...(t3 ? [{ prefix: "", adapter: t3, retrySafe: true }] : []), ...(claude ? [{ prefix: "claude", adapter: claude }] : [])], policy);
+  // A copy of 10and2's Pi extension from an older 10and2 is brought up to this one's: Pi loads it in each Pi started after.
+  if (policy.pi) { try { if (piExtensionStatus(piAgentDir()).state === "outdated") { installPiExtension(piAgentDir()); log("pi: updated 10and2's Pi extension"); } } catch (e) { log(`pi: ${describe(e)}`); } }
+  if (policy.opencode) { try { const s = await openCodePluginStatus(); if (s.installed && !s.current) { await installOpenCodePlugin(); log("opencode: updated 10and2's OpenCode plugin"); } } catch (e) { log(`opencode: ${describe(e)}`); } }
+  // Codex doesn't dedupe a message it's sent twice, so a lost outcome is never sent again.
+  const codex = policy.codex ? new CodexAdapter({ policy, codexHome: defaultCodexHome(), db: join(stateDirectory(), "codex.db"), stateDir: join(stateDirectory(), "codex"), log }) : null;
+  const opencode = policy.opencode ? new OpenCodeAdapter({ policy, db: join(stateDirectory(), "opencode.db"), stateDir: join(stateDirectory(), "opencode"), log }) : null;
+  const pi = policy.pi ? new PiAdapter({ policy, agentDir: piAgentDir(), db: join(stateDirectory(), "pi.db"), stateDir: join(stateDirectory(), "pi"), log }) : null;
+  const adapter = new Local([
+    ...(t3 ? [{ prefix: "", adapter: t3, retrySafe: true }] : []),
+    ...(claude ? [{ prefix: "claude", adapter: claude }] : []),
+    ...(codex ? [{ prefix: "codex", adapter: codex }] : []),
+    ...(pi ? [{ prefix: "pi", adapter: pi }] : []),
+    ...(opencode ? [{ prefix: "opencode", adapter: opencode }] : []),
+  ], policy);
   link = new Link({
     url: policy.brain, token, adapter, ledger, log,
     onFatal: () => { record({ error: "this computer was disconnected (revoked on the website, or set up again elsewhere)", fatal: true }); stop(fatalExit); },
@@ -341,6 +457,9 @@ async function runConnector() {
   log(`connector ${VERSION}: linking to ${origin}`);
   void t3?.start().catch((e) => { log(`t3: ${describe(e)}; not restarting`); record({ error: `T3 Code: ${describe(e)}` }); stop(fatalExit); });
   void claude?.start().then(() => log("claude: reading sessions"), (e) => log(`claude: ${describe(e)}`));
+  void codex?.start().then(() => log("codex: reading sessions"), (e) => log(`codex: ${describe(e)}`));
+  void opencode?.start().then(() => log("opencode: reading sessions"), (e) => log(`opencode: ${describe(e)}`));
+  void pi?.start().then(() => log("pi: reading sessions"), (e) => log(`pi: ${describe(e)}`));
   let stopping = false;
   const shutdown = async () => {
     if (stopping) return;
@@ -379,14 +498,20 @@ async function status() {
   }
   say();
   note(`Sees   ${seesText(policy)}`);
-  note(`Can    ${mayText(policy)}, after your spoken yes`);
+  // Each agent, and what Driver may do with it after the spoken yes (choose.ts).
+  const choice = choiceOf(readPolicyFile());
+  for (const a of ORDER) {
+    if (!choice.on[a] && readPolicyFile()?.agents?.[a] === undefined) continue;
+    const caps = capsFor(choice, a).map((c) => CAP_SHORT[c]).join(" · ") || "read only";
+    note(`${NAMES[a].padEnd(12)} ${choice.on[a] ? `on    ${caps}` : dim("off")}`);
+  }
   if (policy.actions.includes("start_work")) {
-    note(`       New work runs with at most ${policy.maxRuntimeMode}`);
-    if (policy.t3) note(`       New T3 Code worktrees start from ${baseText(policy.worktreeBase)}`);
+    note(`New work runs with at most ${CEILING_LABEL[policy.maxRuntimeMode]}`);
+    if (policy.t3) note(`New T3 Code worktrees start from ${baseText(policy.worktreeBase)}`);
   }
   if (policy.claude) {
     const h = await hooksStatus(claudeDir()).catch(() => null);
-    if (!h?.installed) note(dim(`Claude Code updates within seconds; ${cmd("10and2 hooks install")} makes it instant`));
+    if (!h?.installed) note(dim(`${cmd("10and2 hooks install")} lets Driver answer Claude Code's questions, and makes updates instant`));
     const db = join(stateDirectory(), "claude.db");
     if (existsSync(db)) {
       const conn = new DatabaseSync(db, { readOnly: true });
@@ -442,14 +567,38 @@ async function autostart() {
 }
 
 async function hooks() {
-  // Hooks edit the user's own Claude Code settings, so they're only ever installed or removed when asked. The command is
-  // found on PATH, so an upgrade doesn't leave hooks pointing at an old copy.
+  // Hooks edit the user's own Claude Code settings, so they're only ever installed or removed when asked (here, or by
+  // setup's question). The command is found on PATH, so an upgrade doesn't leave hooks pointing at an old copy.
   const hookCommand = process.env.TENANDTWO_COMMAND || "10and2";
   if (sub === "install") await installHooks(claudeDir(), hookCommand);
   else if (sub === "uninstall") await uninstallHooks(claudeDir());
   else if (sub !== "status") throw new Error(`${cmd("10and2 hooks")} takes install, uninstall or status.`);
   const s = await hooksStatus(claudeDir());
   say(s.installed ? `10and2's Claude Code hooks are installed in ${claudeDir()}.` : s.events.length ? `Some of 10and2's Claude Code hooks are installed: ${s.events.join(", ")}.` : `10and2's Claude Code hooks aren't installed in ${claudeDir()}.`);
+}
+
+/** `10and2 pi …`: 10and2's extension in Pi's own extensions folder, asked for here or by setup's question. */
+function piCommand() {
+  const dir = piAgentDir();
+  const s = sub === "install" ? installPiExtension(dir) : sub === "uninstall" ? uninstallPiExtension(dir) : sub === "status" ? piExtensionStatus(dir) : null;
+  if (!s) throw new Error(`${cmd("10and2 pi")} takes install, uninstall or status.`);
+  say({
+    installed: `10and2's Pi extension is installed (${s.path}). Pi sessions started from now on can be reached; one already open needs restarting.`,
+    outdated: `An older copy of 10and2's Pi extension is installed (${s.path}). ${cmd("10and2 pi install")} updates it.`,
+    missing: `10and2's Pi extension isn't installed${sub === "uninstall" ? " anymore" : ""}. ${cmd("10and2 pi install")} adds it.`,
+    foreign: `${s.path} is another extension, not 10and2's, so it's left as it is.`,
+  }[s.state]);
+}
+
+/** `10and2 opencode …`: 10and2's plugin in OpenCode's own plugins folder, asked for here or by setup's question. */
+async function openCodeCommand() {
+  if (sub === "install") await installOpenCodePlugin();
+  else if (sub === "uninstall") await uninstallOpenCodePlugin();
+  else if (sub !== "status") throw new Error(`${cmd("10and2 opencode")} takes install, uninstall or status.`);
+  const s = await openCodePluginStatus();
+  say(!s.installed ? `10and2's OpenCode plugin isn't installed${sub === "uninstall" ? " anymore" : ""}. ${cmd("10and2 opencode install")} adds it.`
+    : !s.current ? `An older copy of 10and2's OpenCode plugin is installed (${s.path}). ${cmd("10and2 opencode install")} updates it.`
+    : `10and2's OpenCode plugin is installed (${s.path}). OpenCode started from now on can be reached; one already open needs restarting.`);
 }
 
 /** `10and2 brain …`: a brain of your own on this computer, instead of your 10 & 2 account's. */
@@ -513,7 +662,7 @@ async function brainSetup(service: Service, path: string) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`${cmd("--port")} is a port number, like ${DEFAULT_PORT}.`);
 
   say(`${bold("10 & 2")} ${dim("·")} your own brain, on this computer\n`);
-  const found = await agents("10and2 brain setup");
+  const { found, choice } = await chooseAgents("10and2 brain setup", existing);
   // From the environment when it's there (a script, or pasted where nobody sees it), else asked for without showing it.
   const key = process.env.OPENAI_API_KEY || await secret(`Your OpenAI API key ${dim("(from platform.openai.com; it stays on this computer)")}`); // provider-name-ok: which key to make (Jordan, 5 Nov)
   if (!key) throw new Error("Your brain needs your OpenAI API key, to talk and to read your threads. Run this again in a terminal, or with the key in OPENAI_API_KEY.");
@@ -521,7 +670,7 @@ async function brainSetup(service: Service, path: string) {
   say();
 
   const origin = `http://127.0.0.1:${port}`;
-  const policy = await policyFor(origin, existing, found);
+  const policy = await policyFor(origin, existing, choice);
   // This computer's own connector, linked to it over loopback with a token only the two of them know.
   const token = randomBytes(32).toString("base64url");
   const vars = addMachine({
@@ -542,7 +691,7 @@ async function brainSetup(service: Service, path: string) {
     if (s.running) await connected(origin, token);
     else warn(`This computer's connection is installed at ${s.where}, but isn't running: see ${s.logs}`);
   } else note(`To run it: ${cmd("10and2 brain run")} and ${cmd("10and2 run")}, each in a terminal you keep open; or ${cmd("10and2 brain autostart on")} and ${cmd("10and2 autostart on")}.`);
-  canDo(policy);
+  canDo(policy, choice, found);
   await phone(vars);
 }
 

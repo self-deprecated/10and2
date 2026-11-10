@@ -81,6 +81,9 @@ export function summaryHeard(c: Pick<Card, "reply" | "contentKey">, briefed: Bri
 /** Top-level items worth briefing: not settled, not snoozed. */
 export const briefable = (i: WorkItem) => i.parentId === null && !i.settled && !i.snoozedUntil;
 
+/** How long a thread Driver started stands in for itself while the work system's list doesn't have it. */
+const PROVISIONAL_MS = 10 * 60_000;
+
 export function clutterOf(items: WorkItem[]): ClutterGroup[] {
   const byId = new Map(items.map((i) => [i.id, i]));
   const root = (i: WorkItem) => {
@@ -153,11 +156,29 @@ export class Briefing {
   }
 
   /**
-   * A thread Driver just started: list the items again at once, so it can be named straight away, and brief it as soon
-   * as it can be (a refresh under way finishes first).
+   * Threads Driver started that the work system's list doesn't have yet: a connector lists its machine's last snapshot
+   * (connector-client.ts), so on 8 November "let me know when that one replies", 14 s after a start, found no thread
+   * by its name three times. Each stands in, by its id, until the list has it or `PROVISIONAL_MS` pass; it isn't briefed.
    */
-  async added(id: string): Promise<void> {
-    this.items = await this.deps.adapter.list();
+  private readonly provisional = new Map<string, WorkItem>();
+
+  /** The list as the briefing keeps it: what the work system says, plus the stand-ins for what it doesn't list yet. */
+  private listed(items: WorkItem[], now = Date.now()): WorkItem[] {
+    for (const [id, p] of this.provisional) if (items.some((i) => i.id === id) || now - Date.parse(p.updatedAt) > PROVISIONAL_MS) this.provisional.delete(id);
+    return this.provisional.size ? [...items, ...this.provisional.values()] : items;
+  }
+
+  /**
+   * A thread Driver just started: list the items again at once, so it can be named straight away, and brief it as soon
+   * as it can be (a refresh under way finishes first). `started`: what Driver called it and where, to stand in until
+   * the list has it.
+   */
+  async added(id: string, started?: { title: string; group: string }): Promise<void> {
+    const items = await this.deps.adapter.list();
+    if (started && !items.some((i) => i.id === id)) {
+      this.provisional.set(id, { id, title: started.title, group: started.group, status: "running", updatedAt: new Date().toISOString(), settled: false, snoozedUntil: null, parentId: null, pendingQuestion: false });
+    }
+    this.items = this.listed(items);
     this.onChange([id], true);
   }
 
@@ -181,8 +202,8 @@ export class Briefing {
   private async doRefresh(ids?: string[]) {
     const { adapter, store, classify, log } = this.deps;
     const now = new Date();
-    this.items = await adapter.list();
-    const visible = this.items.filter(briefable);
+    this.items = this.listed(await adapter.list());
+    const visible = this.items.filter((i) => briefable(i) && !this.provisional.has(i.id));
     const visibleIds = new Set(visible.map((i) => i.id));
     const cards = new Map(store.cards().map((c) => [c.itemId, c]));
     let changed = false;

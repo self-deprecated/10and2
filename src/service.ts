@@ -40,6 +40,9 @@ Restart=on-failure
 RestartSec=5
 # 78: revoked, replaced by another copy, or a brain this version can't talk to. Restarting wouldn't help.
 RestartPreventExitStatus=78
+# Only the connector itself stops with the service: Claude Code runs it started (a background session, Claude's
+# supervisor) carry on through a restart or an update.
+KillMode=process
 UMask=0077
 
 [Install]
@@ -63,6 +66,7 @@ ${[l.node, l.script, ...job.launchdArgs].map((a) => `    <string>${xml(a)}</stri
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
+  <key>AbandonProcessGroup</key><true/>
   <key>Umask</key><integer>63</integer>
   <key>StandardOutPath</key><string>${xml(logs)}</string>
   <key>StandardErrorPath</key><string>${xml(logs)}</string>

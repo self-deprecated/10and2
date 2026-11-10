@@ -26,12 +26,13 @@ import { ROLL_LATE } from "./voice/endPolicy.ts";
 import type { Hangups } from "./voice/hangups.ts";
 import type { Recordings } from "./voice/recording.ts";
 import type { Flags } from "./flags.ts";
-import { buildSessionConfig, VoiceSession, type Conversations, type Opening, type ReadOut } from "./voice/session.ts";
+import { buildSessionConfig, VoiceSession, type Conversations, type KeptDraft, type Opening, type ReadOut } from "./voice/session.ts";
 import { CallView, type CallRecord } from "./voice/callview.ts";
 import { describe, spokenHost } from "./util.ts";
+import { spokenPlaces } from "./places.ts";
 import type { ConsentHolder, Props } from "./analytics.ts";
 import { recentDrives, summarize, summaryText } from "./drives.ts";
-import { assemble, dictatedParts, DRAFT_MAX, draftStateOf, isNewThread, mentionedPlaces, newThreadName, parseDraft, parseNewThread, tappedReply, tappedWords, wordCount, type Draft, type NewThread } from "./drafts.ts";
+import { assemble, dictatedParts, DRAFT_MAX, draftStateOf, isNewThread, mentionedPlaces, newThreadName, parseDraft, parseNewThread, placedTarget, tappedReply, tappedWords, wordCount, type Draft, type NewThread } from "./drafts.ts";
 import { confirmOf, parseUntil, READBACK_ALL, tapVia, trackChange, type ConfirmLevels, type KeepReplies, type TapAction } from "./proposals.ts";
 import { SHOWN, timeline, timelineQuery } from "./timeline.ts";
 import { merge, ownOf, parseOwn, STORE_KEY as VOCABULARY_KEY } from "./vocabulary.ts";
@@ -442,15 +443,41 @@ function api(cfg: Config, deps: ServerDeps): Api {
       read.push({ handle: names.get(r.itemId) ?? "that thread", heard, parts, of: r.segments, text: reply?.text ?? "", itemId: r.itemId, ...(reply ? { at: reply.at } : {}) });
       if (heard === "all" && reply) marks.push(() => deps.store.markSeen(r.itemId, { runAt: Date.parse(reply.at), question: null }, conversationId));
     }
-    // A reply the user left unsent to come back: which thread (its name is ours, never the phone's), and how far along.
+    // A reply the user left unsent to come back: kept here when its words came (`keepLeftUnsent`), else which thread
+    // (its name is ours, never the phone's) and how far along, still only on the phone.
     const keptParts = Math.floor(Number(body.keptParts));
-    const kept = typeof body.keptItemId === "string" && keptParts > 0
+    const kept = keepLeftUnsent(conversationId, body) ?? (typeof body.keptItemId === "string" && keptParts > 0
       ? { handle: names.get(body.keptItemId) ?? "a thread", parts: Math.min(keptParts, 99) }
-      : undefined;
+      : undefined);
     return {
       open: { kind: "reading", read, said: typeof body.said === "string" ? body.said.slice(0, 500) : "", news: base.kind === "callback" ? base.replies : [], kept, ...heldOf(body) },
       heard: () => marks.forEach((m) => m()),
     };
+  }
+
+  /**
+   * A reply the user was dictating or writing and came back to the call without sending (`keptDraft`, the phone's
+   * draft as `parseDraft` reads it): kept for later at once, as a new thread's prompt is (`newThreadOpening`), so it's
+   * in Not sent and the backend can send it by its kept id. 9 November: only its thread came back, so "send it" found
+   * nothing to send and took another kept prompt instead. `keptId`: the kept reply the phone carried on with (dictating
+   * to the thread again), whose words these replace. Null when there's nothing to keep, or it can't be (its thread
+   * settled or gone, already sent, too long): it stays on the phone, as before.
+   */
+  function keepLeftUnsent(conversationId: string, body: any): KeptDraft | null {
+    const draft = body.keptDraft !== undefined ? parseDraft(body.keptDraft) : null;
+    if (!draft || isNewThread(draft.itemId) || draftStateOf(deps.store, draft.id).state === "sent") return null;
+    const target = namedItems(deps.briefing).find((n) => n.id === draft.itemId);
+    if (!target) return null;
+    const message = assemble(draft, () => null);
+    if (message.length > DRAFT_MAX + 2000) return null;
+    const { note, text } = dictatedParts(message);
+    const before = typeof body.keptId === "string" ? deps.store.keptReply(body.keptId) : null;
+    const kept = deps.store.keepReply({
+      id: before?.threadId === draft.itemId ? before.id : `K-${randomUUID().slice(0, 8)}`, threadId: draft.itemId, threadName: target.handle,
+      project: target.group, text, note, draftId: draft.id, conversationId, keptAt: Date.now(),
+    });
+    deps.log(`voice ${conversationId}: a reply to ${target.handle} left unsent, ${draft.id}, kept as ${kept.id}`);
+    return { handle: target.handle, parts: draft.parts.length, keptId: kept.id, words: wordCount(draft) };
   }
 
   /**
@@ -493,7 +520,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
    */
   function newThreadOpening(conversationId: string, draft: Draft, message: string, start: NewThread, reading: Extract<Opening, { kind: "reading" }>): Opening {
     if (draftStateOf(deps.store, draft.id).state === "sent") throw new Refused("That prompt has already been sent.");
-    const places = deps.adapter.places?.() ?? [];
+    const places = spokenPlaces(deps.adapter.places?.() ?? []);
     const place = places.find((p) => p.id === start.placeId) ?? null;
     const { note, text } = dictatedParts(message);
     const kept = deps.store.keepReply({
@@ -933,7 +960,9 @@ function api(cfg: Config, deps: ServerDeps): Api {
    * A new thread started with a tap (contracts §3, "Tap to send"): a dictated draft's `new:` target (`target`), and its
    * prompt. `keptId`: it was kept for later in a call, and is no longer once it's started.
    */
-  async function tappedStart(body: any, target: string, message: string, keptId?: string): Promise<Response> {
+  async function tappedStart(body: any, given: string, message: string, keptId?: string): Promise<Response> {
+    // A project picked on the phone (Not sent's picker, `placeId`): the same new thread, started there.
+    const target = typeof body.placeId === "string" && body.placeId ? placedTarget(given, body.placeId) ?? given : given;
     const again = earlierTap(body, (p) => p.action === "start_work" && p.fields.target === target && p.fields.message === message);
     if (again) return again;
     const start = parseNewThread(target);
@@ -984,7 +1013,9 @@ function api(cfg: Config, deps: ServerDeps): Api {
           const started = await startSession(body.sdp, id, first, memoryDays, accepted, voice, created, news, readingStyle, readingVoice, fastOf(body).conversations, phoneBuildOf(headed(req)), keepRepliesFor(body, id), confirm, wakeWordOf(body), body.newThreads === "talk");
           // What was read to the end counts as heard once there's a session to tell about it.
           reading?.heard();
-          return started;
+          // The reply left unsent is kept here now: the phone drops its own copy.
+          const kept = reading?.open.kind === "reading" ? reading.open.kept?.keptId : undefined;
+          return kept ? { ...started, keptId: kept } : started;
         });
         creating = run.catch(() => {});
         try {
@@ -1142,6 +1173,13 @@ function api(cfg: Config, deps: ServerDeps): Api {
       }
       // Replies kept for later in calls (the phone's Not sent): listed, edited before sending, discarded, or all sent.
       if (req.method === "GET" && url.pathname === "/api/kept") return send(200, { kept: keptRows() });
+      // Where a new thread can start (Not sent's picker for a prompt with no project yet), most recently active first.
+      if (req.method === "GET" && url.pathname === "/api/places") {
+        const places = (deps.adapter.actions.includes("start_work") ? spokenPlaces(deps.adapter.places?.() ?? []) : [])
+          .filter((p) => (deps.adapter.actionsFor?.(p.id) ?? deps.adapter.actions).includes("start_work"))
+          .sort((a, b) => (b.activeAt ?? "").localeCompare(a.activeAt ?? ""));
+        return send(200, { places: places.map((p) => ({ id: p.id, name: p.name, activeAt: p.activeAt })) });
+      }
       if (req.method === "POST" && url.pathname === "/api/kept/send") {
         const body = await readJson(req);
         const items: unknown[] | null = Array.isArray(body.items) ? body.items : null;

@@ -7,11 +7,25 @@ import { createInterface } from "node:readline";
 
 const args = process.argv.slice(2);
 const value = (flag) => args[args.indexOf(flag) + 1];
-if (args.includes("--help")) { console.log("-w, --worktree [name]"); process.exit(0); }
-if (args.includes("--version")) { console.log(process.env.FAKE_CLAUDE_WORKTREE === "1" ? "2.1.312 (Claude Code)" : "2.1.309 (Claude Code)"); process.exit(0); }
-if (!args.includes("-p") || !args.includes("--permission-mode")) process.exit(2);
+const bg = process.env.FAKE_CLAUDE_BG === "1";
+if (args.includes("--help")) { console.log(`-w, --worktree [name]${bg ? "\n  --bg, --background  Start the session in the background" : ""}`); process.exit(0); }
+if (args.includes("--version")) { console.log(bg ? "2.1.321 (Claude Code)" : process.env.FAKE_CLAUDE_WORKTREE === "1" ? "2.1.312 (Claude Code)" : "2.1.309 (Claude Code)"); process.exit(0); }
 const config = process.env.CLAUDE_CONFIG_DIR;
 if (!config) process.exit(2);
+if (args.includes("--bg")) {
+  // A background start: Claude Code's supervisor takes the session, and this command only reports its short id.
+  appendFileSync(join(config, "calls.jsonl"), JSON.stringify({ args, cwd: process.cwd(), pid: process.pid, bg: true }) + "\n");
+  if (process.env.FAKE_CLAUDE_BG_REFUSE === "1") { console.error("Workspace not trusted"); process.exit(1); }
+  const id = args.includes("--resume") ? value("--resume") : randomUUID();
+  const where = args.includes("--worktree") ? join(process.cwd(), ".claude", "worktrees", value("--worktree")) : process.cwd();
+  const folder = join(config, "projects", where.replace(/[/.]/g, "-"));
+  mkdirSync(folder, { recursive: true });
+  const message = args[args.indexOf("--") + 1];
+  if (process.env.FAKE_CLAUDE_NEVER_ECHO !== "1") appendFileSync(join(folder, `${id}.jsonl`), JSON.stringify({ type: "user", sessionId: id, cwd: where, entrypoint: "cli", origin: { kind: "human" }, timestamp: new Date().toISOString(), version: "2.1.321", permissionMode: value("--permission-mode"), uuid: randomUUID(), message: { role: "user", content: message } }) + "\n");
+  console.log(`backgrounded · ${id.slice(0, 8)}${args.includes("--name") ? ` · ${value("--name")}` : ""}`);
+  process.exit(0);
+}
+if (!args.includes("-p") || !args.includes("--permission-mode")) process.exit(2);
 const id = args.includes("--resume") ? value("--resume") : value("--session-id");
 const cwd = args.includes("--worktree") ? join(process.cwd(), ".claude", "worktrees", value("--worktree")) : process.cwd();
 if (args.includes("--worktree")) { mkdirSync(join(cwd, ".git"), { recursive: true }); process.chdir(cwd); }

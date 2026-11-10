@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
 import { WebSocketServer, type WebSocket } from "ws";
-import { answersFor, mapStatus, snoozedUntil, T3Adapter, titleFrom, toCommand, toLaunch, worktreeStart, type ShellThread } from "../src/t3/adapter.ts";
+import { answersFor, folderOf, mapStatus, snoozedUntil, T3Adapter, titleFrom, toCommand, toLaunch, type ShellThread } from "../src/t3/adapter.ts";
+import { worktreeStart } from "../src/work.ts";
 import type { LaunchProfile } from "../src/contract.ts";
 import { ConnectionError, RpcClient, RpcError } from "../src/t3/rpc.ts";
 
@@ -337,7 +338,7 @@ test("T3Adapter: places are the shell's projects; a launch uses the project's mo
       if (f.tag === "orchestration.subscribeShell") {
         push = (v) => ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [v] }));
         push({ kind: "snapshot", snapshot: {
-          projects: [{ id: "p1", title: "nix", defaultModelSelection: null, workspaceRoot: "/home/x/nix" }, { id: "p2", title: "driver", defaultModelSelection: { instanceId: "claude", model: "opus" } }],
+          projects: [{ id: "p1", title: "nix", defaultModelSelection: null, workspaceRoot: "/home/x/mono/nix", repositoryIdentity: { name: "mono-nix" } }, { id: "p2", title: "driver", defaultModelSelection: { instanceId: "claude", model: "opus" } }],
           threads: [
             thread("old", { updatedAt: "2026-10-15T08:00:00Z", modelSelection: { instanceId: "codex", model: "old" } }),
             thread("new", { updatedAt: "2026-10-16T08:00:00Z", modelSelection: { instanceId: "codex", model: "gpt-6" } }),
@@ -359,7 +360,8 @@ test("T3Adapter: places are the shell's projects; a launch uses the project's mo
   const adapter = new T3Adapter({ baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {}, auth });
   try {
     await adapter.start();
-    assert.deepEqual(adapter.places(), [{ id: "p1", name: "nix", activeAt: "2026-10-16T08:00:00Z" }, { id: "p2", name: "driver", activeAt: null }]);
+    // With the end of its checkout's path and its repository's name: other names for it (brain/src/places.ts).
+    assert.deepEqual(adapter.places(), [{ id: "p1", name: "nix", activeAt: "2026-10-16T08:00:00Z", folder: "mono/nix", repo: "mono-nix" }, { id: "p2", name: "driver", activeAt: null }]);
     const start = { kind: "start_work" as const, placeId: "p1", title: "Launch profiles", message: "Add them.", profile: build };
     assert.deepEqual(await adapter.execute(start, "P-1:start"), { ok: true, itemId: "t1" });
     assert.deepEqual(launches[0].modelSelection, { instanceId: "codex", model: "gpt-6" }, "the project's most recently active thread's model");
@@ -496,4 +498,10 @@ test("local project visibility filters threads, places and changes, and guards e
     assert.equal((await adapter.execute({ kind: "settle", itemId: "public" }, "moved")).ok, false);
     assert.deepEqual(changes, [["public"]], "removing a previously visible item invalidates the brain's view");
   } finally { await adapter.close(); t3.close(); }
+});
+
+test("folderOf: the end of a checkout's path, never all of it", () => {
+  assert.equal(folderOf("/home/jmo/Development/mono/nix/"), "mono/nix");
+  assert.equal(folderOf("/srv"), "srv");
+  assert.equal(folderOf("C:\\work\\api"), "work/api");
 });

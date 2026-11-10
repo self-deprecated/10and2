@@ -123,6 +123,23 @@ function cli(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: number |
   });
 }
 
+test("setup refuses an address given as a word or a mistyped flag before pairing anywhere; every command refuses what it wouldn't read", async (t) => {
+  const dir = temp(t, "setup-stray-");
+  const env: NodeJS.ProcessEnv = { HOME: dir, PATH: "/nonexistent", XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1" };
+  const run = await cli(["setup", "10and2-stg.selfdep.com", "--no-autostart"], env);
+  assert.notEqual(run.status, 0);
+  assert.match(run.out, /10and2 setup --brain=10and2-stg\.selfdep\.com/);
+  assert.ok(!existsSync(join(dir, "config", "10and2", "credentials.json")), "nothing paired");
+  const typo = await cli(["setup", "--brian=10and2-stg.selfdep.com", "--no-autostart"], env);
+  assert.equal(typo.status, 64);
+  assert.match(typo.out, /no --brian/);
+  assert.ok(!existsSync(join(dir, "config", "10and2", "credentials.json")), "a mistyped flag pairs nothing either");
+  const extra = await cli(["status", "now"], env);
+  assert.equal(extra.status, 64);
+  assert.match(extra.out, /doesn't take "now"/);
+  assert.match((await cli(["setup", "--brain=x", "--help"], env)).out, /10and2 setup/, "help still wins");
+});
+
 test("setup pairs in the browser, keeps the credential private, writes a policy; status shows it; revoke undoes it", async (t) => {
   const dir = temp(t, "setup-");
   const bin = join(dir, "bin");
@@ -154,7 +171,7 @@ test("setup pairs in the browser, keeps the credential private, writes a policy;
   assert.equal(statSync(creds).mode & 0o777, 0o600);
   assert.equal(JSON.parse(readFileSync(creds, "utf8"))[origin], credential);
   const policy = JSON.parse(readFileSync(join(dir, "config", "10and2", "connector.json"), "utf8"));
-  assert.deepEqual(policy, { brain: `${origin.replace("http", "ws")}/connector`, projects: "*", actions: ["follow_up", "settle", "snooze", "archive", "start_work"], maxRuntimeMode: "full-access", t3: true, claude: false, worktreeBase: "main" });
+  assert.deepEqual(policy, { brain: `${origin.replace("http", "ws")}/connector`, projects: "*", actions: ["follow_up", "settle", "snooze", "archive", "start_work"], steer: true, answer: true, maxRuntimeMode: "full-access", agents: { claude: false, codex: false, pi: false, opencode: false, t3: true }, worktreeBase: "main" });
 
   const again = await cli(["setup", "--no-autostart"], env);
   assert.equal(again.status, 0);
@@ -164,13 +181,29 @@ test("setup pairs in the browser, keeps the credential private, writes a policy;
   const status = await cli(["status"], env);
   assert.match(status.out, /Not running/);
   assert.match(status.out, /Sees +every project in T3 Code/);
-  assert.match(status.out, /Can +follow up, start work, settle, snooze and archive, after your spoken yes/);
+  assert.match(status.out, /T3 Code +on +follow up · steer · answer · start · tidy/);
+  assert.match(status.out, /Claude Code +off/);
+  assert.match(status.out, /New work runs with at most full access/);
   assert.match(status.out, /New T3 Code worktrees start from the latest main on origin/);
   assert.doesNotMatch(status.out, /brain/i, "no internals in what people read");
   assert.ok(!status.out.includes(credential));
   const verbose = await cli(["status", "--verbose"], env);
   assert.match(verbose.out, /device d{22} of user_abc123/);
   assert.ok(!verbose.out.includes(credential));
+
+  const narrowed = await cli(["agents", "--no-steer", "--no-start=t3", "--yes"], env);
+  assert.equal(narrowed.status, 0, narrowed.out);
+  assert.match(narrowed.out, /can follow up, answer questions, start new work, settle, snooze and archive/);
+  assert.match(narrowed.out, /For T3 Code: no new work\./);
+  const chosen = JSON.parse(readFileSync(join(dir, "config", "10and2", "connector.json"), "utf8"));
+  assert.equal(chosen.steer, false);
+  assert.deepEqual(chosen.agents.t3, { actions: ["follow_up", "settle", "snooze", "archive"] });
+  assert.equal(chosen.brain, policy.brain, "choosing again keeps the rest");
+  assert.equal(chosen.worktreeBase, "main");
+  const none = await cli(["agents", "--off=t3", "--yes"], env);
+  assert.notEqual(none.status, 0);
+  assert.match(none.out, /Every coding agent is switched off/);
+  assert.equal(JSON.parse(readFileSync(join(dir, "config", "10and2", "connector.json"), "utf8")).steer, false, "nothing is saved");
 
   const revoke = await cli(["revoke", "--yes"], env);
   assert.equal(revoke.status, 0, revoke.out);

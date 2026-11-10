@@ -21,7 +21,7 @@ export function wire(o: { adapter: Adapter; store: Store; classify: Classifier; 
     clutter: () => briefing.view().clutter,
     places: () => adapter.places?.() ?? [],
     profiles: o.profiles,
-    started: (id) => briefing.added(id),
+    started: (id, started) => briefing.added(id, started),
     spoken: (id) => conversations.spoken(id),
     lastUserTurn: (id) => conversations.lastUserTurn(id),
     log,

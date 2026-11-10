@@ -10,6 +10,7 @@ import { dictatedParts, DRAFT_MAX, draftState, newThreadName, newThreadTarget, p
 import { inGroup, isMark, keyWords, nameKey, norm, pick, resolve, sayKey, saysHead, speechTokens, spokenTitle, withGroup, type Named } from "./handles.ts";
 import { TAP, type KeptReply, type Proposal, type ProposalTarget, type Store } from "./store.ts";
 import { mapLimit } from "./util.ts";
+import { otherNames, spokenPlaces } from "./places.ts";
 import type { Track } from "./analytics.ts";
 
 export type ProposeAction = "follow_up" | "settle" | "snooze" | "archive" | "settle_subagents" | "start_work";
@@ -105,8 +106,8 @@ export type ProposalDeps = {
   /** Where new work can start (the adapter's places), and what it may run with: the first profile is the default. */
   places?: () => Place[];
   profiles?: LaunchProfile[];
-  /** A new thread was started: let the briefing know it, so it can be named straight away. */
-  started?: (itemId: string) => Promise<void>;
+  /** A new thread was started: let the briefing know it (and what Driver calls it, where), so it can be named straight away. */
+  started?: (itemId: string, started: { title: string; group: string }) => Promise<void>;
   /** Everything the assistant has said aloud in this conversation. */
   spoken: (conversationId: string) => string;
   lastUserTurn: (conversationId: string) => UserTurn;
@@ -341,13 +342,24 @@ function badMessage(message: string): string | null {
  * Which place the user means: their words for a project, with or without its machine ("driver", "expo on Quartz"). The
  * same project on two machines is theirs to settle. Pure, for tests.
  */
-export function pickPlace(spoken: string, places: Place[]): { place: Place } | { error: string } {
+export function pickPlace(spoken: string, given: Place[]): { place: Place } | { error: string } {
+  // Said as the user can say them: no two alike (places.ts).
+  const places = spokenPlaces(given);
   if (!places.length) return { error: "Driver can't see any projects right now: their machines may be unreachable. Say so." };
   const words = spoken.replace(/\b(project|repo|repository|machine)\b/gi, " ").trim();
   const named = places.map((p) => ({ id: p.id, handle: p.name, group: "", title: p.name.replace(/, on [\w-]+$/, "") }));
   const r = words ? resolve(words, named) : { kind: "none" as const };
   if (r.kind === "match") return { place: places.find((p) => p.id === r.item.id)! };
-  if (r.kind === "ambiguous") return { error: `"${spoken}" could mean ${list(r.options.map((o) => o.handle))}. Ask the user which.` };
+  // Each option a clause of its own: names have commas in them ("nix, on Lattice").
+  if (r.kind === "ambiguous") return { error: `"${spoken}" could mean ${r.options.map((o) => o.handle).join("; or ")}. Ask the user which, in those words.` };
+  // Another name for it: its repository's or its folder's ("mono nix" is the project "nix" in mono/nix), with the machine
+  // if they said one.
+  const key = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+  const machine = / on ([\w-]+)$/i.exec(words.replace(/,/g, ""))?.[1]?.toLowerCase();
+  const said = key(machine ? words.replace(/,?\s+on\s+[\w-]+$/i, "") : words);
+  const also = said ? places.filter((p) => otherNames(p).some((n) => key(n) === said) && (!machine || p.name.toLowerCase().endsWith(`, on ${machine}`))) : [];
+  if (also.length === 1) return { place: also[0] };
+  if (also.length > 1) return { error: `"${spoken}" could mean ${also.map((p) => p.name).join("; or ")}. Ask the user which, in those words.` };
   const recent = [...places].sort((a, b) => (b.activeAt ?? "").localeCompare(a.activeAt ?? "")).slice(0, 6).map((p) => p.name);
   return { error: `${words ? `No project matches "${spoken}".` : "Which project?"} Projects active lately: ${recent.join("; ")}. Ask the user which.` };
 }
@@ -554,7 +566,7 @@ export class Proposals {
     const profiles = this.d.profiles ?? [];
     const profile = this.profileOf(asked);
     if ("error" in profile) return profile;
-    const places = this.d.places?.() ?? [];
+    const places = spokenPlaces(this.d.places?.() ?? []);
     let place: Place;
     if ("project" in where) {
       const found = pickPlace(where.project, places);
@@ -707,7 +719,13 @@ export class Proposals {
    */
   keep(conversationId: string, id: string): ToolResult {
     const p = this.d.store.proposal(id);
-    if (!p || p.conversationId !== conversationId) return { error: "No such proposal." };
+    if (!p || p.conversationId !== conversationId) {
+      // A reply or a new thread's prompt kept already (its kept id, "K-…"): "keep it" is done. On 8 November the backend
+      // passed a dictated prompt's kept id and got "No such proposal.".
+      const kept = /^K-/.test(id) ? this.d.store.keptReply(id) : null;
+      if (kept) return { kept: true, already: true, kept_id: kept.id, result: "It's kept already, in Not sent on the phone.", instruction: "Say only that it's kept, in Not sent on their phone (\"Kept. It's in Not sent on your phone.\"), then carry on with what they want next." };
+      return { error: "No such proposal." };
+    }
     if (p.action === "start_work" && p.fields.keptId) return this.keepStart(p);
     if (p.action !== "follow_up" || p.targets.length !== 1) return { error: "Only a reply to a thread or a dictated prompt can be kept for later. Say so, and ask whether to go ahead or leave it." };
     const target = p.targets[0];
@@ -803,7 +821,7 @@ export class Proposals {
   private async startKept(conversationId: string, kept: KeptReply, start: NewThread, levels: ConfirmLevels, where: { project?: string | null; profile?: string | null }): Promise<ToolResult> {
     if (!this.d.adapter.actions.includes("start_work")) return { error: "This system can't start work." };
     if (this.sendingKept.has(kept.id)) return { error: "That prompt is being started right now." };
-    const places = this.d.places?.() ?? [];
+    const places = spokenPlaces(this.d.places?.() ?? []);
     // A place no longer there (its machine asleep, or gone from T3) is asked about again, as none is.
     let placeId = places.some((p) => p.id === start.placeId) ? start.placeId : null;
     if (where.project?.trim()) {
@@ -813,7 +831,14 @@ export class Proposals {
     }
     if (!placeId) {
       const recent = [...places].sort((a, b) => (b.activeAt ?? "").localeCompare(a.activeAt ?? "")).slice(0, 6).map((p) => p.name);
-      return { error: `Which project should it start in? Ask the user.${recent.length ? ` Projects active lately: ${recent.join("; ")}.` : ""}` };
+      // Not "ask the user" outright: on 9 November the backend called this for "keep it for later", was told to ask, and
+      // asked again and again ("I already said keep it for later").
+      return {
+        sent: false,
+        kept: true,
+        result: "Nothing was started: it has no project yet. It stays kept, in Not sent on the phone.",
+        instruction: `If the user wanted it kept, or didn't clearly ask to start it, say only "Kept. It's in Not sent on your phone." and don't ask about a project. If they asked to start it, ask which project.${recent.length ? ` Projects active lately: ${recent.join("; ")}.` : ""}`,
+      };
     }
     const profile = where.profile?.trim() || start.profile;
     const placed = this.newThread({ placeId }, profile);
@@ -997,8 +1022,8 @@ export class Proposals {
   async tapStart(target: string, message: string, requestId?: string, keptId?: string): Promise<Proposal | { error: string }> {
     const start = parseNewThread(target);
     if (!start) return { error: "That new thread couldn't be read, so nothing was started." };
-    if (!start.placeId) return { error: "Nothing was started: it has no project yet. Start it in a call, and 10 & 2 asks which project." };
-    if (!(this.d.places?.() ?? []).some((x) => x.id === start.placeId)) return { error: "That project isn't reachable now (its computer may be asleep), or it's gone, so nothing was started." };
+    if (!start.placeId) return { error: "Nothing was started: it has no project yet. Choose one, or start it in a call." };
+    if (!(spokenPlaces(this.d.places?.() ?? [])).some((x) => x.id === start.placeId)) return { error: "That project isn't reachable now (its computer may be asleep), or it's gone, so nothing was started." };
     const s = this.newThread({ placeId: start.placeId }, start.profile);
     if ("error" in s) return { error: "That new thread can't be started from here. Start it in a call instead." };
     const now = this.now();
@@ -1131,7 +1156,7 @@ export class Proposals {
     const tapped = p.conversationId === TAP;
     const f = p.fields;
     const key = `${p.id}:start`;
-    const place = (this.d.places?.() ?? []).find((x) => x.id === f.placeId);
+    const place = (spokenPlaces(this.d.places?.() ?? [])).find((x) => x.id === f.placeId);
     const reason = !this.d.adapter.connected(f.placeId!) ? "is on a machine that isn't connected right now" : !place ? "is no longer in T3" :
       sayKey(place.name) !== sayKey(f.place!) ? `is now called ${place.name}` : null;
     if (reason) {
@@ -1168,7 +1193,7 @@ export class Proposals {
       // system's name for it is in the briefing.
       if (!tapped) for (const n of new Set([name, name.replace(/^your /, ""), "new thread", "your new thread"])) this.d.store.alias(p.conversationId, nameKey(n), itemId);
       this.d.store.star(itemId, true);
-      await this.d.started?.(itemId).catch((e) => this.d.log?.(`proposal ${p.id}: couldn't list the new thread (${String(e)})`));
+      await this.d.started?.(itemId, { title: f.title ?? "Your new thread", group: f.place! }).catch((e) => this.d.log?.(`proposal ${p.id}: couldn't list the new thread (${String(e)})`));
     }
     this.d.log?.(`proposal ${p.id} start_work → executed`);
     return {

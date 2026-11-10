@@ -1,0 +1,18 @@
+# The harness tests' container (run.sh): Node 22 (the connector's oldest supported), tmux, git, and each coding-agent CLI
+# at the version its adapter was measured on. The tests run with no network, against test/fixtures/mock-model.mjs.
+FROM docker.io/library/node:22-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends tmux git ca-certificates && rm -rf /var/lib/apt/lists/*
+ARG CLAUDE_CODE=2.1.321
+ARG CODEX=0.167.0
+ARG OPENCODE=1.19.5
+ARG PI=1.5.1
+RUN npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUDE_CODE}" \
+    ${CODEX:+"@openai/codex@${CODEX}"} ${OPENCODE:+"opencode-ai@${OPENCODE}"} ${PI:+"@earendil-works/pi-coding-agent@${PI}"} \
+  && npm cache clean --force
+# OpenCode installs its plugin package into its config folder from npm before it loads any plugin, and waits for it: put
+# there ahead of time (opencode.harness.ts copies this into its own config folder), since the tests have no network.
+RUN if [ -n "$OPENCODE" ]; then mkdir -p /opt/opencode-config && cd /opt/opencode-config \
+    && npm install --no-fund --no-audit --save-exact "@opencode-ai/plugin@${OPENCODE}" && npm cache clean --force; fi
+USER node
+ENV TENANDTWO_HARNESS=1 DISABLE_AUTOUPDATER=1
+WORKDIR /work/connector

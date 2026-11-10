@@ -108,3 +108,92 @@ export function keys(onEnter: () => void, onCancel: () => void): () => void {
   input.on("data", onData);
   return () => { input.off("data", onData); input.setRawMode(false); input.pause(); };
 }
+
+/** A row of a checklist: a box to switch, or a choice cycled with ← and →. Disabled rows can't change. */
+export type Row =
+  | { kind: "box"; label: string; detail?: string; on: boolean; disabled?: boolean; open?: boolean }
+  | { kind: "choice"; label: string; options: string[]; index: number; detail?: string };
+/** `back`: ← on a box finishes, as on a screen opened from another. */
+export type ListState = { rows: Row[]; at: number; back?: boolean };
+export type ListKey = "up" | "down" | "space" | "left" | "right" | "enter" | "cancel" | "other";
+export type ListOutcome = { done: boolean; cancelled?: boolean; open?: number };
+
+/**
+ * One key on a checklist, as a pure step so it can be tested: ↑↓ move (skipping nothing), space switches a box, → on a
+ * box that opens (an agent's own permissions) asks to open it, ← → cycle a choice, Enter finishes.
+ */
+export function listStep(s: ListState, key: ListKey): ListOutcome {
+  const row = s.rows[s.at]!;
+  switch (key) {
+    case "up": s.at = (s.at + s.rows.length - 1) % s.rows.length; break;
+    case "down": s.at = (s.at + 1) % s.rows.length; break;
+    case "space": if (row.kind === "box" && !row.disabled) row.on = !row.on; break;
+    case "right":
+      if (row.kind === "choice") row.index = (row.index + 1) % row.options.length;
+      else if (row.open && !row.disabled && row.on) return { done: true, open: s.at };
+      break;
+    case "left":
+      if (row.kind === "choice") row.index = (row.index + row.options.length - 1) % row.options.length;
+      else if (s.back) return { done: true };
+      break;
+    case "enter": return { done: true };
+    case "cancel": return { done: true, cancelled: true };
+  }
+  return { done: false };
+}
+
+function drawList(title: string, s: ListState, hint: string): string[] {
+  const lines = [`  ${title}`];
+  s.rows.forEach((r, i) => {
+    const cursor = i === s.at ? accent("❯") : " ";
+    if (r.kind === "box") {
+      const mark = r.disabled ? dim("○") : r.on ? paint("green", "◉") : dim("○");
+      const label = r.disabled ? dim(r.label) : r.label;
+      lines.push(`  ${cursor} ${mark} ${label.padEnd(14)}${r.detail ? ` ${dim(r.detail)}` : ""}`);
+    } else {
+      lines.push(`  ${cursor}   ${r.label}  ${accent(`◂ ${r.options[r.index]} ▸`)}${r.detail ? `  ${dim(r.detail)}` : ""}`);
+    }
+  });
+  lines.push("", `  ${dim(hint)}`);
+  return lines;
+}
+
+/**
+ * A checklist at the terminal, redrawn in place, until Enter (or → on a row that opens). Off a terminal it returns at
+ * once with the rows as given: the defaults apply.
+ */
+export async function checklist(title: string, rows: Row[], hint: string, opts: { back?: boolean } = {}): Promise<{ rows: Row[]; open?: number }> {
+  const s: ListState = { rows, at: Math.max(0, rows.findIndex((r) => r.kind === "choice" || !r.disabled)), back: opts.back };
+  if (!process.stdin.isTTY || !tty()) return { rows };
+  const { emitKeypressEvents } = await import("node:readline");
+  emitKeypressEvents(process.stdin);
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  let drawn = 0;
+  const render = () => {
+    const lines = drawList(title, s, hint);
+    if (drawn) process.stdout.write(`\x1b[${drawn}A`);
+    for (const l of lines) process.stdout.write(`\r\x1b[2K${l}\n`);
+    drawn = lines.length;
+  };
+  render();
+  try {
+    return await new Promise((resolve, reject) => {
+      const onKey = (_: string, k: { name?: string; ctrl?: boolean } | undefined) => {
+        const name = k?.name;
+        const key: ListKey = (k?.ctrl && name === "c") || (!k?.ctrl && name === "q") ? "cancel" : name === "up" || name === "k" ? "up" : name === "down" || name === "j" ? "down"
+          : name === "space" ? "space" : name === "left" || name === "h" ? "left" : name === "right" || name === "l" ? "right"
+          : name === "return" || name === "enter" ? "enter" : name === "escape" ? "enter" : "other";
+        const out = listStep(s, key);
+        render();
+        if (!out.done) return;
+        process.stdin.removeListener("keypress", onKey);
+        if (out.cancelled) reject(new Cancelled()); else resolve({ rows: s.rows, ...(out.open !== undefined ? { open: out.open } : {}) });
+      };
+      process.stdin.on("keypress", onKey);
+    });
+  } finally {
+    process.stdin.setRawMode(false);
+    process.stdin.pause();
+  }
+}

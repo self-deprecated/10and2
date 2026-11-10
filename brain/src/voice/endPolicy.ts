@@ -50,10 +50,12 @@ const OBJECTION = /^(?:(?:oh|no|hey|um|uh|er|ah)\b[\s,.!]*)*(?:don'?t|don’t|do
  * on when they say so ("no, don't hang up"), object ("Oh! Don't", 2 November) or go on to something else ("let's start
  * a new thread…"), not when they just acknowledge it ("okay, thanks").
  */
-export const keepsTalking = (said: string) => {
+export const keepsTalking = (said: string, wake = STANDARD_WAKE_WORD) => {
   const words = said.trim().split(/\s+/).filter(Boolean);
   if (STAY_ON.test(said)) return true;
   if (endsWithGoodbye(said)) return false;
+  // Asking again for the hang-up under way ("Go on hold mode" twice, 8 November) isn't talking over it.
+  if (asksToPause(said, wake)) return false;
   return OBJECTION.test(said.trim()) || (words.length >= 4 && !/\b(?:thanks|thank you|cheers|ta)[\s.!]*$/i.test(said));
 };
 
@@ -154,7 +156,7 @@ export function step(previous: EndState, input: EndInput, now: number, correct: 
       state.filler = null;
       state.userTurn += input.delta;
       state.userWords = (state.userWords + input.delta).slice(-USER_WORDS);
-      if (state.endRequestedAt && !state.closing && overridable(state) && keepsTalking(correct(state.userTurn))) {
+      if (state.endRequestedAt && !state.closing && overridable(state) && keepsTalking(correct(state.userTurn), state.wake)) {
         result.decision = { stayOn: state.endReason };
         result.log = "the user talked over the hang-up: staying on";
         state.endRequestedAt = 0;

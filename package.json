@@ -1,12 +1,15 @@
 {
   "name": "10and2",
   "type": "module",
-  "version": "0.6.0",
-  "description": "The connector for 10 & 2: lets you talk to the coding agents on your computer (T3 Code, Claude Code) from the 10 & 2 iPhone app.",
+  "version": "0.7.0",
+  "description": "The connector for 10 & 2: lets you talk to the coding agents on your computer (Claude Code, Codex, Pi, OpenCode, T3 Code) from the 10 & 2 iPhone app.",
   "keywords": [
     "10and2",
     "coding agents",
     "claude code",
+    "codex",
+    "pi",
+    "opencode",
     "t3 code",
     "voice"
   ],
@@ -33,12 +36,14 @@
   "files": [
     "bin",
     "dist",
+    "extensions",
     "THIRD_PARTY_NOTICES"
   ],
   "scripts": {
     "start": "node src/main.ts run",
     "build": "node build.mjs",
     "test": "node --test test/*.test.ts",
+    "test:harness": "bash test/harness/run.sh",
     "typecheck": "tsc --noEmit",
     "check": "tsc --noEmit && node --test test/*.test.ts && npm run build && node test/smoke.mjs",
     "prepublishOnly": "npm run check"

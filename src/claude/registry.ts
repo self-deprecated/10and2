@@ -71,6 +71,8 @@ export type Live = {
   status: "busy" | "idle" | "waiting" | null; statusUpdatedAt: string | null; waitingFor: string | null; name: string | null;
   /** How it was started: `cli` in a terminal, `sdk-*` for headless runs and apps built on the Agent SDK. */
   entrypoint: string | null;
+  /** Its inbox for cross-session messages (2.1.224+), a Unix socket; null when it has none. */
+  socket: string | null;
 };
 
 export function iso(value: unknown): string | null {
@@ -102,7 +104,8 @@ export function registrySnapshot(configDir: string, log?: (s: string) => void): 
         status: verified && ["busy", "idle", "waiting"].includes(r.status) ? r.status : null,
         statusUpdatedAt: iso(r.statusUpdatedAt), waitingFor: typeof r.waitingFor === "string" ? r.waitingFor : null,
         name: typeof r.name === "string" ? r.name : null,
-        entrypoint: typeof r.entrypoint === "string" ? r.entrypoint : null });
+        entrypoint: typeof r.entrypoint === "string" ? r.entrypoint : null,
+        socket: typeof r.messagingSocketPath === "string" && isAbsolute(r.messagingSocketPath) && r.messagingSocketPath.endsWith(".sock") ? r.messagingSocketPath : null });
     } catch (e) {
       // A partial file owned by a live pid may be the session we're about to resume. Absence of its id isn't a lock.
       if ((e as NodeJS.ErrnoException).code !== "ENOENT") uncertain ||= pidState(Number(file.slice(0, -5)), null) !== "dead";

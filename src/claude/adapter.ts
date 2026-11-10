@@ -1,18 +1,23 @@
-import { watch, existsSync, readdirSync, statSync, mkdirSync, openSync, closeSync, readSync, chmodSync, unlinkSync } from "node:fs";
+import { watch, existsSync, readdirSync, readFileSync, statSync, mkdirSync, openSync, closeSync, readSync, chmodSync, unlinkSync } from "node:fs";
 import type { FSWatcher } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, execFile } from "node:child_process";
 import { createConnection, createServer } from "node:net";
 import type { Server } from "node:net";
 import type { Action, Adapter, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
-import { allows, visible, withinCeiling } from "../policy.ts";
+import { allows, answers, ceilingFor, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy, RuntimeMode } from "../policy.ts";
 import { iso, pidState, procStart, readRegistry, registrySnapshot, sessionId, versionAtLeast } from "./registry.ts";
 import type { Live } from "./registry.ts";
 import { Transcript, t3Cwd, typedUser } from "./transcript.ts";
 import { Store } from "./store.ts";
+import { folderOf, gitRoot, group } from "../work.ts";
+import { attestedMode, envelope, heldFor, peerToken, post } from "./inbox.ts";
+import { asked } from "./transcript.ts";
+import type { Asked } from "./transcript.ts";
+import type { Socket } from "node:net";
 
 export type Options = {
   configDir?: string; policy: Policy; db: string; claudeBin?: string; stateDir: string; log: (m: string) => void; now?: () => number;
@@ -24,6 +29,8 @@ export type Options = {
   readCacheMs?: number;
   /** Local override for isolated installations/tests; defaults to the standard runtime socket. */
   hookSocketPath?: string;
+  /** False keeps starts and follow-ups headless (`claude -p`) even where background sessions are available. */
+  background?: boolean;
 };
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 export function sessionForKey(key: string): string {
@@ -45,20 +52,40 @@ export function resumeMode(session: string | null, ceiling: RuntimeMode): string
   return REACH[session]! <= REACH[cap]! ? session : cap;
 }
 
-function gitRoot(cwd: string): string | null {
-  for (let p = resolve(cwd);; p = dirname(p)) {
-    if (existsSync(join(p, ".git"))) return p;
-    if (dirname(p) === p) return null;
-  }
-}
-function group(cwd: string): string {
-  const workspace = cwd.match(/[/\\]workspaces[/\\]([^/\\]+)[/\\][^/\\]+(?:[/\\]|$)/);
-  return workspace?.[1] ?? basename(gitRoot(cwd) ?? cwd);
-}
 /** How much of a new transcript is read before deciding whether it's one Driver lists at all. */
 const HEAD_BYTES = 512 * 1024;
 const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whether Claude received that. Driver won't send it again." };
-const HELD = "It's open in a terminal, so Driver can't send to it.";
+/** A live session without an inbox: Claude Code before 2.1.224, or one started bare. */
+const HELD = "It's open in a terminal in an older Claude Code, so Driver can't send to it. Updating Claude Code fixes that.";
+/** A live session, on a machine whose policy doesn't let Driver steer open sessions. */
+const NO_STEERING = "It's open in a terminal, and this computer doesn't let Driver send to open sessions.";
+const NOT_DELIVERED = "That session didn't take the message. Driver won't send it again.";
+const AWAITING_OK = "It's waiting for your OK in that session's terminal. Driver won't send it again.";
+/**
+ * An open AskUserQuestion that 10 & 2's PermissionRequest hook is holding for Driver (hooks.ts): the terminal shows the
+ * question meanwhile, and whichever answers first wins. The hook gets the answers as one JSON line, then exits.
+ */
+type Ask = { socket: Socket; heldAt: string } & ({ questions: Asked[]; plan?: undefined } | { plan: string; questions?: undefined });
+/** Words that let a plan go ahead as it is: a short yes, with nothing asking for a change. */
+export const goAhead = (words: string) => words.trim().length <= 60
+  && /^(yes|yeah|yep|yup|sure|ok|okay|go|go ahead|do it|approve|approved|proceed|sounds good|looks good|ship it|that works|go for it|let's go|start)\b/i.test(words.trim())
+  && !/\b(but|except|change|instead|first|wait|don't|not)\b/i.test(words);
+/**
+ * The answer to each question from the user's words: an option whose label they said (every one, for a multi-select),
+ * or else their words themselves, which Claude Code takes as a typed-in answer.
+ */
+export function answersFor(questions: Asked[], words: string): Record<string, string> {
+  // Words only, so "Milliseconds, please." names "Milliseconds" and "Tabs" isn't found in "establish".
+  const plain = (s: string) => ` ${s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()} `;
+  const said = plain(words);
+  const out: Record<string, string> = {};
+  for (const q of questions) {
+    const named = q.options.filter((o) => plain(o).trim() !== "" && said.includes(plain(o)));
+    const exact = q.options.find((o) => plain(o) === said);
+    out[q.question] = exact ?? (q.multiSelect && named.length ? named.join(", ") : named.length === 1 ? named[0]! : words);
+  }
+  return out;
+}
 type Row = { transcript: Transcript; cwd: string; live: Live[]; item: WorkItem };
 
 export class ClaudeAdapter implements Adapter {
@@ -87,6 +114,10 @@ export class ClaudeAdapter implements Adapter {
   private writes = new Set<Promise<Receipt>>();
   private collisions = new Set<string>();
   private worktrees = false;
+  /** This Claude Code starts background sessions (`claude --bg`), which Driver uses to start and continue work. */
+  private background = false;
+  /** Open AskUserQuestions held by the hook, by session. */
+  private asks = new Map<string, Ask>();
   /** Transcripts left out on their first records, by path, with the inode they had (a new file is read again). */
   private skipped = new Map<string, number | bigint>();
 
@@ -119,11 +150,23 @@ export class ClaudeAdapter implements Adapter {
   private async probeWorktrees() {
     const output = (flag: string) => new Promise<string>((resolve) => {
       execFile(this.opts.claudeBin ?? "claude", [flag], { timeout: 3000, maxBuffer: 1024 * 1024,
-        env: { ...process.env, CLAUDE_CONFIG_DIR: this.configDir } }, (err, stdout) => resolve(err ? "" : stdout));
+        env: this.childEnv() }, (err, stdout) => resolve(err ? "" : stdout));
     });
     const [version, help] = await Promise.all([output("--version"), output("--help")]);
     // Headless worktrees were measured starting at 2.1.310; require the flag as well.
     this.worktrees = versionAtLeast(version.trim().split(/\s+/)[0], "2.1.310") && /--worktree\b/.test(help);
+    // Background starts were measured on 2.1.321 (docs/launch/release.md); require the flag as well.
+    this.background = this.opts.background !== false && versionAtLeast(version.trim().split(/\s+/)[0], "2.1.321") && /--bg\b/.test(help);
+  }
+  /**
+   * The environment of the `claude` Driver runs: its own, with CLAUDE_CONFIG_DIR only for a folder other than the
+   * default. Set even to the default, it moves Claude Code's global settings (trusted folders, MCP servers) from
+   * ~/.claude.json to ~/.claude/.claude.json, so a run would lose them, and a background start in a trusted folder be
+   * refused as untrusted.
+   */
+  private childEnv(): NodeJS.ProcessEnv {
+    if (process.env.CLAUDE_CONFIG_DIR || this.configDir !== resolve(join(homedir(), ".claude"))) return { ...process.env, CLAUDE_CONFIG_DIR: this.configDir };
+    return process.env;
   }
   get isLoaded(): boolean { return this.loaded; }
   connected(): boolean { return this.loaded && !this.closed && !this.closing && this.opts.policy.claude && existsSync(join(this.configDir, "projects")); }
@@ -220,7 +263,7 @@ export class ClaudeAdapter implements Adapter {
       };
       next.set(id, { transcript: t, cwd, live: holders, item });
     }
-    this.rows = next; this.refreshPlaces();
+    this.rows = next; this.refreshPlaces(); this.releaseAnswered();
     const changed: string[] = []; let urgent = false;
     for (const [id, row] of next) {
       const w = row.item, reply = row.transcript.reply;
@@ -257,18 +300,36 @@ export class ClaudeAdapter implements Adapter {
   }
   private refreshPlaces() {
     this.roots.clear();
-    for (const { cwd } of this.rows.values()) {
+    // Folders with a recent session, and every folder the user has trusted in Claude Code, as T3 Code lists every
+    // project: new work can start in a project untouched for weeks.
+    for (const cwd of [...[...this.rows.values()].map((r) => r.cwd), ...this.trustedFolders()]) {
       const root = gitRoot(cwd);
       // A visible subfolder must not grant a launch into its hidden repository parent.
       if (root && visible(this.opts.policy, root)) this.roots.set(hash(root).slice(0, 12), root);
     }
   }
+  private trusted: { mtimeMs: number; folders: string[] } | null = null;
+  /**
+   * The folders Claude Code's global settings (~/.claude.json, or .claude.json in CLAUDE_CONFIG_DIR) record as trusted,
+   * that still exist. Read again only when the file changes; anything unreadable is none.
+   */
+  private trustedFolders(): string[] {
+    const path = process.env.CLAUDE_CONFIG_DIR || this.configDir !== resolve(join(homedir(), ".claude")) ? join(this.configDir, ".claude.json") : join(homedir(), ".claude.json");
+    try {
+      const st = statSync(path);
+      if (this.trusted?.mtimeMs === st.mtimeMs) return this.trusted.folders;
+      const projects = st.size > 64 * 1024 * 1024 ? {} : JSON.parse(readFileSync(path, "utf8"))?.projects ?? {};
+      const folders = Object.entries(projects).filter(([dir, v]: [string, any]) => isAbsolute(dir) && v?.hasTrustDialogAccepted === true && existsSync(dir)).map(([dir]) => dir);
+      this.trusted = { mtimeMs: st.mtimeMs, folders };
+      return folders;
+    } catch { return []; }
+  }
   places(): Place[] {
-    if (!this.loaded || this.closed || !this.opts.policy.claude) return [];
+    if (!this.loaded || this.closed || !this.opts.policy.claude || !allows(this.opts.policy, "start_work", "claude")) return [];
     const roots = [...this.roots].filter(([, root]) => visible(this.opts.policy, root));
     const counts = new Map<string, number>();
     for (const [, root] of roots) counts.set(basename(root), (counts.get(basename(root)) ?? 0) + 1);
-    return roots.map(([id, root]) => ({ id, name: basename(root) + ((counts.get(basename(root)) ?? 0) > 1 ? ` (${id})` : ""),
+    return roots.map(([id, root]) => ({ id, name: basename(root) + ((counts.get(basename(root)) ?? 0) > 1 ? ` (${id})` : ""), folder: folderOf(root),
       activeAt: [...this.rows.values()].filter((r) => gitRoot(r.cwd) === root).map((r) => r.item.updatedAt).sort().at(-1) ?? null }));
   }
   async list(): Promise<WorkItem[]> { this.fresh(); return [...this.rows.values()].map((r) => ({ ...r.item })); }
@@ -280,7 +341,9 @@ export class ClaudeAdapter implements Adapter {
   async report(id: string): Promise<Report> {
     this.fresh(); const r = this.row(id), t = r.transcript, last = t.reply;
     return { text: last?.text ?? "", progress: r.item.status === "running" ? t.progress : null,
-      question: r.item.pendingQuestion ? t.tool ? `wants to run ${t.tool.name}` : "Claude needs your input in its terminal." : null,
+      question: this.asks.get(id)?.plan ? `Claude has a plan ready and asks whether to go ahead with it: ${this.asks.get(id)!.plan!.slice(0, 3000)}`
+        : r.item.pendingQuestion || this.asks.has(id) ? (this.asks.get(id)?.questions ?? t.asking) ? (this.asks.get(id)?.questions ?? t.asking)!.map((q) => `${q.question}${q.options.length ? ` Options: ${q.options.join(" / ")}.` : ""}`).join(" ")
+        : t.tool ? `wants to run ${t.tool.name}` : "Claude needs your input in its terminal." : null,
       reply: last ? { runId: last.runId, messageId: last.messageId, at: last.at } : null };
   }
   async replies(id: string): Promise<PastReply[]> { this.fresh(); return this.row(id).transcript.replies().map((r) => ({ ...r })); }
@@ -294,11 +357,11 @@ export class ClaudeAdapter implements Adapter {
     if (this.closed || this.closing || !this.loaded) return "Claude sessions aren't loaded right now.";
     this.scan();
     if (!this.opts.policy.claude) return "Claude sessions are disabled on this machine.";
-    if (!allows(this.opts.policy, action.kind)) return "This machine's local policy doesn't allow that action.";
+    if (!allows(this.opts.policy, action.kind, "claude")) return "This machine's local policy doesn't allow that action.";
     if (action.kind === "start_work") {
       if (action.title?.trimStart().startsWith("-")) return "A session title must not start with a dash.";
       if (!this.roots.has(action.placeId)) return "That project isn't visible to Driver.";
-      if (!withinCeiling(this.opts.policy, action.profile)) return "That launch profile exceeds this machine's permission ceiling.";
+      if (!withinCeiling(this.opts.policy, action.profile, "claude")) return "That launch profile exceeds this machine's permission ceiling.";
       if (action.profile.workspace === "worktree" && !this.worktrees) return "Driver hasn't verified headless Claude worktrees with this Claude version. Choose the project checkout profile.";
       if (action.profile.workspace === "worktree") {
         const root = this.roots.get(action.placeId)!;
@@ -313,16 +376,19 @@ export class ClaudeAdapter implements Adapter {
     return null;
   }
   private followUpRefusal(id: string, row: Row, holdersUncertain: boolean): string | null {
+    // A question Claude asked that the hook holds takes the answer; a live session (a terminal, a background session,
+    // Driver's own run) takes the message in its inbox, between steps or as its next turn.
+    if (this.asks.has(id)) return null;
+    if (row.live.length) return !steers(this.opts.policy, "claude") ? NO_STEERING : row.live.some((l) => l.socket) ? null : HELD;
     if (this.store.run(id)) return "Driver is already running that session, or can't yet verify that its previous run ended.";
-    if (row.live.length) return HELD;
     if (holdersUncertain) return "Driver can't verify whether a terminal holds that session right now.";
     if (row.transcript.unknown) return "This session uses a Claude transcript version Driver doesn't understand yet.";
-    if (resumeMode(row.transcript.permissionMode, this.opts.policy.maxRuntimeMode) === null) return "Driver can't tell what permissions that session runs with, so it won't send to it.";
+    if (resumeMode(row.transcript.permissionMode, ceilingFor(this.opts.policy, "claude")) === null) return "Driver can't tell what permissions that session runs with, so it won't send to it.";
     return null;
   }
   /** Follow-ups this machine would refuse right now, per session, from the last scan; checked again on execute. */
   refusals(): Record<string, { follow_up?: string }> {
-    if (!this.loaded || this.closed || !allows(this.opts.policy, "follow_up")) return {};
+    if (!this.loaded || this.closed || !allows(this.opts.policy, "follow_up", "claude")) return {};
     const uncertain = registrySnapshot(this.configDir, this.opts.log).uncertain;
     const out: Record<string, { follow_up?: string }> = {};
     for (const [id, row] of this.rows) {
@@ -353,6 +419,16 @@ export class ClaudeAdapter implements Adapter {
     const id = action.kind === "start_work" ? sessionForKey(key) : action.itemId;
     // Re-read after the asynchronous preflight. Claude itself does not lock out terminal holders.
     const holders = registrySnapshot(this.configDir, this.opts.log);
+    if (action.kind === "follow_up") {
+      const ask = this.asks.get(id);
+      if (ask) return this.tracked(this.answer(action, key, digest, ask));
+      const live = holders.live.filter((l) => l.sessionId === id);
+      // The most recently active holder with an inbox: usually the terminal the user has open.
+      const target = live.filter((l) => l.socket).sort((a, b) => (b.statusUpdatedAt ?? "").localeCompare(a.statusUpdatedAt ?? ""))[0];
+      if (live.length && !steers(this.opts.policy, "claude")) return { ok: false, error: NO_STEERING };
+      if (target) return this.tracked(this.message(action, key, digest, target));
+      if (live.length) return { ok: false, error: HELD };
+    }
     if (holders.live.some((l) => l.sessionId === id)) return { ok: false, error: HELD };
     if (action.kind === "follow_up" && holders.uncertain) return { ok: false, error: "Driver can't verify whether a terminal holds that session right now." };
     if (this.store.run(id)) return { ok: false, error: "Driver is already running that session." };
@@ -360,14 +436,148 @@ export class ClaudeAdapter implements Adapter {
       const existing = this.store.operation(key);
       return existing ? existing.hash !== digest ? { ok: false, error: "That operation key was already used for different words or settings." } : existing.receipt ? JSON.parse(existing.receipt) : UNKNOWN : { ok: false, error: "Driver is already running that session." };
     }
-    const pending = this.launch(action, key, id);
+    return this.tracked(this.background ? this.launchBackground(action, key, id) : this.launch(action, key, id));
+  }
+
+  private async tracked(pending: Promise<Receipt>): Promise<Receipt> {
     this.writes.add(pending);
     try { return await pending; } finally { this.writes.delete(pending); }
+  }
+  /** Reserves an operation key for a write without a run of Driver's own: null, or the earlier outcome to repeat. */
+  private reserve(key: string, digest: string): Receipt | null {
+    if (this.store.begin(key, digest)) return null;
+    const existing = this.store.operation(key);
+    return !existing ? UNKNOWN : existing.hash !== digest ? { ok: false, error: "That operation key was already used for different words or settings." } : existing.receipt ? JSON.parse(existing.receipt) : UNKNOWN;
+  }
+
+  /**
+   * A follow-up to a session something has open (a terminal, a background session, a run of Driver's own): posted to its
+   * inbox. It counts as sent once Claude Code queues it (its transcript's `enqueue` with these exact words) or records
+   * it as a turn (a user record with this message's id). One it holds for the user's approval says so.
+   */
+  private async message(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string, target: Live): Promise<Receipt> {
+    const earlier = this.reserve(key, digest);
+    if (earlier) return earlier;
+    const id = action.itemId, row = this.rows.get(id);
+    const sessionMode = row?.transcript.permissionMode ?? null;
+    const mode = attestedMode(sessionMode, ceilingFor(this.opts.policy, "claude"));
+    const content = envelope(action.message, mode), uuid = randomUUID();
+    const path = row?.transcript.path || join(this.configDir, "projects", target.cwd.replace(/[/.]/g, "-"), `${id}.jsonl`);
+    let baseline = 0;
+    try { baseline = statSync(path).size; } catch { /* No transcript yet: everything in it is new. */ }
+    if (!(await post(target.socket!, peerToken(this.configDir, target.pid), id, uuid, content))) {
+      return this.store.finish(key, { ok: false, error: "Driver couldn't reach that session. Is it still open?" });
+    }
+    const lines = new TranscriptLines(path, baseline);
+    // One Claude Code will hold for the user's approval needs no long wait (unless its settings accept every message).
+    const held = heldFor(sessionMode, mode);
+    const deadline = Date.now() + Math.min(this.opts.acceptanceTimeoutMs ?? 15_000, held ? 3000 : Infinity);
+    while (Date.now() < deadline) {
+      for (const r of lines.read()) {
+        const queued = r.type === "queue-operation" && r.operation === "enqueue" && r.content === content;
+        if (queued || (r.type === "user" && r.uuid === uuid)) { this.schedule(); return this.store.finish(key, { ok: true }); }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return this.store.finish(key, { ok: false, unknown: true, error: held ? AWAITING_OK : NOT_DELIVERED });
+  }
+
+  /** The answer to a question Claude asked, through the hook holding it; the hook passes it on and exits. */
+  private async answer(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string, ask: Ask): Promise<Receipt> {
+    const earlier = this.reserve(key, digest);
+    if (earlier) return earlier;
+    this.asks.delete(action.itemId);
+    // A plan goes ahead on a plain yes; any other words go back to Claude as what to change.
+    const reply = ask.plan ? goAhead(action.message) ? { approve: true } : { revise: action.message } : { answers: answersFor(ask.questions!, action.message) };
+    const passed = await new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => resolve(false), 5000);
+      ask.socket.once("close", () => { clearTimeout(timer); resolve(true); });
+      ask.socket.once("error", () => { clearTimeout(timer); resolve(false); });
+      if (ask.socket.destroyed || !ask.socket.writable) { clearTimeout(timer); resolve(false); return; }
+      ask.socket.end(JSON.stringify(reply) + "\n");
+    });
+    this.schedule();
+    return this.store.finish(key, passed ? { ok: true } : { ok: false, unknown: true, error: "Claude may have had its answer already. Driver won't send it again." });
+  }
+
+  /**
+   * New work, or a follow-up to a session nothing has open, as a background session (`claude --bg`): it shows in
+   * `claude agents`, `claude attach` opens it in a terminal, and while it runs Driver can message it like any live
+   * session. Claude Code's supervisor stops it about an hour after it goes idle; the conversation stays. It counts as sent
+   * once its transcript records the message as the user's prompt. When `claude --bg` fails before starting anything
+   * (an untrusted folder, a bypass mode never accepted, no supervisor), it runs headless instead.
+   */
+  private async launchBackground(action: Extract<Action, { kind: "start_work" | "follow_up" }>, key: string, id: string): Promise<Receipt> {
+    const starting = action.kind === "start_work";
+    const cwd = starting ? this.roots.get(action.placeId)! : this.row(id).cwd;
+    const mode = starting ? action.profile.interactionMode === "plan" ? "plan" : permissionMode(action.profile.runtimeMode) : resumeMode(this.row(id).transcript.permissionMode, ceilingFor(this.opts.policy, "claude"))!;
+    // A name the user gave the session stays; otherwise Claude Code keeps titling it itself.
+    const name = starting ? action.title : this.rows.get(id)?.transcript.named ? this.rows.get(id)?.transcript.title ?? undefined : undefined;
+    const worktree = starting && action.profile.workspace === "worktree" ? `driver-${id.slice(0, 13)}` : null;
+    // Without a worktree profile it stays where it is: Claude Code would otherwise move a background session into a
+    // worktree before its first edit, a user's own session included.
+    const args = ["--bg", "--permission-mode", mode, ...(name ? ["--name", name] : []),
+      ...(worktree ? ["--worktree", worktree] : ["--settings", JSON.stringify({ worktree: { bgIsolation: "none" } })]),
+      ...(starting ? [] : ["--resume", id]), "--", action.message];
+    this.store.markStarted(id);
+    const previous = starting ? undefined : this.rows.get(id)?.transcript;
+    const baseline = previous?.offset ?? 0;
+    const ran = await new Promise<{ code: number | null; out: string }>((resolve) => {
+      let out = "";
+      try {
+        const child = spawn(this.opts.claudeBin ?? "claude", args, { cwd, detached: true, env: this.childEnv(), stdio: ["ignore", "pipe", "pipe"] });
+        const timer = setTimeout(() => resolve({ code: null, out }), 30_000);
+        child.stdout.on("data", (b) => { out += b.toString(); });
+        child.stderr.on("data", (b) => { out += b.toString(); });
+        child.on("error", () => { clearTimeout(timer); resolve({ code: -1, out }); });
+        child.on("exit", (code) => { clearTimeout(timer); resolve({ code, out }); });
+      } catch { resolve({ code: -1, out }); }
+    });
+    const short = /backgrounded · ([0-9a-f]{8})/.exec(ran.out)?.[1];
+    const copy = /started a copy (?:of that conversation )?as ([0-9a-f]{8})/.exec(ran.out)?.[1];
+    if (!short && ran.code !== null && ran.code !== 0) {
+      this.opts.log(`claude: background start refused (${ran.out.trim().split("\n").at(-1)?.slice(0, 200) ?? `exit ${ran.code}`}); running it headless`);
+      return this.launch(action, key, id);
+    }
+    if (!short) { this.store.ended(id); return this.store.finish(key, UNKNOWN); }
+    const finish = (receipt: Receipt) => { this.store.ended(id); this.scan(); return this.store.finish(key, receipt); };
+    if (copy || (!starting && short !== id.slice(0, 8))) {
+      return finish({ ok: false, unknown: true, error: "It was open somewhere else, so Claude started a copy with your message. Driver won't send it again." });
+    }
+    // The session's transcript: the one Driver read, or a new one under its working folder (or worktree).
+    // The supervisor starts the session's own process before its first record, so this waits twice as long.
+    const deadline = Date.now() + 2 * (this.opts.acceptanceTimeoutMs ?? 15_000);
+    let lines: TranscriptLines | null = previous?.path ? new TranscriptLines(previous.path, baseline) : null, path = previous?.path ?? null;
+    while (Date.now() < deadline) {
+      if (!lines) {
+        path = this.findTranscript(short);
+        if (path) lines = new TranscriptLines(path);
+      }
+      for (const r of lines?.read() ?? []) {
+        if (typedUser(r) === action.message && typeof r.sessionId === "string" && r.sessionId.startsWith(short)) {
+          this.store.markStarted(r.sessionId);
+          return finish(starting ? { ok: true, itemId: r.sessionId } : { ok: true });
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    return finish(UNKNOWN);
+  }
+  /** The transcript of a session whose id starts with `short`, in any project folder. */
+  private findTranscript(short: string): string | null {
+    const projects = join(this.configDir, "projects");
+    try {
+      for (const dir of readdirSync(projects)) {
+        const file = readdirSync(join(projects, dir)).find((f) => f.startsWith(short) && f.endsWith(".jsonl") && sessionId(f.slice(0, -6)));
+        if (file) return join(projects, dir, file);
+      }
+    } catch { /* Not there yet. */ }
+    return null;
   }
 
   private async launch(action: Extract<Action, { kind: "start_work" | "follow_up" }>, key: string, id: string): Promise<Receipt> {
     const cwd = action.kind === "start_work" ? this.roots.get(action.placeId)! : this.row(id).cwd;
-    const mode = action.kind === "start_work" ? action.profile.interactionMode === "plan" ? "plan" : permissionMode(action.profile.runtimeMode) : resumeMode(this.row(id).transcript.permissionMode, this.opts.policy.maxRuntimeMode)!;
+    const mode = action.kind === "start_work" ? action.profile.interactionMode === "plan" ? "plan" : permissionMode(action.profile.runtimeMode) : resumeMode(this.row(id).transcript.permissionMode, ceilingFor(this.opts.policy, "claude"))!;
     const args = ["-p", action.kind === "start_work" ? "--session-id" : "--resume", id, "--permission-mode", mode,
       "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--replay-user-messages"];
     // With no title, Claude Code names the session itself.
@@ -396,7 +606,7 @@ export class ClaudeAdapter implements Adapter {
     const transcriptPath = previous?.path || join(this.configDir, "projects", runCwd.replace(/[/.]/g, "-"), `${id}.jsonl`);
     let child;
     try {
-      child = spawn(this.opts.claudeBin ?? "claude", args, { cwd, detached: true, env: { ...process.env, CLAUDE_CONFIG_DIR: this.configDir }, stdio: ["pipe", out, err] });
+      child = spawn(this.opts.claudeBin ?? "claude", args, { cwd, detached: true, env: this.childEnv(), stdio: ["pipe", out, err] });
     } catch {
       closeSync(out); closeSync(err); this.store.ended(id);
       return finish({ ok: false, error: "Driver couldn't start Claude on this machine." });
@@ -448,14 +658,16 @@ export class ClaudeAdapter implements Adapter {
       try { unlinkSync(this.socketPath); } catch { /* bind below reports it */ }
     }
     const server = createServer((socket) => {
-      socket.setTimeout(200, () => socket.destroy()); let text = "";
+      socket.setTimeout(500, () => socket.destroy()); let text = "";
       socket.on("error", () => {});
       socket.on("data", (chunk) => {
+        if (text.includes("\n")) return;
         text += chunk.toString();
-        if (text.length > 4096) { socket.destroy(); return; }
+        if (text.length > 64 * 1024) { socket.destroy(); return; }
         if (!text.includes("\n")) return;
         try {
           const event = JSON.parse(text.slice(0, text.indexOf("\n")));
+          if (event.hook_event_name === "PermissionRequest" && sessionId(event.session_id) && this.hold(event.session_id, socket, event)) return;
           // Payloads never set status or supply reply text. Only a fresh filesystem read may do that.
           if (sessionId(event.session_id) && ["SessionStart", "SessionEnd", "Stop", "Notification"].includes(event.hook_event_name)) this.schedule();
         } catch { /* Untrusted or incomplete local notification. */ }
@@ -473,6 +685,33 @@ export class ClaudeAdapter implements Adapter {
       });
     });
   }
+  /**
+   * Keeps a PermissionRequest hook's connection while its session waits on an AskUserQuestion Driver may answer. The
+   * questions come from the hook, since Claude Code writes the call to its transcript only once it's answered; only
+   * their text and option labels are kept. False (the hook exits at once, leaving the question to the terminal) for a
+   * session Driver doesn't list, or no questions.
+   */
+  private hold(id: string, socket: Socket, event: any): boolean {
+    this.scan();
+    const row = this.rows.get(id), heldAt = new Date(this.now()).toISOString();
+    const questions = event.tool === "ExitPlanMode" ? null : asked({ name: "AskUserQuestion", input: { questions: event.questions } });
+    const plan = event.tool === "ExitPlanMode" && typeof event.plan === "string" && event.plan.trim() ? event.plan.slice(0, 20_000) : null;
+    if (!row || (!questions && !plan) || this.closing || !answers(this.opts.policy, "claude")) return false;
+    this.asks.get(id)?.socket.end();
+    socket.setTimeout(0);
+    const ask: Ask = questions ? { socket, questions, heldAt } : { socket, plan: plan!, heldAt };
+    this.asks.set(id, ask);
+    socket.once("close", () => { if (this.asks.get(id) === ask) { this.asks.delete(id); this.schedule(); } });
+    this.schedule();
+    return true;
+  }
+  /** A question answered in the terminal (or a session that ended) lets its hook go, with no answer. */
+  private releaseAnswered() {
+    for (const [id, ask] of this.asks) {
+      const row = this.rows.get(id), answered = row?.transcript.answeredAt;
+      if (!row || !row.live.length || (answered && answered >= ask.heldAt)) { this.asks.delete(id); ask.socket.end(); }
+    }
+  }
   async close(): Promise<void> {
     if (this.shutdown) return this.shutdown;
     this.closing = true;
@@ -486,6 +725,7 @@ export class ClaudeAdapter implements Adapter {
     // Finish acceptance bookkeeping; the child itself stays detached and keeps its log descriptors.
     await Promise.allSettled([...this.writes]);
     this.closed = true; this.loaded = false; this.listeners.clear();
+    for (const ask of this.asks.values()) ask.socket.end(); this.asks.clear();
     this.socket?.close();
     if (this.ownsSocket) { try { unlinkSync(this.socketPath); } catch { /* Server may already have removed it. */ } }
     this.store.close();
