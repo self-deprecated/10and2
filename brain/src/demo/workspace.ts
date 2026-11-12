@@ -5,7 +5,7 @@ import type { ItemStatus } from "../adapter.ts";
 import type { Card } from "../store.ts";
 
 /** What the briefing says of a reply, written here rather than by the classifier, so a demo never waits on a model. */
-export type DemoCard = Pick<Card, "state" | "summary" | "ask" | "suggested">;
+export type DemoCard = Pick<Card, "state" | "summary" | "ask" | "suggested" | "answers">;
 /** A finished reply: the message that started its run, and how long before the demo it finished. */
 export type DemoReply = { text: string; prompt: string; agoMin: number; card: DemoCard };
 /** The reply a follow-up gets when the user's words match `when` (or, for a question, pick the option). */
@@ -43,7 +43,7 @@ export const DEMO_MACHINE = "Demo laptop";
 export const OPENER =
   "Morning. Two things want a decision: the CarPlay reply tone is asking how to handle music, and the Postgres backups are ready to deploy whenever you say. TestFlight build 58 is waiting for your go to upload, and checkout is blocked on a Stripe test key. Five finished review subthreads could be tidied.";
 
-const decide = (summary: string, ask: string | null = null): DemoCard => ({ state: "needs_decision", summary, ask, suggested: "follow_up" });
+const decide = (summary: string, ask: string | null = null, answers: string[] = []): DemoCard => ({ state: "needs_decision", summary, ask, suggested: "follow_up", answers });
 const ready = (summary: string): DemoCard => ({ state: "ready_to_apply", summary, ask: null, suggested: "follow_up" });
 const done = (summary: string): DemoCard => ({ state: "done_unreviewed", summary, ask: null, suggested: "settle" });
 
@@ -58,7 +58,7 @@ export const THREADS: DemoThread[] = [
       agoMin: 14,
       prompt: "Make the reply tone play over CarPlay too, not just the phone speaker.",
       text: "The reply tone now plays over CarPlay as well as the phone speaker. It goes through the same audio session as the call, so it follows whatever route is active, and I added a test that switches routes mid-tone. One thing I need from you before I finish: what should happen to music that's playing when a reply comes in?",
-      card: decide("The reply tone plays over CarPlay now; it's asking what to do with music that's playing.", "Duck the music, pause it, or play the tone only?"),
+      card: decide("The reply tone plays over CarPlay now; it's asking what to do with music that's playing.", "Duck the music, pause it, or play the tone only?", ["Duck it", "Pause it", "Tone only"]),
     }],
     question: {
       id: "q-carplay-music",
@@ -103,7 +103,7 @@ export const THREADS: DemoThread[] = [
       agoMin: 55,
       prompt: "Sketch how a demo mode could work for Apple's reviewer: no machine connected, nothing real changes.",
       text: "Here's the plan: a demo adapter in the brain with a fixed fake workspace, selected per account, so the reviewer gets real voice with nothing connected. Every command succeeds and changes nothing, and replies arrive within seconds so call-backs show off. It needs no change to the voice side. Shall I build it?",
-      card: decide("It has a plan for a demo mode with a fake workspace and is asking whether to build it.", "Build it?"),
+      card: decide("It has a plan for a demo mode with a fake workspace and is asking whether to build it.", "Build it?", ["Yes, build it", "Not yet"]),
     }],
     wroteAgoMin: 40,
     running: {
@@ -132,7 +132,7 @@ export const THREADS: DemoThread[] = [
         agoMin: 38,
         prompt: "Bump the build, run the tests and archive it, but don't upload yet.",
         text: "Build 58 is archived and signed. All 112 unit tests and the 9 UI tests pass, and the archive is 41 megabytes. I haven't uploaded it: it's the first build for external testers, so Apple's Beta App Review will look at it, and that wants the reviewer notes and the privacy policy link in App Store Connect. Both are filled in. Shall I upload it and submit it for review?",
-        card: decide("Build 58 is archived and tests pass; it's waiting for your go to upload it and submit it for review.", "Upload build 58 and submit it for review?"),
+        card: decide("Build 58 is archived and tests pass; it's waiting for your go to upload it and submit it for review.", "Upload build 58 and submit it for review?", ["Yes, upload it", "Not yet"]),
       },
       {
         agoMin: 300,
@@ -276,7 +276,7 @@ export const THREADS: DemoThread[] = [
       agoMin: 22,
       prompt: "Set up nightly Postgres backups to R2 and check a restore works.",
       text: "Nightly backups are ready: a script that dumps the database, compresses it and uploads it to R2, and a timer that runs it at 2 AM. I tested it against a scratch bucket: a 1.2 gigabyte dump uploaded in 40 seconds, and restoring it into a scratch database worked. It isn't deployed: switching the server restarts Postgres for about five seconds. Should I deploy it now, or tonight at 2 AM?",
-      card: decide("Nightly backups to R2 are tested; deploying restarts Postgres for five seconds, so it's asking when.", "Deploy now, or tonight at 2 AM?"),
+      card: decide("Nightly backups to R2 are tested; deploying restarts Postgres for five seconds, so it's asking when.", "Deploy now, or tonight at 2 AM?", ["Now", "Tonight at 2"]),
     }],
     next: [{
       when: /deploy|tonight|now|go ahead|yes|do it|switch/i,
@@ -309,8 +309,8 @@ export const THREADS: DemoThread[] = [
     replies: [{
       agoMin: 48,
       prompt: "Draft the launch post from the notes in the post folder.",
-      text: "The launch post is drafted: about 900 words, with a short story about the first drive, what Driver does, how to join the beta, and three screenshots. One question: prices aren't final yet. Do you want the pricing section in with today's numbers, or should I leave it out until they're settled?",
-      card: decide("The launch post is drafted; it's asking whether to keep the pricing section in.", "Keep the pricing section, or leave it out until prices are final?"),
+      text: "The launch post is drafted: about 900 words, with a short story about the first drive, what the app does, how to join the beta, and three screenshots. One question: prices aren't final yet. Do you want the pricing section in with today's numbers, or should I leave it out until they're settled?",
+      card: decide("The launch post is drafted; it's asking whether to keep the pricing section in.", "Keep the pricing section, or leave it out until prices are final?", ["Keep it in", "Leave it out"]),
     }],
     next: [
       {
@@ -351,7 +351,7 @@ export const THREADS: DemoThread[] = [
       agoMin: 210,
       prompt: "Plan moving our 1,800 users' sign-in to Clerk.",
       text: "There are two ways to move the 1,800 existing users. One: import them into Clerk with their password hashes, so nobody notices; Clerk supports our bcrypt hashes. Two: send everyone a magic link on their next sign-in and drop passwords. The first is invisible to users and takes about a day; the second is simpler but costs some sign-ins. I'd do the first. Which do you want?",
-      card: decide("It has two ways to move the 1,800 users to Clerk and recommends importing their password hashes.", "Import password hashes, or switch everyone to magic links?"),
+      card: decide("It has two ways to move the 1,800 users to Clerk and recommends importing their password hashes.", "Import password hashes, or switch everyone to magic links?", ["Import the hashes", "Magic links"]),
     }],
     wroteAgoMin: 210,
     next: [{

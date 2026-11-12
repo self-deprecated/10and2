@@ -179,7 +179,7 @@ export function step(previous: EndState, input: EndInput, now: number, correct: 
       state.reply += input.delta;
       // Never on a call the user hasn't spoken in: a call-back or a return from a reading opens with Driver talking.
       if (!state.endRequestedAt && !state.pauseAnswered && state.userWords.trim() && promisesCallback(state.reply)) {
-        request({ kind: "paused" }, "Driver said it would hang up");
+        request({ kind: "paused" }, "the voice said it would hang up");
       }
       state.userTurn = "";
       state.lastActivity = state.lastAssistantDelta = now;

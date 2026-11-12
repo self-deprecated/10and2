@@ -26,7 +26,7 @@ in
       chmod -R u+w $sourceRoot/brain
     '';
     nodejs = nodejs_24;
-    npmDepsHash = "sha256-5t8LLUuu1NhWcybOb+y+99Ev1U7w/+QHA1NfBG4od78=";
+    npmDepsHash = "sha256-9pBt6UqR8mzgXjBEG4gwvVN0Rl+2xbNQtfIkEiFGN00=";
     # The same bundled files npm publishes (`npm run build`): no TypeScript or node_modules at runtime.
     installPhase = ''
       runHook preInstall

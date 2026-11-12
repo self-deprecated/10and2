@@ -58,11 +58,11 @@ type Live = {
 type Row = { s: SessionRow; v: View; item: WorkItem; holder: Endpoint | null; runner: Endpoint | null; pending: Pending | null; unreachable: boolean };
 
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
-const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whether OpenCode received that. Driver won't send it again." };
-const NO_STEERING = "It's open in OpenCode, and this computer doesn't let Driver send to open sessions.";
-const UNREACHABLE = "It's open in an OpenCode that Driver can't reach. Installing 10 & 2's OpenCode plugin and restarting OpenCode fixes that.";
-const CAPPED = "That session may do more than this computer lets Driver run, so Driver won't send to it.";
-const NOT_REACHED = "Driver couldn't reach OpenCode. Is it still open?";
+const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whether OpenCode received that. 10 & 2 won't send it again." };
+const NO_STEERING = "It's open in OpenCode, and this computer doesn't let 10 & 2 send to open sessions.";
+const UNREACHABLE = "It's open in an OpenCode that 10 & 2 can't reach. Installing 10 & 2's OpenCode plugin and restarting OpenCode fixes that.";
+const CAPPED = "That session may do more than this computer lets 10 & 2 run, so 10 & 2 won't send to it.";
+const NOT_REACHED = "10 & 2 couldn't reach OpenCode. Is it still open?";
 const KEY_REUSED = "That operation key was already used for different words or settings.";
 /** A question OpenCode is asking, said as it's asked. */
 const ask = (qs: Asked[]) => qs.map((q) => `${q.question}${q.options.length ? ` Options: ${q.options.join(" / ")}.` : ""}`).join(" ");
@@ -346,7 +346,7 @@ export class OpenCodeAdapter implements Adapter {
   async list(): Promise<WorkItem[]> { await this.fresh(); return [...this.rows.values()].map((r) => ({ ...r.item })); }
   private row(id: string): Row {
     const row = this.rows.get(id);
-    if (!row || !visible(this.opts.policy, row.s.directory)) throw new Error("That session isn't visible to Driver.");
+    if (!row || !visible(this.opts.policy, row.s.directory)) throw new Error("That session isn't visible to 10 & 2.");
     return row;
   }
   async report(id: string): Promise<Report> {
@@ -372,15 +372,15 @@ export class OpenCodeAdapter implements Adapter {
     if (!this.opts.policy.opencode) return "OpenCode sessions are disabled on this machine.";
     if (!allows(this.opts.policy, action.kind, "opencode")) return "This machine's local policy doesn't allow that action.";
     if (action.kind === "start_work") {
-      if (!this.roots.has(action.placeId)) return "That project isn't visible to Driver.";
+      if (!this.roots.has(action.placeId)) return "That project isn't visible to 10 & 2.";
       if (!withinCeiling(this.opts.policy, action.profile, "opencode")) return "That launch profile exceeds this machine's permission ceiling.";
       // OpenCode's own worktrees are experimental in 1.19.5 (and outside its session API), so Driver makes a plain one.
       const worktrees = join(this.roots.get(action.placeId)!, ".opencode", "worktrees");
-      if (action.profile.workspace === "worktree" && existsSync(worktrees) && !visible(this.opts.policy, worktrees)) return "That project's worktree folder is outside Driver's visible folders.";
+      if (action.profile.workspace === "worktree" && existsSync(worktrees) && !visible(this.opts.policy, worktrees)) return "That project's worktree folder is outside 10 & 2's visible folders.";
       return null;
     }
     const row = this.rows.get(action.itemId);
-    if (!row) return "That session isn't visible to Driver.";
+    if (!row) return "That session isn't visible to 10 & 2.";
     if (action.kind === "snooze" && !Number.isFinite(Date.parse(action.until))) return "That snooze time isn't valid.";
     if (action.kind === "follow_up") return this.followUpRefusal(row);
     return null;
@@ -388,12 +388,12 @@ export class OpenCodeAdapter implements Adapter {
   private followUpRefusal(row: Row): string | null {
     const p = row.pending;
     // Driver never gives a tool permission: that's for the user, in OpenCode.
-    if (p?.kind === "permission") return `It's waiting for your OK in OpenCode to ${wants(p)}. Driver doesn't give that; answer it in OpenCode.`;
-    if (p?.kind === "question") return answers(this.opts.policy, "opencode") ? null : "It's asking you a question in OpenCode, and this computer doesn't let Driver answer questions.";
+    if (p?.kind === "permission") return `It's waiting for your OK in OpenCode to ${wants(p)}. 10 & 2 doesn't give that; answer it in OpenCode.`;
+    if (p?.kind === "question") return answers(this.opts.policy, "opencode") ? null : "It's asking you a question in OpenCode, and this computer doesn't let 10 & 2 answer questions.";
     if (row.runner) return "It's running in a one-off OpenCode run right now. Try again once that's done.";
     if (row.holder) return steers(this.opts.policy, "opencode") ? null : NO_STEERING;
     if (row.unreachable) return UNREACHABLE;
-    if (row.item.pendingQuestion) return "It's asking you something in an OpenCode that Driver can't reach. Answer it there.";
+    if (row.item.pendingQuestion) return "It's asking you something in an OpenCode that 10 & 2 can't reach. Answer it there.";
     // Continued in Driver's own server, which runs under this machine's ceiling: a session whose own rules allow more is refused.
     if (!atMost(reach([{ permission: "*", pattern: "*", action: "allow" }, ...askAll(ceilingFor(this.opts.policy, "opencode")), ...(row.s.permission ?? [])]), ceilingFor(this.opts.policy, "opencode"))) return CAPPED;
     return null;
@@ -450,11 +450,11 @@ export class OpenCodeAdapter implements Adapter {
   private async message(action: Extract<Action, { kind: "follow_up" }>, key: string, row: Row, ep: Endpoint): Promise<Receipt> {
     const id = row.s.id, dir = row.s.directory;
     let known: Set<string>;
-    try { known = withDb(this.dbPath, (db) => userMessageIds(db, id)); } catch { return this.finish(key, { ok: false, error: "Driver couldn't read OpenCode's sessions just now. Nothing was sent." }); }
+    try { known = withDb(this.dbPath, (db) => userMessageIds(db, id)); } catch { return this.finish(key, { ok: false, error: "10 & 2 couldn't read OpenCode's sessions just now. Nothing was sent." }); }
     let r;
     try { r = await call(ep, "POST", `/session/${encodeURIComponent(id)}/prompt_async`, { directory: dir, body: { parts: [{ type: "text", text: action.message }] } }); }
     catch (e) { return this.failed(key, e); }
-    if (r.status >= 400 && r.status < 500) return this.finish(key, { ok: false, error: "OpenCode didn't take the message. Driver won't send it again." });
+    if (r.status >= 400 && r.status < 500) return this.finish(key, { ok: false, error: "OpenCode didn't take the message. 10 & 2 won't send it again." });
     if (r.status >= 300) return this.finish(key, UNKNOWN);
     if (ep.via === "serve") this.serve.use(dir);
     return this.finish(key, await this.arrived(ep, id, dir, action.message, known) ? { ok: true } : UNKNOWN);
@@ -484,8 +484,8 @@ export class OpenCodeAdapter implements Adapter {
     try { r = await call(p.ep, "POST", `/question/${encodeURIComponent(p.id)}/reply`, { directory: p.directory, body: { answers: answersFor(p.questions, action.message) } }); }
     catch (e) { return this.failed(key, e); }
     if (r.status === 200 && r.body === true) return this.finish(key, { ok: true });
-    if (r.status >= 400 && r.status < 500) return this.finish(key, { ok: false, error: "That question was already answered in OpenCode. Driver didn't send your answer." });
-    return this.finish(key, { ok: false, unknown: true, error: "OpenCode may have had its answer already. Driver won't send it again." });
+    if (r.status >= 400 && r.status < 500) return this.finish(key, { ok: false, error: "That question was already answered in OpenCode. 10 & 2 didn't send your answer." });
+    return this.finish(key, { ok: false, unknown: true, error: "OpenCode may have had its answer already. 10 & 2 won't send it again." });
   }
 
   /** The rules an agent runs with in this process, or null when it can't be told. */
@@ -510,17 +510,17 @@ export class OpenCodeAdapter implements Adapter {
   private async continueInServe(action: Extract<Action, { kind: "follow_up" }>, key: string, row: Row): Promise<Receipt> {
     let ep: Endpoint;
     try { ep = await this.serveEndpoint(); }
-    catch (e) { this.opts.log(`opencode: ${(e as Error).message}`); return this.finish(key, { ok: false, error: "Driver couldn't start OpenCode on this computer." }); }
+    catch (e) { this.opts.log(`opencode: ${(e as Error).message}`); return this.finish(key, { ok: false, error: "10 & 2 couldn't start OpenCode on this computer." }); }
     this.serve.use(row.s.directory);
     const agent = row.v.agent ?? row.s.agent ?? "build";
     const rules = await this.agentRules(ep, row.s.directory, agent);
-    if (!rules) return this.finish(key, { ok: false, error: "Driver can't tell what that session may do, so it won't send to it." });
+    if (!rules) return this.finish(key, { ok: false, error: "10 & 2 can't tell what that session may do, so it won't send to it." });
     if (!atMost(reach([...rules, ...(row.s.permission ?? [])]), ceilingFor(this.opts.policy, "opencode"))) return this.finish(key, { ok: false, error: CAPPED });
     return this.message(action, key, row, ep);
   }
 
   /**
-   * New work: a session made in the project's folder, or a fresh worktree inside it (`.opencode/worktrees/driver-<id>`,
+   * New work: a session made in the project's folder, or a fresh worktree inside it (`.opencode/worktrees/10and2-<id>`,
    * from the policy's `worktreeBase`), with the profile's agent (`plan` for a plan) and rules for its
    * runtime mode, then the words as its first message. Made in an OpenCode terminal open in that folder, if there is
    * one (it shows in its session list there), else in Driver's own server.
@@ -534,13 +534,13 @@ export class OpenCodeAdapter implements Adapter {
     const tui = this.live.endpoints.filter((e) => e.kind === "tui" && e.directory === root).sort((a, b) => b.startedAt - a.startedAt)[0];
     let ep: Endpoint;
     try { ep = tui ?? await this.serveEndpoint(); }
-    catch (e) { this.opts.log(`opencode: ${(e as Error).message}`); return this.finish(key, { ok: false, error: "Driver couldn't start OpenCode on this computer." }); }
+    catch (e) { this.opts.log(`opencode: ${(e as Error).message}`); return this.finish(key, { ok: false, error: "10 & 2 couldn't start OpenCode on this computer." }); }
     if (ep.via === "serve") this.serve.use(root);
     const plan = action.profile.interactionMode === "plan", agent = plan ? "plan" : "build";
     const agentRules = await this.agentRules(ep, root, agent);
-    if (!agentRules) return this.finish(key, { ok: false, error: plan ? "OpenCode here has no plan agent, so Driver can't start a plan." : "Driver can't tell what OpenCode here would allow, so it won't start work." });
+    if (!agentRules) return this.finish(key, { ok: false, error: plan ? "OpenCode here has no plan agent, so 10 & 2 can't start a plan." : "10 & 2 can't tell what OpenCode here would allow, so it won't start work." });
     const rules = sessionRules(action.profile.runtimeMode, agentRules, plan);
-    if (!atMost(reach([...agentRules, ...rules]), action.profile.runtimeMode)) return this.finish(key, { ok: false, error: "OpenCode's settings here allow more than that profile, so Driver won't start it." });
+    if (!atMost(reach([...agentRules, ...rules]), action.profile.runtimeMode)) return this.finish(key, { ok: false, error: "OpenCode's settings here allow more than that profile, so 10 & 2 won't start it." });
     let made;
     try { made = await call(ep, "POST", "/session", { directory: root, body: { ...(action.title ? { title: action.title } : {}), agent, ...(rules.length ? { permission: rules } : {}) } }); }
     catch (e) { return this.failed(key, e); }
@@ -556,7 +556,7 @@ export class OpenCodeAdapter implements Adapter {
     }
     if (r.status >= 400 && r.status < 500) {
       void call(ep, "DELETE", `/session/${encodeURIComponent(id)}`, { directory: root }).catch(() => {});
-      return this.finish(key, { ok: false, error: "OpenCode didn't take the message. Driver won't send it again." });
+      return this.finish(key, { ok: false, error: "OpenCode didn't take the message. 10 & 2 won't send it again." });
     }
     if (r.status >= 300) return this.finish(key, UNKNOWN);
     return this.finish(key, await this.arrived(ep, id, root, action.message, new Set()) ? { ok: true, itemId: id } : UNKNOWN);

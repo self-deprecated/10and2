@@ -36,24 +36,24 @@ const OWN_KEY = "your OpenAI key"; // provider-name-ok: see above
 const usage = () => `${bold("10and2")} ${VERSION} ${dim("·")} connects this computer's coding agents (Claude Code, Codex, Pi, OpenCode, T3 Code) to 10 & 2
 
   ${cmd("10and2 setup")}     connect this computer (opens your browser to approve it)
-  ${cmd("10and2 status")}    whether it's connected, and what Driver can see and do here
-  ${cmd("10and2 agents")}    choose which coding agents to connect, and what Driver may do
+  ${cmd("10and2 status")}    whether it's connected, and what 10 & 2 can see and do here
+  ${cmd("10and2 agents")}    choose which coding agents to connect, and what 10 & 2 may do
   ${cmd("10and2 revoke")}    disconnect this computer
 
 More
   ${cmd("10and2 autostart on|off|status")}     start at login
-  ${cmd("10and2 hooks install|uninstall|status")}  Driver answers Claude Code's questions; updates are instant
-  ${cmd("10and2 pi install|uninstall|status")}     Driver reaches the Pi sessions you have open
-  ${cmd("10and2 opencode install|uninstall|status")}  Driver reaches the OpenCode sessions you have open
+  ${cmd("10and2 hooks install|uninstall|status")}  10 & 2 answers Claude Code's questions; updates are instant
+  ${cmd("10and2 pi install|uninstall|status")}     10 & 2 reaches the Pi sessions you have open
+  ${cmd("10and2 opencode install|uninstall|status")}  10 & 2 reaches the OpenCode sessions you have open
   ${cmd("10and2 run")}                         run in this terminal instead of at login
   ${cmd("10and2 token")}                       a token, for a brain you configure by hand
 
-Setup options: --name=<what Driver calls it>  --worktree-base=<branch, or HEAD>  --yes  --no-autostart  --brain=<url>  --token (a brain of your own)
+Setup options: --name=<what 10 & 2 calls it>  --worktree-base=<branch, or HEAD>  --yes  --no-autostart  --brain=<url>  --token (a brain of your own)
 Choosing without a terminal: --agents=claude,pi  --off=codex  --read-only  --no-steer  --no-answer  --no-start  --no-tidy  (--no-steer=codex: that agent only)
 Settings: ${defaultPolicyPath()}
 
 Your own brain ${dim(`(instead of your 10 & 2 account: ${OWN_KEY}, your computer)`)}
-  ${cmd("10and2 brain setup")}                 run Driver's brain on this computer ${dim("(--port=8790)")}
+  ${cmd("10and2 brain setup")}                 run 10 & 2's brain on this computer ${dim("(--port=8790)")}
   ${cmd("10and2 brain status")}                whether it's running, and which computers it accepts
   ${cmd("10and2 brain add <name> <hash>")}     accept another computer ${dim("(set up there with --brain=<address> --token)")}
   ${cmd("10and2 brain remove <name>")}         stop accepting a computer
@@ -213,7 +213,7 @@ async function setup() {
 async function chooseAgents(again: string, existing: any | null): Promise<{ found: Found[]; choice: Choice }> {
   const found = await detect();
   if (!found.some((f) => f.installed)) {
-    throw new Error(`No coding agent Driver works with is on this computer (Claude Code, Codex, Pi, OpenCode or T3 Code), so there's nothing to connect. Install one, then run ${cmd(again)} again.`);
+    throw new Error(`No coding agent 10 & 2 works with is on this computer (Claude Code, Codex, Pi, OpenCode or T3 Code), so there's nothing to connect. Install one, then run ${cmd(again)} again.`);
   }
   let choice = applyFlags(startingChoice(existing, found), flags);
   if (!flags.has("yes") && process.stdin.isTTY && process.stdout.isTTY) choice = await chooseInteractively(found, choice);
@@ -255,7 +255,7 @@ function baseText(base: string) {
 }
 
 async function machineName() {
-  const wanted = flags.get("name") ?? (flags.has("yes") ? defaultName() : await ask("What should Driver call this computer?", defaultName()));
+  const wanted = flags.get("name") ?? (flags.has("yes") ? defaultName() : await ask("What should 10 & 2 call this computer?", defaultName()));
   // 10 & 2 keeps a machine's name to one word (it's part of every thread's id); say so rather than change it quietly.
   const name = oneWord(wanted);
   if (name !== wanted) say(`    ${dim(`It'll be ${bold(name)}: one word, so it can name your threads.`)}`);
@@ -320,7 +320,7 @@ async function offerHelpers(choice: Choice) {
   }
   if (!helpers.length) return;
   const names = helpers.map((h) => h.name).join(" and ");
-  if (!flags.has("yes") && !await confirm(`Let Driver answer questions and reach open sessions? It adds the ${names}`, true)) {
+  if (!flags.has("yes") && !await confirm(`Let 10 & 2 answer questions and reach open sessions? It adds the ${names}`, true)) {
     note(dim(`Not added. ${helpers.map((h) => cmd(h.undo.replace("uninstall", "install"))).join(" and ")} adds ${helpers.length > 1 ? "them" : "it"} later.`));
     return;
   }
@@ -523,14 +523,14 @@ async function status() {
   }
   if (policy.claude) {
     const h = await hooksStatus(claudeDir()).catch(() => null);
-    if (!h?.installed) note(dim(`${cmd("10and2 hooks install")} lets Driver answer Claude Code's questions, and makes updates instant`));
+    if (!h?.installed) note(dim(`${cmd("10and2 hooks install")} lets 10 & 2 answer Claude Code's questions, and makes updates instant`));
     const db = join(stateDirectory(), "claude.db");
     if (existsSync(db)) {
       const conn = new DatabaseSync(db, { readOnly: true });
       try {
         const runs = conn.prepare("SELECT sessionId, pid FROM claude_runs WHERE pid IS NOT NULL").all() as { sessionId: string; pid: number }[];
         const live = runs.filter((r) => { try { process.kill(r.pid, 0); return true; } catch { return false; } });
-        if (live.length) note(`Claude Code runs Driver started, still going: ${live.map((r) => `${r.sessionId} (pid ${r.pid})`).join(", ")}`);
+        if (live.length) note(`Claude Code runs 10 & 2 started, still going: ${live.map((r) => `${r.sessionId} (pid ${r.pid})`).join(", ")}`);
       } catch { /* an older or empty database */ } finally { conn.close(); }
     }
   }

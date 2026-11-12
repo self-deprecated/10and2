@@ -134,7 +134,7 @@ test("with steering off, an open Pi is refused in words and nothing is sent", as
   const h = harness(t, { policy: { steer: false } }), s = h.completed(); const lines = await h.live(s.id, "idle");
   await h.adapter.start();
   const why = await h.adapter.check(follow(s.id, "x"));
-  assert.equal(why, "It's open in Pi, and this computer doesn't let Driver send to open sessions.");
+  assert.equal(why, "It's open in Pi, and this computer doesn't let 10 & 2 send to open sessions.");
   assert.equal(h.adapter.refusals()[s.id]?.follow_up, why);
   const r = await h.adapter.execute(follow(s.id, "x"), "no-steer");
   assert.deepEqual(r, { ok: false, error: why });
@@ -157,7 +157,7 @@ test("the extension's question is answered with the option the user named, else 
   const off = harness(t, { policy: { answer: false } }), o = off.completed();
   const none = await off.live(o.id, "waiting", { questions: [{ questionId: "q8", title: "Which?", options: ["A"] }] });
   await off.adapter.start();
-  assert.match((await off.adapter.check(follow(o.id, "A")))!, /doesn't let Driver answer/);
+  assert.match((await off.adapter.check(follow(o.id, "A")))!, /doesn't let 10 & 2 answer/);
   assert.equal(none.length, 0);
 });
 

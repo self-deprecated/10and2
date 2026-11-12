@@ -112,7 +112,7 @@ export function summary(c: Choice, found: Found[]): string[] {
   const reach = ORDER.filter((a) => c.on[a]).map((a) => NAMES[a]);
   const offFound = ORDER.filter((a) => !c.on[a] && found.find((f) => f.agent === a)?.installed).map((a) => NAMES[a]);
   const all = CAPS.filter((cap) => c.caps[cap]).flatMap((cap) => ({ follow_up: ["follow up"], steer: ["steer an open session"], answer: ["answer questions"], start_work: ["start new work"], tidy: ["settle", "snooze", "archive"] })[cap]);
-  const lines = [`Driver can reach ${list(reach)}${offFound.length ? ` (${list(offFound)} ${offFound.length === 1 ? "is" : "are"} off)` : ""}, and can ${all.length ? list(all) : "only read"}: each only after you hear it read back and say yes.`];
+  const lines = [`10 & 2 can reach ${list(reach)}${offFound.length ? ` (${list(offFound)} ${offFound.length === 1 ? "is" : "are"} off)` : ""}, and can ${all.length ? list(all) : "only read"}: each only after you hear it read back and say yes.`];
   for (const a of ORDER) {
     const off = (c.off[a] ?? []).filter((cap) => c.on[a] && c.caps[cap]);
     if (off.length) lines.push(`For ${NAMES[a]}: ${off.map((cap) => "no " + ({ follow_up: "follow-ups", steer: "steering", answer: "answering", start_work: "new work", tidy: "tidying" })[cap]).join(", ")}.`);
@@ -151,11 +151,11 @@ export async function chooseInteractively(found: Found[], start: Choice): Promis
       const narrowed = (c.off[a] ?? []).filter((cap) => c.caps[cap]).length;
       return { kind: "box", label: NAMES[a], detail: describeFound(f) + (narrowed ? ` · ${narrowed} switched off` : ""), on: c.on[a] && f.installed, disabled: !f.installed && !c.on[a], open: true };
     });
-    const picked = await checklist("Coding agents on this computer", rows, "↑↓ move · space switch on/off · → what Driver may do with it · enter continue · q quit");
+    const picked = await checklist("Coding agents on this computer", rows, "↑↓ move · space switch on/off · → what 10 & 2 may do with it · enter continue · q quit");
     picked.rows.forEach((r, i) => { if (r.kind === "box") c.on[ORDER[i]!] = r.on; });
     if (picked.open === undefined) break;
     const a = ORDER[picked.open]!;
-    const own = await checklist(`${NAMES[a]}: what Driver may do`, CAPS.map((cap) => ({
+    const own = await checklist(`${NAMES[a]}: what 10 & 2 may do`, CAPS.map((cap) => ({
       kind: "box", label: CAP_LABEL[cap], on: c.caps[cap] && !(c.off[a] ?? []).includes(cap), disabled: !c.caps[cap],
       detail: !c.caps[cap] ? "off for every agent" : (c.off[a] ?? []).includes(cap) ? `off for ${NAMES[a]}` : CAP_DETAIL[cap] ?? "" })),
       "space switch · ← or enter back · q quit · only narrows: what's off for every agent stays off", { back: true });
@@ -165,7 +165,7 @@ export async function chooseInteractively(found: Found[], start: Choice): Promis
     ...CAPS.map((cap): Row => ({ kind: "box", label: CAP_LABEL[cap], detail: CAP_DETAIL[cap] ?? "", on: c.caps[cap] })),
     { kind: "choice", label: "New work may run with", options: RUNTIME_MODES.map((m) => CEILING_LABEL[m]), index: RUNTIME_MODES.indexOf(c.ceiling) },
   ];
-  const got = await checklist("What Driver may do (each only after you hear it read back and say yes)", rows, "space switch · ←→ change · enter continue · q quit");
+  const got = await checklist("What 10 & 2 may do (each only after you hear it read back and say yes)", rows, "space switch · ←→ change · enter continue · q quit");
   CAPS.forEach((cap, i) => { const r = got.rows[i]!; if (r.kind === "box") c.caps[cap] = r.on; });
   const last = got.rows.at(-1)!;
   if (last.kind === "choice") c.ceiling = RUNTIME_MODES[last.index]!;

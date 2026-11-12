@@ -71,11 +71,11 @@ test("flags choose without a terminal, and narrow one agent when given names", (
   assert.throws(() => applyFlags(start, flags({ agents: "claude,cursor" })), /no agent called "cursor"/);
 });
 
-test("the closing words say who Driver reaches, what it may do, and what's narrower", () => {
+test("the closing words say who 10 & 2 reaches, what it may do, and what's narrower", () => {
   const c: Choice = { ...defaultChoice(found({ claude: true, codex: true, pi: true, opencode: true })), off: { codex: ["steer", "start_work"] } };
   c.on.opencode = false;
   const lines = summary(c, found({ claude: true, codex: true, pi: true, opencode: true }));
-  assert.match(lines[0]!, /^Driver can reach Claude Code, Codex and Pi \(OpenCode is off\), and can follow up, steer an open session/);
+  assert.match(lines[0]!, /^10 & 2 can reach Claude Code, Codex and Pi \(OpenCode is off\), and can follow up, steer an open session/);
   assert.equal(lines[1], "For Codex: no steering, no new work.");
   const none = summary({ ...c, caps: { follow_up: false, steer: false, answer: false, start_work: false, tidy: false } }, found({ claude: true }));
   assert.match(none[0]!, /can only read/);

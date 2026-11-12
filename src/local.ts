@@ -81,7 +81,7 @@ export class Local implements Adapter {
   report(id: string): Promise<Report> { const r = this.route(id); return r.e.adapter.report(r.id); }
   replies(id: string): Promise<PastReply[]> { const r = this.route(id); return r.e.adapter.replies?.(r.id) ?? Promise.resolve([]); }
   async check(a: Action): Promise<string | null> {
-    if (!allows(this.policy, a.kind)) return `Driver isn't allowed to ${a.kind.replaceAll("_", " ")} on this machine.`;
+    if (!allows(this.policy, a.kind)) return `10 & 2 isn't allowed to ${a.kind.replaceAll("_", " ")} on this machine.`;
     if (a.kind === "start_work" && !withinCeiling(this.policy, a.profile)) return `The ${a.profile.name} profile asks for more access than this machine allows.`;
     const r = this.route(target(a));
     if (!r.e.adapter.actions.includes(a.kind)) return `This work system can't ${a.kind.replaceAll("_", " ")}.`;

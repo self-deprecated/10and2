@@ -156,7 +156,7 @@ test("with steering off, open sessions are refused in words and a session nothin
   } });
   fake.begin(busy, "Slow work");
   await until(async () => (await adapter.list()).find((i) => i.id === busy)!.status === "running");
-  const refusal = "It's open in Codex, and this computer doesn't let Driver send to open sessions.";
+  const refusal = "It's open in Codex, and this computer doesn't let 10 & 2 send to open sessions.";
   assert.equal(await adapter.check(follow(busy, "x")), refusal);
   assert.equal(await adapter.check(follow(open, "x")), refusal);
   assert.deepEqual(adapter.refusals()[open], { follow_up: refusal });
@@ -199,7 +199,7 @@ test("a session another Codex process writes, or one on another provider, is ref
     provider = fake.thread(cwd, { refuse: "provider" }).id;
   } });
   const a = await adapter.execute(follow(writer, "Hi"), "w");
-  assert.equal(a.ok, false); if (!a.ok) { assert.equal(a.unknown, undefined); assert.match(a.error, /open in a Codex window Driver can't reach/); }
+  assert.equal(a.ok, false); if (!a.ok) { assert.equal(a.unknown, undefined); assert.match(a.error, /open in a Codex window 10 & 2 can't reach/); }
   const b = await adapter.execute(follow(provider, "Hi"), "p");
   assert.equal(b.ok, false); if (!b.ok) { assert.equal(b.unknown, undefined); assert.match(b.error, /different AI provider/); assert.doesNotMatch(b.error, /mock|other/); }
   assert.equal(fake.count("turn/start"), 0);
@@ -256,7 +256,7 @@ test("new work with a worktree profile runs in a fresh worktree inside the proje
   const r = await adapter.execute({ kind: "start_work", placeId: place, message: "Build it", profile: build }, "wt-1");
   assert.equal(r.ok, true, JSON.stringify(r));
   const cwd: string = fake.last("thread/start").cwd;
-  assert.match(cwd, /[/]\.codex[/]worktrees[/]driver-[0-9a-f]{12}$/);
+  assert.match(cwd, /[/]\.codex[/]worktrees[/]10and2-[0-9a-f]{12}$/);
   assert.ok(cwd.startsWith(project));
   assert.ok(existsSync(join(cwd, "README")), "the worktree has the project's files");
   assert.equal(execFileSync("git", ["-C", project, "status", "--porcelain"], { encoding: "utf8" }), "", "the worktree stays out of the project's status");
@@ -294,7 +294,7 @@ test("a question that takes only its options isn't answered with other words; wi
   off.fake.begin(id, "Ask me");
   off.fake.ask(id, QUESTION, { questions: QUESTIONS, isBlocking: true });
   await until(async () => (await off.adapter.list())[0]!.pendingQuestion);
-  assert.match((await off.adapter.check(follow(id, "Beta")))!, /doesn't let Driver answer them/);
+  assert.match((await off.adapter.check(follow(id, "Beta")))!, /doesn't let 10 & 2 answer them/);
 });
 
 test("commands are never approved: a follow-up to a session waiting for an OK says what it wants to run", async (t) => {
@@ -304,14 +304,14 @@ test("commands are never approved: a follow-up to a session waiting for an OK sa
   fake.ask(id, "item/commandExecution/requestApproval", { kind: "command", command: "rm -rf build", reason: "Remove old output?", startedAtMs: Date.now() });
   await until(async () => (await adapter.report(id)).question === "Codex wants to run rm -rf build. Remove old output?");
   const why = await adapter.check(follow(id, "Yes, go ahead"));
-  assert.equal(why, "Codex is waiting for your OK: it wants to run rm -rf build. Driver can't approve that, so answer it in Codex.");
+  assert.equal(why, "Codex is waiting for your OK: it wants to run rm -rf build. 10 & 2 can't approve that, so answer it in Codex.");
   assert.deepEqual(await adapter.execute(follow(id, "Yes, go ahead"), "approve"), { ok: false, error: why });
   await pause(50);
   assert.equal(fake.answers.length, 0, "never answered");
   assert.equal(fake.count("turn/start") + fake.count("turn/steer"), 0);
 });
 
-test("an outcome Driver can't confirm is unknown, and never sent again", async (t) => {
+test("an outcome 10 & 2 can't confirm is unknown, and never sent again", async (t) => {
   let id = "", taken = "";
   const { fake, adapter } = await setup(t, { acceptanceTimeoutMs: 300, before: (fake, cwd) => {
     id = fake.thread(cwd, { status: { type: "idle" } }).id;

@@ -32,7 +32,7 @@ import { describe, spokenHost } from "./util.ts";
 import { spokenPlaces } from "./places.ts";
 import type { ConsentHolder, Props } from "./analytics.ts";
 import { recentDrives, summarize, summaryText } from "./drives.ts";
-import { assemble, dictatedParts, DRAFT_MAX, draftStateOf, isNewThread, mentionedPlaces, newThreadName, parseDraft, parseNewThread, placedTarget, tappedReply, tappedWords, wordCount, type Draft, type NewThread } from "./drafts.ts";
+import { assemble, dictatedParts, DRAFT_MAX, draftStateOf, isNewThread, mentionedPlaces, newThreadName, parseDraft, parseNewThread, placedTarget, REPLY_PARTS_MAX, tappedReplies, tappedReply, tappedWords, wordCount, type Draft, type NewThread } from "./drafts.ts";
 import { confirmOf, parseUntil, READBACK_ALL, tapVia, trackChange, type ConfirmLevels, type KeepReplies, type TapAction } from "./proposals.ts";
 import { SHOWN, timeline, timelineQuery } from "./timeline.ts";
 import { merge, ownOf, parseOwn, STORE_KEY as VOCABULARY_KEY } from "./vocabulary.ts";
@@ -122,6 +122,8 @@ const MAX_BODY = 128 * 1024;
 const CONVERSATION_ID = /^[\w-]{8,64}$/;
 /** How long the phone's memory setting keeps notes when a client doesn't say (the desk page, older apps). */
 const DEFAULT_MEMORY_DAYS = 3;
+/** How far back `GET /api/usage` counts. */
+const USAGE_DAYS = 30;
 /**
  * A Start within this long of the last conversation's last session rejoins it, rather than begin a new one: the user
  * stopping and starting again, or a reading or dictation it handed off ending, isn't the end of a conversation.
@@ -873,7 +875,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
 
   /** What became of a proposal answered with a tap, as the phone shows it: like any tap's answer (`tapAnswer`). */
   function answerOf(verb: "confirm" | "cancel", p: Proposal): Response {
-    const expired = "That waited too long for a yes, so nothing was changed. Ask Driver again.";
+    const expired = "That waited too long for a yes, so nothing was changed. Ask again.";
     if (p.state === "expired") return send(409, { error: expired });
     if (verb === "cancel") {
       if (p.state === "cancelled") return send(200, { ok: true, state: "cancelled", result: "Nothing was changed." });
@@ -891,7 +893,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
         return send(409, { error: p.result ?? "That didn't go through." });
       case "cancelled":
         // A sentence from carrying it out ("… so I called this off"), or a short reason: a name changed, a newer change.
-        return send(409, { error: p.result === "a name changed" ? "A thread changed since Driver read this back, so nothing was changed. Ask Driver again." : p.result?.endsWith(".") ? p.result : "That was called off, so nothing was changed." });
+        return send(409, { error: p.result === "a name changed" ? "A thread changed since it was read back, so nothing was changed. Ask again." : p.result?.endsWith(".") ? p.result : "That was called off, so nothing was changed." });
       default:
         return send(409, { error: "Nothing was changed. Try again." });
     }
@@ -953,6 +955,58 @@ function api(cfg: Config, deps: ServerDeps): Api {
       return res;
     } finally {
       sendingKept.delete(kept.id);
+    }
+  }
+
+  /**
+   * A thread's drafts sent as one message (contracts §3, "Drafts sent as one"): `parts`, each the user's words and the
+   * paragraph they answer if they picked one, put together in the order given (`tappedReplies`) and sent as any tapped
+   * reply is (`tapped`: the same `requestId` rules and answers). A part with `keptId` is a reply kept for later in a
+   * call, to this thread, as the phone shows it: no longer kept once the message has gone through, and a dictated
+   * one's first line starts the message.
+   */
+  async function sendParts(body: any): Promise<Response> {
+    const given: unknown[] | null = Array.isArray(body.parts) ? body.parts : null;
+    if (!given?.length || given.length > REPLY_PARTS_MAX) return send(400, { error: `parts must list 1 to ${REPLY_PARTS_MAX} replies` });
+    if (body.requestId === undefined) return send(400, { error: "requestId is required" });
+    if (typeof body.id !== "string" || isNewThread(body.id)) return send(400, { error: "parts are replies to an open thread" });
+    const parts: { text: string; quote: string | null }[] = [];
+    const keptIds: string[] = [];
+    for (const one of given as any[]) {
+      const text = typeof one?.text === "string" ? one.text.trim() : "";
+      if (!text) return send(400, { error: "Write a reply first." });
+      parts.push({ text, quote: typeof one.quote === "string" ? one.quote : null });
+      if (one.keptId !== undefined) {
+        if (typeof one.keptId !== "string" || keptIds.includes(one.keptId)) return send(400, { error: "keptId must be a kept reply's id, once" });
+        keptIds.push(one.keptId);
+      }
+    }
+    const message = tappedReplies(parts);
+    if (message.length > DRAFT_MAX) return send(400, { error: "That reply is too long to send in one go." });
+    // The same words to the same thread: a kept reply's first line is on the message that went, and gone with the reply.
+    const again = earlierTap(body, (p) => p.action === "follow_up" && p.targets[0]?.itemId === body.id && tappedWords(p.fields.message ?? "") === tappedWords(message));
+    if (again) {
+      const answer = await again;
+      // Sent, but still kept only if the brain stopped in between: not any more.
+      if (answer.status === 200) for (const id of keptIds) if (!sendingKept.has(id)) deps.store.dropKept(id);
+      return answer;
+    }
+    const kept = keptIds.map((id) => deps.store.keptReply(id));
+    if (kept.some((k) => !k)) return send(404, { error: "That reply isn't kept any more: it was sent or discarded." });
+    if (kept.some((k) => k!.threadId !== body.id)) return send(400, { error: "That kept reply is for another thread." });
+    if (keptIds.some((id) => sendingKept.has(id))) return send(409, { error: "That reply is being sent right now." });
+    if (namedItems(deps.briefing, true).some((n) => n.id === body.id)) return send(409, { error: "That thread is done, so nothing was sent. Bring it back first, or discard the reply." });
+    for (const id of keptIds) sendingKept.add(id);
+    try {
+      const note = kept.find((k) => k!.note)?.note;
+      const res = await tapped(body, "follow_up", { message: note ? `${note}\n\n${message}` : message });
+      if (res.status === 200) {
+        for (const id of keptIds) deps.store.dropKept(id);
+        if (keptIds.length) deps.analytics?.track("reply_kept", { action: "sent", count: keptIds.length });
+      }
+      return res;
+    } finally {
+      for (const id of keptIds) sendingKept.delete(id);
     }
   }
 
@@ -1162,6 +1216,8 @@ function api(cfg: Config, deps: ServerDeps): Api {
         const body = await readJson(req);
         // A reply kept for later in a call (Not sent): sent as it was kept, or as edited.
         if (body.keptId !== undefined) return sendKept(body, () => deps.analytics?.track("reply_kept", { action: "sent", count: 1 }));
+        // A thread's drafts, sent as one message.
+        if (body.parts !== undefined) return sendParts(body);
         const text = typeof body.text === "string" ? body.text.trim() : "";
         if (!text) return send(400, { error: "Write a reply first." });
         if (text.length > DRAFT_MAX) return send(400, { error: "That reply is too long to send in one go." });
@@ -1173,6 +1229,8 @@ function api(cfg: Config, deps: ServerDeps): Api {
       }
       // Replies kept for later in calls (the phone's Not sent): listed, edited before sending, discarded, or all sent.
       if (req.method === "GET" && url.pathname === "/api/kept") return send(200, { kept: keptRows() });
+      // What the account has done with the app in the last 30 days: the paywall's header (the look, 12 November).
+      if (req.method === "GET" && url.pathname === "/api/usage") return send(200, { days: USAGE_DAYS, ...deps.store.usage(Date.now() - USAGE_DAYS * 86_400_000) });
       // Where a new thread can start (Not sent's picker for a prompt with no project yet), most recently active first.
       if (req.method === "GET" && url.pathname === "/api/places") {
         const places = (deps.adapter.actions.includes("start_work") ? spokenPlaces(deps.adapter.places?.() ?? []) : [])
@@ -1388,7 +1446,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
           updatedAt: view.updatedAt,
           readFailures: view.readFailures,
           opener: view.opener,
-          cards: view.cards.map(({ itemId, handle, title, group, state, summary, ask, suggested, status, unread }) => ({ itemId, handle, title, group, state, summary, ask, suggested, status, unread })),
+          cards: view.cards.map(({ itemId, handle, title, group, state, summary, ask, answers, suggested, status, unread }) => ({ itemId, handle, title, group, state, summary, ask, answers: answers ?? [], suggested, status, unread })),
           unread: view.cards.filter((c) => c.unread).length,
           clutter: { total: view.clutterTotal, groups: view.clutter.map(({ parent, group, count }) => ({ parent, group, count })) },
           snoozed: view.snoozed,

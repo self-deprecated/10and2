@@ -60,14 +60,14 @@ export function shortTitle(text: string): string {
 
 /** How much of a new session file is read before deciding whether it's one Driver lists (its header says where it ran). */
 const HEAD_BYTES = 64 * 1024;
-const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whether Pi received that. Driver won't send it again." };
-const NO_STEERING = "It's open in Pi, and this computer doesn't let Driver send to open sessions.";
-const NO_ANSWERING = "It's waiting for an answer in Pi, and this computer doesn't let Driver answer.";
-const OTHER_DIALOG = "It's waiting for an answer in Pi that Driver can't give. Answer it in Pi.";
+const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whether Pi received that. 10 & 2 won't send it again." };
+const NO_STEERING = "It's open in Pi, and this computer doesn't let 10 & 2 send to open sessions.";
+const NO_ANSWERING = "It's waiting for an answer in Pi, and this computer doesn't let 10 & 2 answer.";
+const OTHER_DIALOG = "It's waiting for an answer in Pi that 10 & 2 can't give. Answer it in Pi.";
 const NO_FULL_ACCESS_START = "Pi runs its tools without asking, so this computer's settings don't allow starting it.";
 const NO_FULL_ACCESS_CONTINUE = "Pi runs its tools without asking, so this computer's settings don't allow continuing it while it's closed.";
-const NO_EXTENSION = "Driver can't tell whether that session is open in Pi. Running 10and2 pi install on this computer fixes that.";
-const UNREACHABLE = "Driver couldn't reach that session. Is it still open?";
+const NO_EXTENSION = "10 & 2 can't tell whether that session is open in Pi. Running 10and2 pi install on this computer fixes that.";
+const UNREACHABLE = "10 & 2 couldn't reach that session. Is it still open?";
 
 type Row = { session: PiSession | null; cwd: string; live: Live | null; item: WorkItem };
 
@@ -282,7 +282,7 @@ export class PiAdapter implements Adapter {
   async list(): Promise<WorkItem[]> { this.fresh(); return [...this.rows.values()].map((r) => ({ ...r.item })); }
   private row(id: string): Row {
     const row = this.rows.get(id);
-    if (!row || !visible(this.opts.policy, row.cwd)) throw new Error("That session isn't visible to Driver.");
+    if (!row || !visible(this.opts.policy, row.cwd)) throw new Error("That session isn't visible to 10 & 2.");
     return row;
   }
   async report(id: string): Promise<Report> {
@@ -307,16 +307,16 @@ export class PiAdapter implements Adapter {
     if (!allows(policy, action.kind, "pi")) return "This machine's local policy doesn't allow that action.";
     if (action.kind === "start_work") {
       if (action.title?.trimStart().startsWith("-")) return "A session title must not start with a dash.";
-      if (!this.roots.has(action.placeId)) return "That project isn't visible to Driver.";
+      if (!this.roots.has(action.placeId)) return "That project isn't visible to 10 & 2.";
       const worktrees = join(this.roots.get(action.placeId)!, ".pi", "worktrees");
-      if (action.profile.workspace === "worktree" && existsSync(worktrees) && !visible(this.opts.policy, worktrees)) return "That project's worktree folder is outside Driver's visible folders.";
-      if (action.profile.interactionMode === "plan") return "Pi has no plan mode, so Driver can't start it with a plan first. Choose a profile without one.";
+      if (action.profile.workspace === "worktree" && existsSync(worktrees) && !visible(this.opts.policy, worktrees)) return "That project's worktree folder is outside 10 & 2's visible folders.";
+      if (action.profile.interactionMode === "plan") return "Pi has no plan mode, so 10 & 2 can't start it with a plan first. Choose a profile without one.";
       if (!withinCeiling(policy, { runtimeMode: "full-access" }, "pi")) return NO_FULL_ACCESS_START;
       if (action.profile.runtimeMode !== "full-access") return "Pi runs its tools without asking, so it only starts with a full-access profile.";
       return null;
     }
     const row = this.rows.get(action.itemId);
-    if (!row) return "That session isn't visible to Driver.";
+    if (!row) return "That session isn't visible to 10 & 2.";
     if (action.kind === "snooze" && !Number.isFinite(Date.parse(action.until))) return "That snooze time isn't valid.";
     if (action.kind === "follow_up") return this.followUpRefusal(action.itemId, row);
     return null;
@@ -329,12 +329,12 @@ export class PiAdapter implements Adapter {
       if (row.live.status === "waiting") return OTHER_DIALOG;
       return steers(policy, "pi") ? null : NO_STEERING;
     }
-    if (this.store.run(id)) return "Driver is already running that session, or can't yet tell that its last run ended.";
+    if (this.store.run(id)) return "10 & 2 is already running that session, or can't yet tell that its last run ended.";
     if (!withinCeiling(policy, { runtimeMode: "full-access" }, "pi")) return NO_FULL_ACCESS_CONTINUE;
     // Without the extension an open Pi is invisible, and a second Pi on the session would split it into branches.
     if (!this.extension) return NO_EXTENSION;
     if (!row.session) return "That session has nothing in it yet.";
-    if ((row.session.version ?? 0) > 3) return "This session uses a Pi session format Driver doesn't understand yet.";
+    if ((row.session.version ?? 0) > 3) return "This session uses a Pi session format 10 & 2 doesn't understand yet.";
     if (!existsSync(row.cwd)) return "That session's folder isn't on this computer anymore.";
     return null;
   }
@@ -380,8 +380,8 @@ export class PiAdapter implements Adapter {
       }
     }
     const id = action.kind === "start_work" ? sessionForKey(key) : action.itemId;
-    if (this.store.run(id)) return { ok: false, error: "Driver is already running that session." };
-    if (!this.store.begin(key, digest, id)) return this.repeat(key, digest) ?? { ok: false, error: "Driver is already running that session." };
+    if (this.store.run(id)) return { ok: false, error: "10 & 2 is already running that session." };
+    if (!this.store.begin(key, digest, id)) return this.repeat(key, digest) ?? { ok: false, error: "10 & 2 is already running that session." };
     return this.tracked(this.launch(action, key, id));
   }
   /** The outcome of an operation key used before, or null for a new one. */
@@ -402,7 +402,7 @@ export class PiAdapter implements Adapter {
     this.schedule();
     // The extension's ack is Pi itself saying it took the words.
     if (r === "unreachable") return this.store.finish(key, { ok: false, error: UNREACHABLE });
-    if (r === "silent") return this.store.finish(key, { ok: false, unknown: true, error: "That session didn't confirm the message. Driver won't send it again." });
+    if (r === "silent") return this.store.finish(key, { ok: false, unknown: true, error: "That session didn't confirm the message. 10 & 2 won't send it again." });
     if (r.type === "ack") return this.store.finish(key, { ok: true });
     return this.store.finish(key, { ok: false, error: "That session didn't take the message." });
   }
@@ -414,7 +414,7 @@ export class PiAdapter implements Adapter {
     const r = await talk(live.socket, { id: randomUUID(), type: "answer", questionId: q.questionId, value }, this.opts.acceptanceTimeoutMs ?? 5000);
     this.schedule();
     if (r === "unreachable") return this.store.finish(key, { ok: false, error: UNREACHABLE });
-    if (r === "silent") return this.store.finish(key, { ok: false, unknown: true, error: "Pi may have had its answer already. Driver won't send it again." });
+    if (r === "silent") return this.store.finish(key, { ok: false, unknown: true, error: "Pi may have had its answer already. 10 & 2 won't send it again." });
     if (r.type === "ack") return this.store.finish(key, { ok: true });
     return this.store.finish(key, { ok: false, error: "That question was already answered in Pi." });
   }
@@ -435,7 +435,7 @@ export class PiAdapter implements Adapter {
     const sessionPath = row?.session?.path ?? null;
     let baseline = 0;
     if (sessionPath) { try { baseline = statSync(sessionPath).size; } catch { /* gone: everything in it is new */ } }
-    if (!cwd || (!starting && !sessionPath)) { this.store.ended(id); return this.store.finish(key, { ok: false, error: "That session isn't visible to Driver." }); }
+    if (!cwd || (!starting && !sessionPath)) { this.store.ended(id); return this.store.finish(key, { ok: false, error: "That session isn't visible to 10 & 2." }); }
     const turn: Turn = { pi: this.opts.piBin ?? "pi", cwd, message: action.message,
       ...(starting ? { sessionId: id, ...(action.title ? { name: action.title } : {}) } : { session: sessionPath! }) };
     const token = hash(key).slice(0, 24), stderrPath = join(this.opts.stateDir, `${token}.stderr.log`);
@@ -447,13 +447,13 @@ export class PiAdapter implements Adapter {
     };
     let err: number;
     try { err = openSync(stderrPath, "wx", 0o600); }
-    catch { this.store.ended(id); return finish({ ok: false, error: "Driver couldn't create a private run log." }); }
+    catch { this.store.ended(id); return finish({ ok: false, error: "10 & 2 couldn't create a private run log." }); }
     let child: ChildProcess;
     try {
       child = spawn(this.opts.nodeBin ?? process.execPath, [this.opts.entryScript ?? process.argv[1]!, "pi-turn"], { cwd, detached: true, env: this.childEnv(), stdio: ["pipe", "ignore", err] });
     } catch {
       closeSync(err); this.store.ended(id);
-      return finish({ ok: false, error: "Driver couldn't start Pi on this machine." });
+      return finish({ ok: false, error: "10 & 2 couldn't start Pi on this machine." });
     }
     closeSync(err);
     const pid = child.pid;

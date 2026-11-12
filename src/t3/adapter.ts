@@ -339,7 +339,7 @@ export class T3Adapter implements Adapter {
   }
 
   async markRead(itemId: string, watermark: string, idempotencyKey: string): Promise<Receipt | "unsupported"> {
-    if (!this.itemVisible(itemId)) return { ok: false, error: "That thread is outside Driver's visible projects." };
+    if (!this.itemVisible(itemId)) return { ok: false, error: "That thread is outside 10 & 2's visible projects." };
     // Until a snapshot has come, it isn't known whether this T3 tracks visits: try again later.
     if (!this.loaded || !this.client) return { ok: false, error: "T3 is not connected right now." };
     if (!this.visits) return "unsupported";
@@ -381,16 +381,16 @@ export class T3Adapter implements Adapter {
   }
 
   private requireVisible(id: string) {
-    if (!this.itemVisible(id)) throw new Error("That thread is outside Driver's visible projects.");
+    if (!this.itemVisible(id)) throw new Error("That thread is outside 10 & 2's visible projects.");
   }
 
   async check(action: Action): Promise<string | null> {
     const allowed = action.kind === "start_work" ? this.projectVisible(action.placeId) : this.itemVisible(action.itemId);
-    return allowed ? null : "That project is outside Driver's visible projects, or is no longer in T3.";
+    return allowed ? null : "That project is outside 10 & 2's visible projects, or is no longer in T3.";
   }
 
   async execute(action: Action, idempotencyKey: string): Promise<Receipt> {
-    if (this.revoked) return { ok: false, error: "Driver's access to T3 was revoked." };
+    if (this.revoked) return { ok: false, error: "10 & 2's access to T3 was revoked." };
     const reason = await this.check(action);
     if (reason) return { ok: false, error: reason };
     if (action.kind === "start_work") return this.launch(action, idempotencyKey);
@@ -402,7 +402,7 @@ export class T3Adapter implements Adapter {
   }
 
   private async launch(action: Extract<Action, { kind: "start_work" }>, commandId: string): Promise<Receipt> {
-    if (this.revoked) return { ok: false, error: "Driver's access to T3 was revoked." };
+    if (this.revoked) return { ok: false, error: "10 & 2's access to T3 was revoked." };
     if (!this.client || !this.loaded) return { ok: false, error: "T3 is not connected right now." };
     if (!this.projectInfo.has(action.placeId)) return { ok: false, error: "That project is no longer in T3." };
     const model = this.modelFor(action.placeId);
@@ -440,7 +440,7 @@ export class T3Adapter implements Adapter {
   }
 
   private async dispatch(command: Record<string, unknown>): Promise<Receipt> {
-    if (this.revoked) return { ok: false, error: "Driver's access to T3 was revoked." };
+    if (this.revoked) return { ok: false, error: "10 & 2's access to T3 was revoked." };
     if (!this.client) return { ok: false, error: "T3 is not connected right now." };
     try {
       await this.client.request(M.dispatchCommand, command);

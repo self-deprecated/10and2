@@ -228,7 +228,7 @@ export class Link {
       }
     }
     if (!TOOL_ACTIONS.includes(p.name)) throw new RpcError(ERR.noMethod, "There's no such tool.");
-    if (!a.actions.includes(p.name)) throw invalid(`Driver isn't allowed to ${String(p.name).replaceAll("_", " ")} on this machine.`);
+    if (!a.actions.includes(p.name)) throw invalid(`10 & 2 isn't allowed to ${String(p.name).replaceAll("_", " ")} on this machine.`);
     let action;
     try { action = actionOf({ ...args, kind: p.name }); } catch (e) { throw invalid(describe(e)); }
     if ("kind" in args) throw invalid("Unknown action fields aren't supported.");

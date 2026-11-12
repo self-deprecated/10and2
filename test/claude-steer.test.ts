@@ -153,7 +153,7 @@ test("Claude's question, held by the hook, is read out with its options and answ
     updatedInput: { questions, answers: { "Should lap times show seconds or milliseconds?": "Milliseconds" } } } } });
 });
 
-test("a question answered in the terminal lets the hook go with nothing; one Driver doesn't list is never held", async (t) => {
+test("a question answered in the terminal lets the hook go with nothing; one 10 & 2 doesn't list is never held", async (t) => {
   const h = harness(t), { f, questions } = asking(h); await h.adapter.start();
   let printed = "";
   const hook = relayHook(JSON.stringify({ session_id: f.id, hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion", tool_input: { questions } }), h.adapter.socketPath, (s) => { printed += s; });
@@ -209,7 +209,7 @@ test("new work starts as a background session, named, in a worktree or kept in t
   assert.equal(started.ok, true);
   const call = calls(h.config).find((c) => c.bg)!;
   assert.deepEqual(call.args.slice(0, 5), ["--bg", "--permission-mode", "bypassPermissions", "--name", "Fastest lap"]);
-  assert.equal(call.args[call.args.indexOf("--worktree") + 1].startsWith("driver-"), true);
+  assert.equal(call.args[call.args.indexOf("--worktree") + 1].startsWith("10and2-"), true);
   assert.deepEqual(call.args.slice(-2), ["--", "--show the fastest lap"], "the words can't be read as an option");
   if (started.ok) { assert.match(started.itemId!, /^[0-9a-f]{8}-/); await until(async () => (await h.adapter.list()).some((i) => i.id === started.itemId)); }
 
@@ -269,7 +269,7 @@ test("with steering off, a session open in a terminal is refused in words; with 
   const sent = await inbox(t, sock);
   h.registry(f.id, "waiting", { messagingSocketPath: sock });
   await h.adapter.start();
-  assert.match((await h.adapter.check({ kind: "follow_up", itemId: f.id, message: "x" }))!, /doesn't let Driver send to open sessions/);
+  assert.match((await h.adapter.check({ kind: "follow_up", itemId: f.id, message: "x" }))!, /doesn't let 10 & 2 send to open sessions/);
   const r = await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "x" }, "no-steer");
   assert.equal(r.ok, false);
   assert.equal(sent.length, 0);

@@ -292,7 +292,7 @@ export class CallView {
     all.forEach((k, i) => {
       if (this.words.has(k.id)) return;
       const after = i > 0 ? all[i - 1].at : -Infinity;
-      const said = turns.filter((t) => t.at > after && t.at <= k.at).slice(-4).map((t) => `${t.role === "user" ? "You" : "Driver"}: ${t.text}`);
+      const said = turns.filter((t) => t.at > after && t.at <= k.at).slice(-4).map((t) => `${t.role === "user" ? "You" : "10 & 2"}: ${t.text}`);
       this.words.set(k.id, said.length ? cut(said.join("\n"), WORDS_MAX) : null);
     });
   }

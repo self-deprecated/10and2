@@ -143,7 +143,7 @@ export function sinceText(store: Store, last: Drive, items: WorkItem[], view: Br
   const others = view.cards.filter((c) => c.unread && c.reply && Date.parse(c.reply.at) > last.end && !acted.includes(c.itemId)).length;
   if (!lines.length && !others) return null;
   return [
-    `Since the user's last drive with Driver (it ended ${when(last.end)}):`,
+    `Since the user's last drive (it ended ${when(last.end)}):`,
     lines.length ? `${list(lines)}.` : "",
     others ? `${others} other ${others === 1 ? "thread has a new reply" : "threads have new replies"} since then (in the briefing).` : "",
     "This is the first conversation of a new drive: in your first answer, unless the user asks something else, sum this up in a sentence or two, starting with the threads they acted on.",
@@ -163,7 +163,7 @@ export function driveBlock(store: Store, conversationId: string, now: number, me
     const done = drivesChanges(store, last).map((p) => datedLine(store, p));
     const text = summaryText(s, done.length ? [`Changes: ${done.join("; ")}.`] : []);
     return text
-      ? `This drive so far (since ${time(last.start)}), from Driver's own record. It is history: none of it is the result of anything the user asks now, so never give it as what you just did; tell it, as dated background, only when the user asks what they got done. ${text}`
+      ? `This drive so far (since ${time(last.start)}), from the app's own record. It is history: none of it is the result of anything the user asks now, so never give it as what you just did; tell it, as dated background, only when the user asks what they got done. ${text}`
       : null;
   }
   return sinceText(store, last, live.items, live.view, live.names);

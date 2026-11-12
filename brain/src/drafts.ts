@@ -127,12 +127,24 @@ export function tappedReply(text: string, paragraph: string | null): string {
   return said ? `> ${said}\n\n${text}` : text;
 }
 
-/** What a tapped reply says, without the dictation's first line (a kept reply's) or the quoted line it may start with. */
-export const tappedWords = (message: string) => dictatedParts(message).text.replace(/^> [^\n]*\n\n/, "");
+/** How many drafts one message carries (`/api/reply`'s `parts`). */
+export const REPLY_PARTS_MAX = 20;
+
+/**
+ * A thread's drafts sent as one message (`/api/reply` with `parts`): each as a tapped reply is, under the quoted start
+ * of the paragraph it answers when it has one, a blank line between them, in the order given.
+ */
+export const tappedReplies = (parts: { text: string; quote: string | null }[]) => parts.map((p) => tappedReply(p.text, p.quote)).join("\n\n");
+
+/**
+ * What a tapped reply says, without the dictation's first line (a kept reply's) or the quoted lines its parts may start
+ * with.
+ */
+export const tappedWords = (message: string) => dictatedParts(message).text.replace(/(^|\n\n)> [^\n]*\n\n/g, "$1");
 
 /** The first line of a dictated message, saying it was dictated: parts answering a reply as it was read, or none. */
-const DICTATED = "(Dictated by voice in Driver and transcribed on my phone, so names and technical words may be misheard.)";
-const DICTATED_READ = "(Dictated by voice in Driver while your reply was read to me, and transcribed on my phone, so names and technical words may be misheard.)";
+const DICTATED = "(Dictated by voice in 10 & 2 and transcribed on my phone, so names and technical words may be misheard.)";
+const DICTATED_READ = "(Dictated by voice in 10 & 2 while your reply was read to me, and transcribed on my phone, so names and technical words may be misheard.)";
 
 /** A message as its first line saying it was dictated (`note`), if it has one, and the user's words after it. */
 export function dictatedParts(message: string): { note: string | null; text: string } {

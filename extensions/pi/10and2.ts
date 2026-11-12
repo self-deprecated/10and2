@@ -154,11 +154,11 @@ export default function (pi: ExtensionAPI) {
 	// Test only: a model can't be made to ask in tests, so this command takes the path an ask tool would.
 	if (process.env.TENANDTWO_PI_TEST === "1") {
 		pi.registerCommand("tt-ask", {
-			description: "10 & 2 test: ask a question Driver can answer",
+			description: "10 & 2 test: ask a question 10 & 2 can answer",
 			handler: async (args, c) => {
 				const r = await ask(c, args || "Which database?", ["Postgres", "SQLite", "Skip"]);
 				pi.appendEntry("tenandtwo-answer", r);
-				c.ui.notify(`Answer: ${r.value ?? "none"} (${r.via === "connector" ? "from Driver" : "here"})`, "info");
+				c.ui.notify(`Answer: ${r.value ?? "none"} (${r.via === "connector" ? "from 10 & 2" : "here"})`, "info");
 			},
 		});
 	}

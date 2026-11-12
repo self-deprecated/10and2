@@ -75,7 +75,7 @@ test("Pi: list, read, steer idle and busy, answer a question, continue a closed 
     await until("the question to be listed", async () => (await adapter.list()).find((i) => i.id === id)?.pendingQuestion === true);
     assert.equal((await adapter.report(id)).question, "Which database? Options: Postgres / SQLite / Skip.");
     assert.deepEqual(await follow("answer", "SQLite, please"), { ok: true });
-    await until("the terminal to show the answer", () => tui.screen().includes("Answer: SQLite (from Driver)"));
+    await until("the terminal to show the answer", () => tui.screen().includes("Answer: SQLite (from 10 & 2)"));
     await until("the question to be gone", async () => (await adapter.list()).find((i) => i.id === id)?.pendingQuestion === false);
   });
 
@@ -110,7 +110,7 @@ test("Pi: list, read, steer idle and busy, answer a question, continue a closed 
     const itemId = started.ok ? started.itemId! : "";
     await until("the new work to be listed and read", async () => (await adapter.list()).some((i) => i.id === itemId && i.title === "Harness start")
       && (await adapter.report(itemId)).text === "ACK Start words STARTONE", 30_000);
-    assert.ok(readdirSync(join(cwd, ".pi", "worktrees")).some((d) => d.startsWith("driver-")), "it ran in a worktree");
+    assert.ok(readdirSync(join(cwd, ".pi", "worktrees")).some((d) => d.startsWith("10and2-")), "it ran in a worktree");
     assert.deepEqual(adapter.places().map((p) => p.id), [place], "the worktree isn't a project of its own");
   });
 });

@@ -47,21 +47,21 @@ const git = (root: string, ...args: string[]) => new Promise<string | null>((don
   execFile("git", ["-C", root, ...args], { timeout: 60_000 }, (e, out) => done(e ? null : String(out).trim())));
 
 /**
- * A fresh worktree for new work Driver starts, at `<root>/<dir>/driver-<id>` on the branch `driver/<id>`, kept out of
+ * A fresh worktree for new work Driver starts, at `<root>/<dir>/10and2-<id>` on the branch `10and2/<id>`, kept out of
  * the project's own git status. It starts from `base` (the policy's `worktreeBase`): a branch, fetched from origin first,
  * or "HEAD". A folder that isn't in a git repository has nothing to branch, so the work runs in the folder itself.
  */
 export async function addWorktree(root: string, dir: string, id: string, base = "HEAD"): Promise<string> {
   const start = await worktreeStart(root, base);
   if (start === null) return root;
-  const path = join(root, dir, `driver-${id}`);
+  const path = join(root, dir, `10and2-${id}`);
   if (existsSync(path)) return path;
   let ref = "HEAD";
   if (start !== "HEAD") {
     await git(root, "fetch", "--quiet", "origin", start);
     ref = await git(root, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${start}^{commit}`) ? `origin/${start}` : start;
   }
-  if (await git(root, "worktree", "add", "-B", `driver/${id}`, path, ref) === null) throw new Error("Driver couldn't make a worktree in that project.");
+  if (await git(root, "worktree", "add", "-B", `10and2/${id}`, path, ref) === null) throw new Error("10 & 2 couldn't make a worktree in that project.");
   const common = await git(root, "rev-parse", "--git-common-dir");
   if (common) {
     const exclude = join(isAbsolute(common) ? common : join(root, common), "info", "exclude"), line = `/${dir}/`;

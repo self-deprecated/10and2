@@ -107,7 +107,7 @@ export class Machines implements Adapter {
 
   async check(action: Action): Promise<string | null> {
     const r = this.route(action.kind === "start_work" ? action.placeId : action.itemId);
-    if (!r.m.adapter.actions.includes(action.kind)) return `Driver isn't allowed to ${action.kind.replaceAll("_", " ")} on ${r.m.said ?? spoken(r.m.name)}.`;
+    if (!r.m.adapter.actions.includes(action.kind)) return `The app isn't allowed to ${action.kind.replaceAll("_", " ")} on ${r.m.said ?? spoken(r.m.name)}.`;
     const local = action.kind === "start_work" ? { ...action, placeId: r.id } : { ...action, itemId: r.id };
     return r.m.adapter.check?.(local) ?? null;
   }

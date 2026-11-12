@@ -84,7 +84,7 @@ const WRITE_SCHEMA = {
   },
 };
 
-const WRITE_INSTRUCTIONS = `You write one reply for a coding agent in a live demo of Driver, a voice assistant that lets a developer talk to their coding agents while driving. The developer just sent the agent a message (or started a new thread with it). Write the agent's reply after doing that work, as if it went well.
+const WRITE_INSTRUCTIONS = `You write one reply for a coding agent in a live demo of Ten and Two, a voice assistant that lets a developer talk to their coding agents while driving. The developer just sent the agent a message (or started a new thread with it). Write the agent's reply after doing that work, as if it went well.
 - 50 to 110 words of plain prose: no markdown, lists, code blocks, links or file paths longer than a file name. It will be read aloud.
 - Concrete and believable: what was changed, numbers of tests passing, what's committed or not. Stay within the thread's project.
 - End with what's left, or one short question for the developer.

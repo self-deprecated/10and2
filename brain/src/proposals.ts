@@ -199,7 +199,7 @@ const stillWorking = (t: { handle: string; group?: string }) =>
   `${saidBefore(t)} is still working, and T3 can't settle a thread while it runs. Say so: it can be settled once it finishes.`;
 
 const tooAlike = (c: { target: string; other: string }) =>
-  `${c.target} and ${c.other} are named too alike for Driver to tell apart by voice. Tell the user to do this in T3 Code, or to rename one of them.`;
+  `${c.target} and ${c.other} are named too alike for the app to tell apart by voice. Tell the user to do this in T3 Code, or to rename one of them.`;
 
 /** Parses the model's `until`: a date (8 AM local) or a local/zoned date-time, in the future. */
 export function parseUntil(until: string, now: number): Date | null {
@@ -345,7 +345,7 @@ function badMessage(message: string): string | null {
 export function pickPlace(spoken: string, given: Place[]): { place: Place } | { error: string } {
   // Said as the user can say them: no two alike (places.ts).
   const places = spokenPlaces(given);
-  if (!places.length) return { error: "Driver can't see any projects right now: their machines may be unreachable. Say so." };
+  if (!places.length) return { error: "The app can't see any projects right now: their machines may be unreachable. Say so." };
   const words = spoken.replace(/\b(project|repo|repository|machine)\b/gi, " ").trim();
   const named = places.map((p) => ({ id: p.id, handle: p.name, group: "", title: p.name.replace(/, on [\w-]+$/, "") }));
   const r = words ? resolve(words, named) : { kind: "none" as const };
@@ -389,7 +389,7 @@ export class Proposals {
       try {
         const reason = await this.d.adapter.check?.(action);
         if (reason) return reason;
-      } catch { return "Driver couldn't check whether that action is allowed right now. Please try again."; }
+      } catch { return "The app couldn't check whether that action is allowed right now. Please try again."; }
     }
     return null;
   }
@@ -448,7 +448,7 @@ export class Proposals {
       for (const h of input.handles) {
         const r = pick(h, named, this.d.settled?.() ?? [], this.d.store.aliasFor(conversationId, nameKey(h)));
         if (r.kind === "none") return { error: `No thread matches "${h}". Ask the user which one.` };
-        if (r.kind === "settled") return { error: `${saidBefore(r.item)} is settled, so Driver leaves it alone. Say so, and ask whether they meant another thread.` };
+        if (r.kind === "settled") return { error: `${saidBefore(r.item)} is settled, so the app leaves it alone. Say so, and ask whether they meant another thread.` };
         if (r.kind === "ambiguous") return { error: `"${h}" could mean ${r.options.map((o, i, all) => withGroup(o.handle, o.group, i < all.length - 1)).join(" or ")}. Ask the user which one.` };
         const item = r.item as Named & { item: WorkItem };
         if (input.action === "settle" && item.item.status === "running") return { error: stillWorking(item) };
@@ -590,7 +590,7 @@ export class Proposals {
     const profiles = this.d.profiles ?? [];
     const named = asked?.trim().replace(/\s+profile$/i, "");
     const profile = named ? profiles.find((p) => nameKey(p.name) === nameKey(named)) : profiles[0];
-    return profile ?? { error: profiles.length ? `There's no ${named} profile; there are ${list(profiles.map((p) => p.name))}. Ask the user which.` : "Driver has no launch profiles set up." };
+    return profile ?? { error: profiles.length ? `There's no ${named} profile; there are ${list(profiles.map((p) => p.name))}. Ask the user which.` : "The app has no launch profiles set up." };
   }
 
   /** Whether a dictated draft may be proposed: not if it's been sent or is being sent; its own lost proposal again, here. */
@@ -1009,7 +1009,7 @@ export class Proposals {
         return { error: "The user's settings carry this out only with a tap: tell them to tap Send on their phone to go ahead.", refused: "tap Send on your phone" };
       }
       if (level === "readback" && !heard(p, spoken, user.atSpoken)) {
-        return { error: `The user has not heard the full readback yet. Say exactly this, then ask again: ${p.readback}`, refused: "Driver hadn't read it back yet" };
+        return { error: `The user has not heard the full readback yet. Say exactly this, then ask again: ${p.readback}`, refused: "it hadn't been read back yet" };
       }
       // Message groups already used the user's cutoff above; the names and dates must precede it too.
       if (user.atSpoken <= p.createdFrom || (level === "readback" && !heard({ mustHear: p.mustHear.filter((g) => g.message === undefined) }, spoken.slice(0, user.atSpoken)))) {

@@ -61,9 +61,9 @@ const QUESTION = "item/tool/requestUserInput";
 const APPROVALS = new Set(["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval",
   "mcpServer/elicitation/request", "execCommandApproval", "applyPatchApproval"]);
 
-const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whether Codex received that. Driver won't send it again." };
-const NO_STEERING = "It's open in Codex, and this computer doesn't let Driver send to open sessions.";
-const NO_ANSWERS = "Codex is asking a question, and this computer doesn't let Driver answer them. Answer it in Codex.";
+const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whether Codex received that. 10 & 2 won't send it again." };
+const NO_STEERING = "It's open in Codex, and this computer doesn't let 10 & 2 send to open sessions.";
+const NO_ANSWERS = "Codex is asking a question, and this computer doesn't let 10 & 2 answer them. Answer it in Codex.";
 const NOT_CONNECTED = "Codex isn't connected right now.";
 const REUSED = "That operation key was already used for different words or settings.";
 const REFUSED = "Codex didn't take that. Nothing was sent.";
@@ -116,7 +116,7 @@ type Question = { id: string; question: string; isOther?: boolean; options?: { l
  * question takes any answer. One that takes only its options and isn't given one is refused, in words.
  */
 export function answersFor(questions: Question[], words: string): { answers: Record<string, { answers: string[] }> } | { error: string } {
-  if (!questions.length) return { error: "Driver can't see Codex's question, so nothing was sent." };
+  if (!questions.length) return { error: "10 & 2 can't see Codex's question, so nothing was sent." };
   const out: Record<string, { answers: string[] }> = {};
   const said = plain(words);
   for (const q of questions) {
@@ -460,7 +460,7 @@ export class CodexAdapter implements Adapter {
   async list(): Promise<WorkItem[]> { return [...this.rows.values()].map((r) => ({ ...r.item })); }
   private row(id: string): Row {
     const row = this.rows.get(id);
-    if (!row || !visible(this.opts.policy, row.thread.cwd)) throw new Error("That session isn't visible to Driver.");
+    if (!row || !visible(this.opts.policy, row.thread.cwd)) throw new Error("That session isn't visible to 10 & 2.");
     return row;
   }
   async report(id: string): Promise<Report> {
@@ -606,22 +606,22 @@ export class CodexAdapter implements Adapter {
     if (!allows(this.opts.policy, action.kind, "codex")) return "This machine's local policy doesn't allow that action.";
     if (action.kind === "start_work") {
       if (!this.loaded) return NOT_CONNECTED;
-      if (!this.roots.has(action.placeId)) return "That project isn't visible to Driver.";
+      if (!this.roots.has(action.placeId)) return "That project isn't visible to 10 & 2.";
       if (!withinCeiling(this.opts.policy, action.profile, "codex")) return "That launch profile exceeds this machine's permission ceiling.";
       const worktrees = join(this.roots.get(action.placeId)!, ".codex", "worktrees");
-      if (action.profile.workspace === "worktree" && existsSync(worktrees) && !visible(this.opts.policy, worktrees)) return "That project's worktree folder is outside Driver's visible folders.";
+      if (action.profile.workspace === "worktree" && existsSync(worktrees) && !visible(this.opts.policy, worktrees)) return "That project's worktree folder is outside 10 & 2's visible folders.";
       return this.connected() ? null : NOT_CONNECTED;
     }
     const row = this.rows.get(action.itemId);
-    if (!row || !visible(this.opts.policy, row.thread.cwd)) return "That session isn't visible to Driver.";
+    if (!row || !visible(this.opts.policy, row.thread.cwd)) return "That session isn't visible to 10 & 2.";
     if (action.kind === "snooze" && Number.isNaN(Date.parse(action.until))) return "That snooze time isn't valid.";
     if (action.kind === "follow_up") return this.connected() ? this.followUpRefusal(row) : NOT_CONNECTED;
     return null;
   }
   private followUpRefusal(row: Row): string | null {
     const t = row.thread, held = this.held.get(t.id), flag = this.waitingFlag(t);
-    if (held && held.method !== QUESTION) return `Codex is waiting for your OK: it ${wants(held)}. Driver can't approve that, so answer it in Codex.`;
-    if (flag === "approval") return "Codex is waiting for your OK in its terminal. Driver can't approve that, so answer it there.";
+    if (held && held.method !== QUESTION) return `Codex is waiting for your OK: it ${wants(held)}. 10 & 2 can't approve that, so answer it in Codex.`;
+    if (flag === "approval") return "Codex is waiting for your OK in its terminal. 10 & 2 can't approve that, so answer it there.";
     if (held || flag === "question") return answers(this.opts.policy, "codex") ? null : NO_ANSWERS;
     if (t.status.type === "systemError") return "That session hit an error in Codex. Open it in Codex to carry on.";
     if (t.status.type !== "notLoaded") return steers(this.opts.policy, "codex") ? null : NO_STEERING;
@@ -716,8 +716,8 @@ export class CodexAdapter implements Adapter {
       if (e instanceof ConnectionError) return UNKNOWN; // a resume sends nothing, but whether it loaded is unknown
       const m = (e as Error).message;
       this.opts.log(`codex: couldn't load ${id} (${m})`);
-      if (/active writer/i.test(m)) return { ok: false, error: "That session is open in a Codex window Driver can't reach. Send it from there." };
-      if (/provider/i.test(m)) return { ok: false, error: "That session uses a different AI provider than Codex does now, so Driver can't continue it." };
+      if (/active writer/i.test(m)) return { ok: false, error: "That session is open in a Codex window 10 & 2 can't reach. Send it from there." };
+      if (/provider/i.test(m)) return { ok: false, error: "That session uses a different AI provider than Codex does now, so 10 & 2 can't continue it." };
       if (/not found|no rollout|materialized/i.test(m)) return { ok: false, error: "Codex can't find that session any more." };
       return { ok: false, error: REFUSED };
     }
@@ -771,7 +771,7 @@ export class CodexAdapter implements Adapter {
       while (!this.held.has(id) && Date.now() < end) await new Promise((r) => setTimeout(r, 25));
     }
     const held = this.held.get(id);
-    if (!held || held.method !== QUESTION) return { ok: false, error: held ? `Codex is waiting for your OK: it ${wants(held)}. Driver can't approve that, so answer it in Codex.` : "Codex's question was already answered. Nothing was sent." };
+    if (!held || held.method !== QUESTION) return { ok: false, error: held ? `Codex is waiting for your OK: it ${wants(held)}. 10 & 2 can't approve that, so answer it in Codex.` : "Codex's question was already answered. Nothing was sent." };
     if (held.rpc !== this.rpc) return { ok: false, error: "Codex's question was already answered. Nothing was sent." };
     const a = answersFor(held.params?.questions ?? [], words);
     if ("error" in a) return { ok: false, error: a.error };
@@ -781,14 +781,14 @@ export class CodexAdapter implements Adapter {
       held.rpc.onClose(() => { clearTimeout(timer); this.resolved.delete(held); resolve(false); });
     });
     if (!held.rpc.respond(held.id, { answers: a.answers })) return { ok: false, error: NOT_CONNECTED };
-    if (!await done) return { ok: false, unknown: true, error: "Codex may have had its answer already. Driver won't send it again." };
+    if (!await done) return { ok: false, unknown: true, error: "Codex may have had its answer already. 10 & 2 won't send it again." };
     this.touch(id);
     return { ok: true };
   }
 
   /**
    * New work: `thread/start` with the profile's settings, in the project's checkout or a fresh worktree inside it
-   * (`.codex/worktrees/driver-<id>`, as Claude Code keeps its own, starting where the policy's `worktreeBase` says), then
+   * (`.codex/worktrees/10and2-<id>`, as Claude Code keeps its own, starting where the policy's `worktreeBase` says), then
    * its first turn on the same connection (a thread with no turn is dropped when its client leaves). Plan profiles start
    * in Codex's plan mode.
    */

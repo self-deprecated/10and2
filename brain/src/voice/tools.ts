@@ -101,13 +101,13 @@ export const TOOLS = [
   {
     name: "star",
     description:
-      "Star a thread (watch it) or unstar it. Starred threads are what Driver talks about in the car, and Driver calls back when one of them replies. Changes nothing in the thread itself.",
+      "Star a thread (watch it) or unstar it. Starred threads are what the app talks about in the car, and the app calls back when one of them replies. Changes nothing in the thread itself.",
     parameters: { type: "object", additionalProperties: false, required: ["handle", "starred"], properties: { handle: { type: "string" }, starred: { type: "boolean" } } },
   },
   {
     name: "wait_for",
     description:
-      "Tell the user when the first of these threads' agents finishes its current run or asks a question, for example right after a follow-up. Use when the user wants to hear back from a thread, or from any of several (\"tell me when A or B replies\"): pass them all at once. With hang_up false Driver stays on the call and tells them as soon as it replies; with hang_up true it hangs up and calls back. If one has already replied, returns its reply instead.",
+      "Tell the user when the first of these threads' agents finishes its current run or asks a question, for example right after a follow-up. Use when the user wants to hear back from a thread, or from any of several (\"tell me when A or B replies\"): pass them all at once. With hang_up false the app stays on the call and tells them as soon as it replies; with hang_up true it hangs up and calls back. If one has already replied, returns its reply instead.",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -121,13 +121,13 @@ export const TOOLS = [
   {
     name: "hold",
     description:
-      "Hang up and put the call on hold: no minutes are used, the phone listens for the user's wake word to bring them back to this conversation, and Driver calls back if the thread they dealt with last replies. Use when the user says hold, pause, go on hold or hang up for now without naming threads to hear back from.",
+      "Hang up and put the call on hold: no minutes are used, the phone listens for the user's wake word to bring them back to this conversation, and the app calls back if the thread they dealt with last replies. Use when the user says hold, pause, go on hold or hang up for now without naming threads to hear back from.",
     parameters: { type: "object", additionalProperties: false, required: [], properties: {} },
   },
   {
     name: "read_aloud",
     description:
-      "Hang up at once and have the phone read a thread's reply out in full, word for word, in a cheaper voice; the user can talk to Driver again during or after it. Use when the user wants to hear a reply in full or read out, not summarised. Nothing said after it is heard. which: latest (its newest reply), previous (the one before), back (that many replies back, in `back`), about (the reply to the user's message about `about`).",
+      "Hang up at once and have the phone read a thread's reply out in full, word for word, in a cheaper voice; the user can talk to the app again during or after it. Use when the user wants to hear a reply in full or read out, not summarised. Nothing said after it is heard. which: latest (its newest reply), previous (the one before), back (that many replies back, in `back`), about (the reply to the user's message about `about`).",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -143,7 +143,7 @@ export const TOOLS = [
   {
     name: "dictate",
     description:
-      "Hang up at once and have the phone record, in the user's own words as they say them, a reply to a thread (handle) or the opening prompt of a new thread (handle null); its tone is the cue, so nothing said after it is heard. Use when the user wants to dictate a reply, a longer message or a new thread themselves, rather than have you word it. Call it at once: never ask for a project, machine or title first. A reply to that thread they dictated earlier and left unsent is carried on, not replaced. When they come back, Driver asks what to do with what they dictated.",
+      "Hang up at once and have the phone record, in the user's own words as they say them, a reply to a thread (handle) or the opening prompt of a new thread (handle null); its tone is the cue, so nothing said after it is heard. Use when the user wants to dictate a reply, a longer message or a new thread themselves, rather than have you word it. Call it at once: never ask for a project, machine or title first. A reply to that thread they dictated earlier and left unsent is carried on, not replaced. When they come back, the app asks what to do with what they dictated.",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -157,7 +157,7 @@ export const TOOLS = [
   },
   {
     name: "flag",
-    description: "Flag this moment of the call for review, when the user asks to flag it, debug it, or says something went wrong here, in any words. Says so when Driver has flagged it already.",
+    description: "Flag this moment of the call for review, when the user asks to flag it, debug it, or says something went wrong here, in any words. Says so when the app has flagged it already.",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -206,8 +206,8 @@ const HEARD =
 const projectKey = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
 
 /** What the voice model is told once `dictate` has handed off: nothing, since the brain hangs up as it says so. */
-const DICTATING = "Reply with nothing at all: Driver has hung up, and the phone is recording the user after its tone.";
-const HOLDING = "Reply with nothing at all: Driver has hung up, and the phone is on hold after its tone, listening for the user's wake word.";
+const DICTATING = "Reply with nothing at all: the app has hung up, and the phone is recording the user after its tone.";
+const HOLDING = "Reply with nothing at all: the app has hung up, and the phone is on hold after its tone, listening for the user's wake word.";
 
 /** Words that say nothing about which reply is meant. */
 const COMMON = new Set(["the", "and", "about", "that", "this", "with", "for", "you", "your", "one", "where", "what", "when", "reply", "asked", "said", "was", "were", "its", "it's"]);
@@ -271,7 +271,7 @@ function find(spoken: string, deps: ToolDeps, conversationId: string, settledToo
     return { handle: hit.handle, item: hit.item };
   }
   if (r.kind === "ambiguous") return { error: `"${spoken}" could mean ${r.options.map((o, i, all) => withGroup(o.handle, o.group, i < all.length - 1)).join(" or ")}. Ask the user which one.` };
-  if (r.kind === "settled") return { error: `${withGroup(r.item.handle, r.item.group, true)} is settled, so Driver leaves it alone. Say so, and ask whether they meant another thread.` };
+  if (r.kind === "settled") return { error: `${withGroup(r.item.handle, r.item.group, true)} is settled, so the app leaves it alone. Say so, and ask whether they meant another thread.` };
   return { error: `No thread matches "${spoken}". Ask the user which one.` };
 }
 
@@ -498,7 +498,7 @@ export async function runTool(
           count: settled.length,
           threads: shown.map((n) => ({ handle: n.handle, group: n.group, updated: ago(n.item.updatedAt, now) })),
           ...(settled.length > shown.length ? { more: settled.length - shown.length } : {}),
-          instruction: "These threads are settled. details tells what one said; Driver doesn't change settled threads.",
+          instruction: "These threads are settled. details tells what one said; the app doesn't change settled threads.",
         };
       }
       if (project && !view.cards.some((c) => inProject(c.group)) && !view.snoozed.some((s) => inProject(s.group))) {
@@ -610,7 +610,7 @@ export async function runTool(
       if (!entries.length) {
         return { error: `${idle.join(" and ")} ${idle.length > 1 ? "aren't" : "isn't"} working on anything, so there's nothing to wait for. Offer to send a follow-up first.` };
       }
-      if (deps.waits.generation !== generation) return { error: "The user stopped Driver; nothing is being waited for." };
+      if (deps.waits.generation !== generation) return { error: "The user stopped the call; nothing is being waited for." };
       const skipped = idle.length ? ` Also say, in a few words, that ${idle.join(" and ")} ${idle.length > 1 ? "aren't" : "isn't"} working on anything, so you won't wait for ${idle.length > 1 ? "them" : "it"}.` : "";
       const named = new Map(namedItems(deps.briefing).map((n) => [n.id, withGroup(n.handle, n.group, true)]));
       // Staying on (sessions recorded before hang_up was a choice always hung up).
@@ -618,7 +618,7 @@ export async function runTool(
         ctx.watch(entries);
         return {
           watching: true,
-          instruction: `Driver stays on the call. Say in one short sentence that you'll tell them as soon as ${entries.map((e) => named.get(e.item.id) ?? e.handle).join(" or ")} replies, then carry on with what they asked next.${skipped}`,
+          instruction: `The app stays on the call. Say in one short sentence that you'll tell them as soon as ${entries.map((e) => named.get(e.item.id) ?? e.handle).join(" or ")} replies, then carry on with what they asked next.${skipped}`,
         };
       }
       let w = deps.waits.get(ctx.conversationId);
@@ -655,7 +655,7 @@ export async function runTool(
       // A yes the brain carried out itself (VoiceSession's `yesHeard`): done, and the voice model is being told.
       const p = deps.store.proposal(String(args.proposal_id ?? ""));
       if (p?.conversationId === ctx.conversationId && p.fields.heardYes && p.state !== "proposed") {
-        return { done: true, already: true, result: p.result ?? "It's being carried out now.", instruction: "Driver carried this out on the user's yes and is telling them the result: don't say it again or call confirm again. Answer anything else they said, or reply with nothing." };
+        return { done: true, already: true, result: p.result ?? "It's being carried out now.", instruction: "The app carried this out on the user's yes and is telling them the result: don't say it again or call confirm again. Answer anything else they said, or reply with nothing." };
       }
       return deps.proposals.confirm(ctx.conversationId, String(args.proposal_id ?? ""));
     }
@@ -666,11 +666,11 @@ export async function runTool(
     case "send_kept":
       return deps.proposals.sendKept(ctx.conversationId, String(args.kept_id ?? ""), ctx.confirm, { project: typeof args.project === "string" ? args.project : null, profile: typeof args.profile === "string" ? args.profile : null });
     case "flag":
-      return ctx.flag ? ctx.flag(typeof args.note === "string" ? args.note : null) : { error: "Driver can't flag moments here. Say so in a few words." };
+      return ctx.flag ? ctx.flag(typeof args.note === "string" ? args.note : null) : { error: "The app can't flag moments here. Say so in a few words." };
     case "remember": {
       const note = String(args.note ?? "").trim();
       if (!note) return { error: "Nothing to remember." };
-      if (!ctx.memory) return { error: "Memory is turned off in Driver's settings, so nothing was saved. Tell the user." };
+      if (!ctx.memory) return { error: "Memory is turned off in the app's settings, so nothing was saved. Tell the user." };
       const fresh = deps.store.remember(ctx.conversationId, note.slice(0, 500));
       return { saved: true, result: fresh ? "Saved for future drives." : "That was already saved; nothing new." };
     }
@@ -681,7 +681,7 @@ export async function runTool(
       const on = args.starred !== false;
       setStar(deps, found.item, on);
       const name = withGroup(found.handle, found.item.group);
-      return { done: true, result: on ? `Starred ${name}: Driver will follow it in the car.` : `${name} isn't starred any more.` };
+      return { done: true, result: on ? `Starred ${name}: the app will follow it in the car.` : `${name} isn't starred any more.` };
     }
     case "read_aloud": {
       // Stop while this looks the reply up wins: nothing is handed to the phone.
@@ -699,7 +699,7 @@ export async function runTool(
         const options = picked.ambiguous.map((r) => `the one from ${day(r.at)}${r.prompt ? ` after "${headTail(r.prompt, 80)}"` : ""}`);
         return { error: `More than one of ${found.handle}'s replies could be it: ${options.join("; or ")}. Ask the user which.` };
       }
-      if (deps.waits.generation !== generation) return { error: "The user stopped Driver; nothing will be read." };
+      if (deps.waits.generation !== generation) return { error: "The user stopped the call; nothing will be read." };
       const reply = { itemId: found.item.id, messageId: picked.reply.messageId };
       deps.store.saveHandoff(ctx.conversationId, { handle: found.handle, reply });
       // Driver hangs up now, without waiting for the reading: the user would sit in a paid call hearing nothing while a
@@ -715,7 +715,7 @@ export async function runTool(
       ctx.requestEnd({ kind: "reading", handle: found.handle });
       // GPT-Live is given nothing more to say, and hangs up once it's quiet. The result still goes back: a call left
       // unanswered keeps OpenAI from closing the session for 9 s, while the user waits for the reading.
-      return { reading: true, handle: found.handle, instruction: "Reply with nothing at all: Driver has hung up, and the phone is reading it." };
+      return { reading: true, handle: found.handle, instruction: "Reply with nothing at all: the app has hung up, and the phone is reading it." };
     }
     case "dictate": {
       // The phone's recording tone is the cue, so the voice model says nothing (8 November: "Go ahead after the tone." and
@@ -733,7 +733,7 @@ export async function runTool(
         // A project not settled yet (on two machines, or no match) is asked about after the dictation, as none is. An
         // older phone can't bring a prompt back to the call, so it's asked about first, as before.
         if (!ctx.promptsBack && (!placed || "error" in placed)) return placed ?? { error: "Which project is the new thread in? Ask the user, then call dictate with it." };
-        if (deps.waits.generation !== generation) return { error: "The user stopped Driver; nothing will be recorded." };
+        if (deps.waits.generation !== generation) return { error: "The user stopped the call; nothing will be recorded." };
         const place = placed && !("error" in placed) ? placed.place : null;
         const handle = place?.name ?? "";
         deps.store.saveHandoff(ctx.conversationId, { handle, dictate: { itemId: newThreadTarget({ placeId: place?.id ?? null, profile: asked && profile.name }) } });
@@ -745,7 +745,7 @@ export async function runTool(
       // which thread, when it may have been a new one.
       if ("error" in found) return ctx.promptsBack ? { error: `${found.error} If they didn't name one, ask whether it's a reply to a thread or a new thread.` } : found;
       if (!deps.adapter.actions.includes("follow_up")) return { error: "This system can't take replies. Say so." };
-      if (deps.waits.generation !== generation) return { error: "The user stopped Driver; nothing will be recorded." };
+      if (deps.waits.generation !== generation) return { error: "The user stopped the call; nothing will be recorded." };
       about(found);
       deps.store.saveHandoff(ctx.conversationId, { handle: found.handle, dictate: { itemId: found.item.id } });
       ctx.requestEnd({ kind: "dictating", handle: found.handle });
@@ -758,7 +758,7 @@ export async function runTool(
     }
     case "end_session": {
       if (ctx.onlyFlagged?.()) {
-        return { error: "The user only asked Driver to flag this moment for review; the call goes on. Don't say goodbye: answer anything else they said, or wait for them." };
+        return { error: "The user only asked the app to flag this moment for review; the call goes on. Don't say goodbye: answer anything else they said, or wait for them." };
       }
       ctx.requestEnd({ kind: "goodbye" });
       const working = await starredWorking(deps);

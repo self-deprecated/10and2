@@ -182,12 +182,16 @@ export const ROUTES: Route[] = [
   {
     method: "POST", path: "/api/reply", access: "signed_in", by: "brain", where: "both", body: { id: "t-12", text: "Run it tonight.", requestId: REQUEST_ID }, ids: [body("id", "thread"), body("keptId", "kept"), body("messageId", "message", { with: { id: "<own:thread>" }, unused: "the brain quotes `quote`, never looks the message up" }),
       // A new thread's prompt with no project (`new:` and {"n":"iso00001"}), started where Not sent's picker says.
-      body("placeId", "place", { with: { id: "new:eyJuIjoiaXNvMDAwMDEifQ", requestId: "<fresh>" } })],
+      body("placeId", "place", { with: { id: "new:eyJuIjoiaXNvMDAwMDEifQ", requestId: "<fresh>" } }),
+      // A thread's drafts sent as one message, a reply kept in a call among them.
+      body("parts.0.keptId", "kept", { with: { id: "<own:thread>", requestId: "<fresh>", parts: [{ text: "Ship it tonight." }] } })],
     idempotent: { key: "requestId" },
   },
 
   // Kept replies.
   { method: "GET", path: "/api/kept", access: "signed_in", by: "brain", where: "both" },
+  // What the account has done with the app lately: the paywall's header.
+  { method: "GET", path: "/api/usage", access: "signed_in", by: "brain", where: "both" },
   // Where a new thread can start, as Driver says them: Not sent's project picker.
   { method: "GET", path: "/api/places", access: "signed_in", by: "brain", where: "both" },
   {

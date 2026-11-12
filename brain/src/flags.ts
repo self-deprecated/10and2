@@ -143,18 +143,18 @@ export class Flags {
     // A whole conversation flagged afterwards (from its start) is marked at the top.
     const last = turns.findLastIndex((t) => t.role === "user" && t.at <= f.at);
     const marked = last !== -1 ? last : turns.length && f.at <= turns[0].at ? 0 : turns.length;
-    const lines = turns.map((t, i) => `${i === marked ? "\n**>>> FLAGGED HERE <<<**\n\n" : ""}- ${iso(t.at).slice(11, 19)} **${t.role === "user" ? "User" : "Driver"}:** ${t.text.replace(/\s+/g, " ")}`);
+    const lines = turns.map((t, i) => `${i === marked ? "\n**>>> FLAGGED HERE <<<**\n\n" : ""}- ${iso(t.at).slice(11, 19)} **${t.role === "user" ? "User" : "Voice"}:** ${t.text.replace(/\s+/g, " ")}`);
     if (marked === turns.length) lines.push("\n**>>> FLAGGED HERE <<<**");
     return [
-      `# Driver flag: ${iso(f.at)}`,
+      `# 10 & 2 flag: ${iso(f.at)}`,
       "",
-      "The user flagged this moment for review (by saying \"debug\" in a call, or afterwards): something Driver did around here was wrong. Find out what, from the conversation below, the session recordings (every event, tool call and brain log line) and the phone's log, then fix it in this repository (`brain/` or `ios/`). Replay a recording as a test (`brain/README.md`, Session recordings). When done, move this file to `reviewed/` next to it, with a line at the end on what was found and changed.",
+      "The user flagged this moment for review (by saying \"debug\" in a call, or afterwards): something the voice did around here was wrong. Find out what, from the conversation below, the session recordings (every event, tool call and brain log line) and the phone's log, then fix it in this repository (`brain/` or `ios/`). Replay a recording as a test (`brain/README.md`, Session recordings). When done, move this file to `reviewed/` next to it, with a line at the end on what was found and changed.",
       "",
       "## What the user said",
       "",
       `> ${f.said.trim().replace(/\s+/g, " ")}`,
       "",
-      ...(f.issue ? ["## What went wrong, in the user's words", "", "Driver asked what went wrong; this is the user's answer.", "", `> ${f.issue.trim().replace(/\s+/g, " ")}`, ""] : []),
+      ...(f.issue ? ["## What went wrong, in the user's words", "", "The voice asked what went wrong; this is the user's answer.", "", `> ${f.issue.trim().replace(/\s+/g, " ")}`, ""] : []),
       "## Where to look",
       "",
       `- Conversation \`${f.conversationId}\`; flagged in session \`${f.sessionId}\`.`,

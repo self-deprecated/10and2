@@ -75,7 +75,7 @@ test("OpenCode: list, read, steer idle and busy, answer a question, continue a c
     assert.match(tui.screen(), /"Which one\?"="Beta"/);
   });
 
-  await t.test("continue: a closed session is continued in Driver's own server", async () => {
+  await t.test("continue: a closed session is continued in 10 & 2's own server", async () => {
     const pid = entry()?.pid;
     tui.stop();
     if (pid) await until("the terminal to exit", () => { try { process.kill(pid, 0); return false; } catch { return true; } });

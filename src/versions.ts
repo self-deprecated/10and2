@@ -72,5 +72,5 @@ export function versionWarning(agent: Agent, name: string, version: string | nul
   if (!s) return null;
   // Without seeing its sessions, nothing else is of use.
   const what = s.features.includes("read") ? "use" : list(s.features.map((f) => WORDS[f]));
-  return `${name} ${version} is too old for Driver to ${what}. Update to ${s.needs} or newer: ${UPDATE[agent]}`;
+  return `${name} ${version} is too old for 10 & 2 to ${what}. Update to ${s.needs} or newer: ${UPDATE[agent]}`;
 }

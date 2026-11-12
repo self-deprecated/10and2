@@ -252,8 +252,8 @@ export class RemoteAdapter implements Adapter {
   /** From what the machine last said: no round trip, so a proposal never waits on the link. Execute checks again. */
   async check(action: Action): Promise<string | null> {
     const target = targetOf(action);
-    if (!this.connected(target)) return `${spoken(this.name)} isn't connected right now, so Driver can't change anything there.`;
-    if (!this.state.actions.includes(action.kind)) return `Driver isn't allowed to ${action.kind.replaceAll("_", " ")} on ${spoken(this.name)}.`;
+    if (!this.connected(target)) return `${spoken(this.name)} isn't connected right now, so the app can't change anything there.`;
+    if (!this.state.actions.includes(action.kind)) return `The app isn't allowed to ${action.kind.replaceAll("_", " ")} on ${spoken(this.name)}.`;
     if (action.kind === "start_work" && MODES.indexOf(action.profile.runtimeMode) > MODES.indexOf(this.state.ceiling)) return `The ${action.profile.name} profile asks for more access than ${spoken(this.name)} allows.`;
     return this.state.refusals[target]?.[action.kind] ?? null;
   }
@@ -263,7 +263,7 @@ export class RemoteAdapter implements Adapter {
     const { kind, ...args } = action.kind === "start_work" && !action.title && !this.state.names ? { ...action, title: titleFrom(action.message) } : action;
     try {
       const r = await this.request("tools/call", { name: kind, arguments: args, _meta: { "tenandtwo/key": key, "tenandtwo/ttlMs": this.opts.timeoutMs } });
-      if (!validReceipt(r?.structuredContent)) return { ok: false, unknown: true, error: `${spoken(this.name)} answered with something Driver doesn't understand; the outcome may be unknown.` };
+      if (!validReceipt(r?.structuredContent)) return { ok: false, unknown: true, error: `${spoken(this.name)} answered with something the app doesn't understand; the outcome may be unknown.` };
       return r.structuredContent;
     } catch (e) { return this.failed(e); }
   }

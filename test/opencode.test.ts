@@ -155,14 +155,14 @@ test("with steering off, a session open in OpenCode is refused in words and noth
   const id = h.db.finished(h.cwd);
   const fake = await h.tui();
   await h.adapter.start();
-  const why = "It's open in OpenCode, and this computer doesn't let Driver send to open sessions.";
+  const why = "It's open in OpenCode, and this computer doesn't let 10 & 2 send to open sessions.";
   assert.equal(await h.adapter.check(follow(id, "x")), why);
   assert.deepEqual(h.adapter.refusals()[id], { follow_up: why });
   assert.deepEqual(await h.adapter.execute(follow(id, "x"), "k"), { ok: false, error: why });
   assert.equal(fake.writes().length, 0);
 });
 
-test("a session nothing has open is continued in Driver's own OpenCode server, started once under the ceiling, with a password", async (t) => {
+test("a session nothing has open is continued in 10 & 2's own OpenCode server, started once under the ceiling, with a password", async (t) => {
   const h = harness(t);
   const a = h.db.finished(h.cwd), b = h.db.finished(h.cwd, "Other", "Done", { title: "Other" });
   await h.adapter.start();
@@ -182,7 +182,7 @@ test("a session nothing has open is continued in Driver's own OpenCode server, s
   await until(() => !existsSync(join(h.state, "serve.json")));
 });
 
-test("Driver's own server outlives a connector that stops mid-turn, and the next connector picks it up instead of starting another", async (t) => {
+test("10 & 2's own server outlives a connector that stops mid-turn, and the next connector picks it up instead of starting another", async (t) => {
   const h = harness(t);
   const a = h.db.finished(h.cwd), b = h.db.finished(h.cwd, "Other", "Done", { title: "Other" });
   await h.adapter.start();
@@ -209,13 +209,13 @@ test("a session whose own rules allow more than the ceiling isn't continued", as
   const id = h.db.session({ directory: h.cwd, title: "Full access", permission: [{ permission: "*", pattern: "*", action: "allow" }] });
   h.db.assistant(id, h.db.user(id, "go"), { text: "done" });
   await h.adapter.start();
-  const why = "That session may do more than this computer lets Driver run, so Driver won't send to it.";
+  const why = "That session may do more than this computer lets 10 & 2 run, so 10 & 2 won't send to it.";
   assert.equal(await h.adapter.check(follow(id, "x")), why);
   assert.deepEqual(await h.adapter.execute(follow(id, "x"), "k"), { ok: false, error: why });
   assert.equal(h.serve.log().length, 0, "no server was started");
 });
 
-test("new work starts in Driver's own server, or in a terminal open in that project, with the profile's agent and rules", async (t) => {
+test("new work starts in 10 & 2's own server, or in a terminal open in that project, with the profile's agent and rules", async (t) => {
   const h = harness(t);
   h.db.finished(h.cwd);
   await h.adapter.start();
@@ -259,7 +259,7 @@ test("OpenCode's own question is answered with the option the user named, throug
   const f2 = await off.tui();
   f2.state.status = { [q]: { type: "busy" } }; f2.state.questions = [{ id: "que_2", sessionID: q, questions: [{ question: "Which?", options: [] }] }];
   await off.adapter.start();
-  assert.equal(await off.adapter.check(follow(q, "x")), "It's asking you a question in OpenCode, and this computer doesn't let Driver answer questions.");
+  assert.equal(await off.adapter.check(follow(q, "x")), "It's asking you a question in OpenCode, and this computer doesn't let 10 & 2 answer questions.");
 });
 
 test("an answer is the option named (each one, when several may be chosen), else the user's own words", () => {
@@ -276,7 +276,7 @@ test("a permission request is never granted by a follow-up: it's refused, saying
   fake.state.status = { [id]: { type: "busy" } };
   fake.state.permissions = [{ id: "per_1", sessionID: id, permission: "bash", patterns: ["rm -rf build"], metadata: { command: "rm -rf build" } }];
   await h.adapter.start();
-  const why = "It's waiting for your OK in OpenCode to run rm -rf build. Driver doesn't give that; answer it in OpenCode.";
+  const why = "It's waiting for your OK in OpenCode to run rm -rf build. 10 & 2 doesn't give that; answer it in OpenCode.";
   assert.equal(await h.adapter.check(follow(id, "yes, allow it")), why);
   assert.deepEqual(await h.adapter.execute(follow(id, "yes, allow it"), "p"), { ok: false, error: why });
   assert.equal(fake.writes().length, 0, "nothing sent, and no permission reply");
@@ -289,12 +289,12 @@ test("a message OpenCode took without recording it is unknown, and never sent ag
   fake.state.accept = false;
   await h.adapter.start();
   const unknown = await h.adapter.execute(follow(id, "Did it arrive?"), "u");
-  assert.deepEqual(unknown, { ok: false, unknown: true, error: "I can't tell whether OpenCode received that. Driver won't send it again." });
+  assert.deepEqual(unknown, { ok: false, unknown: true, error: "I can't tell whether OpenCode received that. 10 & 2 won't send it again." });
   assert.deepEqual(await h.adapter.execute(follow(id, "Did it arrive?"), "u"), unknown);
   assert.equal(fake.writes().length, 1);
   // One OpenCode refused outright was never sent: said so, not unknown.
   fake.state.accept = 400;
-  assert.deepEqual(await h.adapter.execute(follow(id, "Again"), "r"), { ok: false, error: "OpenCode didn't take the message. Driver won't send it again." });
+  assert.deepEqual(await h.adapter.execute(follow(id, "Again"), "r"), { ok: false, error: "OpenCode didn't take the message. 10 & 2 won't send it again." });
   // A socket nobody answers on (a crashed terminal) isn't a way in: continued in Driver's own server instead.
   await fake.close();
   await h.adapter.check(follow(id, "x"));
@@ -302,7 +302,7 @@ test("a message OpenCode took without recording it is unknown, and never sent ag
   assert.equal(h.serve.log().filter((l) => l.path?.endsWith("/prompt_async")).length, 1);
 });
 
-test("settle, snooze and archive are kept by Driver; archive hides it here and changes nothing in OpenCode", async (t) => {
+test("settle, snooze and archive are kept by 10 & 2; archive hides it here and changes nothing in OpenCode", async (t) => {
   const h = harness(t);
   const id = h.db.finished(h.cwd);
   const fake = await h.tui();

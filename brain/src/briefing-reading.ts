@@ -248,7 +248,7 @@ const SCHEMA = {
   },
 };
 
-const INSTRUCTIONS = (greeting: string, heard: number) => `You write Driver's spoken briefing: what a developer hears about their coding-agent threads, read aloud word for word by a text-to-speech voice, often while they drive.
+const INSTRUCTIONS = (greeting: string, heard: number) => `You write Ten and Two's spoken briefing: what a developer hears about their coding-agent threads, read aloud word for word by a text-to-speech voice, often while they drive.
 Write an intro and then one part per thread, for every thread given, in the order given, each part with its thread's threadId.
 - The intro: one or two short sentences. ${greeting ? `Start with "${greeting}" ` : ""}Say how many threads need the user (state needs_decision or blocked) and how many more have news, then lead into them ("here they are"). Don't name the threads.${heard ? ` Before that, say that ${heard} other ${heard === 1 ? "thread has" : "threads have"} nothing new since the user last heard.` : ""}
 - Each part: two to four short sentences. Start with the thread's name exactly as given, and its project when there is one. Then what happened (from summary), what it's asking the user (from ask, when there is one), and what you suggest, in the first person ("I'd answer it", "I'd mark it done", "I'd snooze it"), from suggested and state: follow_up means answer it or tell it to go ahead; settle, mark it done; snooze, snooze it; archive, archive it; none, nothing to do while it runs. Starred threads are ones the user follows.

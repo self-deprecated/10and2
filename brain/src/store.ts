@@ -19,6 +19,9 @@ export type Card = {
   summary: string;
   ask: string | null;
   suggested: "none" | "follow_up" | "settle" | "snooze" | "archive";
+  /** Up to three short answers to `ask` the user can tap, in their own voice ("Now", "Tonight at 2"); none when the
+   * question is open, or there's no question. A tap makes a draft: nothing is sent by it. */
+  answers?: string[];
   classifiedAt: string;
   /** The reply the card was read from, if the system says which. */
   reply?: CardReply | null;
@@ -170,6 +173,8 @@ export class Store {
     if ((this.db.prepare("PRAGMA table_info(handoffs)").all() as any[]).some((c) => c.name === "readings")) this.db.exec("DROP TABLE handoffs");
     this.db.exec(SCHEMA);
     if (!(this.db.prepare("PRAGMA table_info(cards)").all() as any[]).some((c) => c.name === "reply")) this.db.exec("ALTER TABLE cards ADD COLUMN reply TEXT");
+    // The answers a card offers to tap (the look, 12 November): a card read before has none until its thread reports again.
+    if (!(this.db.prepare("PRAGMA table_info(cards)").all() as any[]).some((c) => c.name === "answers")) this.db.exec("ALTER TABLE cards ADD COLUMN answers TEXT");
     // Sessions used to count as over once the brain stopped using them. Now one is over only when OpenAI says so
     // (`closed_at`); a session that reported its billed seconds got OpenAI's session.closed, so that counts.
     const sessionCols = (this.db.prepare("PRAGMA table_info(sessions)").all() as any[]).map((c) => c.name);
@@ -194,16 +199,17 @@ export class Store {
     return this.db.prepare("SELECT * FROM cards").all().map((r: any) => ({
       itemId: r.item_id, contentKey: r.content_key, state: r.state,
       summary: r.summary, ask: r.ask, suggested: r.suggested, classifiedAt: r.classified_at,
-      reply: r.reply ? JSON.parse(r.reply) : null,
+      reply: r.reply ? JSON.parse(r.reply) : null, answers: r.answers ? JSON.parse(r.answers) : [],
     }));
   }
   putCard(c: Card) {
     this.db.prepare(
-      `INSERT INTO cards (item_id, content_key, state, summary, ask, suggested, classified_at, reply) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO cards (item_id, content_key, state, summary, ask, suggested, classified_at, reply, answers) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(item_id) DO UPDATE SET
        content_key=excluded.content_key, state=excluded.state, summary=excluded.summary,
-       ask=excluded.ask, suggested=excluded.suggested, classified_at=excluded.classified_at, reply=excluded.reply`,
-    ).run(c.itemId, c.contentKey, c.state, c.summary, c.ask, c.suggested, c.classifiedAt, c.reply ? JSON.stringify(c.reply) : null);
+       ask=excluded.ask, suggested=excluded.suggested, classified_at=excluded.classified_at, reply=excluded.reply, answers=excluded.answers`,
+    ).run(c.itemId, c.contentKey, c.state, c.summary, c.ask, c.suggested, c.classifiedAt, c.reply ? JSON.stringify(c.reply) : null,
+      c.answers?.length ? JSON.stringify(c.answers) : null);
   }
   /** The same report from a later read: only which reply it is, and the watermark, move on. */
   setCardReply(itemId: string, reply: CardReply | null) {
@@ -373,7 +379,7 @@ export class Store {
 
   /** A crash leaves in-flight outcomes uncertain; retry with the original operation keys. */
   recoverExecutingProposals() {
-    const result = "Driver restarted while carrying this out; it's unknown whether it went through";
+    const result = "The app restarted while carrying this out; it's unknown whether it went through";
     this.db.transaction(() => {
       this.db.prepare("UPDATE operations SET state = 'unknown' WHERE state != 'done' AND proposal_id IN (SELECT id FROM proposals WHERE state = 'executing')").run();
       this.db.prepare("UPDATE proposals SET state = 'unknown', result = ? WHERE state = 'executing'").run(result);
@@ -422,6 +428,17 @@ export class Store {
   forgetAll(now = Date.now()) {
     this.db.exec("DELETE FROM memory");
     this.set("memoryClearedAt", String(now));
+  }
+  /**
+   * What the account has done with the app since `since` (the paywall's "Your last 30 days"): messages sent to threads
+   * (replies and new threads' first prompts, by voice or by tap, that went through), how many threads they went to,
+   * how many threads were heard (a reply read out in full, or told in a call), and the seconds its calls were billed.
+   */
+  usage(since: number): { sent: number; steered: number; heard: number; callSeconds: number } {
+    const sent = this.db.prepare("SELECT COUNT(*) AS sent, COUNT(DISTINCT item_id) AS steered FROM operations WHERE state = 'done' AND action IN ('follow_up', 'start_work') AND at >= ?").get(since) as any;
+    const heard = this.db.prepare("SELECT COUNT(*) AS n FROM (SELECT item_id FROM reads WHERE read_at >= ? UNION SELECT item_id FROM heard WHERE at >= ?)").get(since, since) as any;
+    const calls = this.db.prepare("SELECT COALESCE(SUM(billed_seconds), 0) AS s FROM sessions WHERE started_at >= ?").get(since) as any;
+    return { sent: Number(sent.sent), steered: Number(sent.steered), heard: Number(heard.n), callSeconds: Math.round(Number(calls.s)) };
   }
   /** Changes Driver carried out since `since`, in any conversation (not the user's taps), newest last. */
   changesSince(since: number, limit: number): Proposal[] {

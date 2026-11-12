@@ -54,13 +54,13 @@ export function resumeMode(session: string | null, ceiling: RuntimeMode): string
 
 /** How much of a new transcript is read before deciding whether it's one Driver lists at all. */
 const HEAD_BYTES = 512 * 1024;
-const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whether Claude received that. Driver won't send it again." };
+const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whether Claude received that. 10 & 2 won't send it again." };
 /** A live session without an inbox: Claude Code before 2.1.224, or one started bare. */
-const HELD = "It's open in a terminal in an older Claude Code, so Driver can't send to it. Updating Claude Code fixes that.";
+const HELD = "It's open in a terminal in an older Claude Code, so 10 & 2 can't send to it. Updating Claude Code fixes that.";
 /** A live session, on a machine whose policy doesn't let Driver steer open sessions. */
-const NO_STEERING = "It's open in a terminal, and this computer doesn't let Driver send to open sessions.";
-const NOT_DELIVERED = "That session didn't take the message. Driver won't send it again.";
-const AWAITING_OK = "It's waiting for your OK in that session's terminal. Driver won't send it again.";
+const NO_STEERING = "It's open in a terminal, and this computer doesn't let 10 & 2 send to open sessions.";
+const NOT_DELIVERED = "That session didn't take the message. 10 & 2 won't send it again.";
+const AWAITING_OK = "It's waiting for your OK in that session's terminal. 10 & 2 won't send it again.";
 /**
  * An open AskUserQuestion that 10 & 2's PermissionRequest hook is holding for Driver (hooks.ts): the terminal shows the
  * question meanwhile, and whichever answers first wins. The hook gets the answers as one JSON line, then exits.
@@ -335,7 +335,7 @@ export class ClaudeAdapter implements Adapter {
   async list(): Promise<WorkItem[]> { this.fresh(); return [...this.rows.values()].map((r) => ({ ...r.item })); }
   private row(id: string): Row {
     const row = this.rows.get(id);
-    if (!row || !visible(this.opts.policy, row.cwd)) throw new Error("That session isn't visible to Driver.");
+    if (!row || !visible(this.opts.policy, row.cwd)) throw new Error("That session isn't visible to 10 & 2.");
     return row;
   }
   async report(id: string): Promise<Report> {
@@ -360,17 +360,17 @@ export class ClaudeAdapter implements Adapter {
     if (!allows(this.opts.policy, action.kind, "claude")) return "This machine's local policy doesn't allow that action.";
     if (action.kind === "start_work") {
       if (action.title?.trimStart().startsWith("-")) return "A session title must not start with a dash.";
-      if (!this.roots.has(action.placeId)) return "That project isn't visible to Driver.";
+      if (!this.roots.has(action.placeId)) return "That project isn't visible to 10 & 2.";
       if (!withinCeiling(this.opts.policy, action.profile, "claude")) return "That launch profile exceeds this machine's permission ceiling.";
-      if (action.profile.workspace === "worktree" && !this.worktrees) return "Driver hasn't verified headless Claude worktrees with this Claude version. Choose the project checkout profile.";
+      if (action.profile.workspace === "worktree" && !this.worktrees) return "10 & 2 hasn't verified headless Claude worktrees with this Claude version. Choose the project checkout profile.";
       if (action.profile.workspace === "worktree") {
         const root = this.roots.get(action.placeId)!;
-        if ([join(root, ".claude"), join(root, ".claude", "worktrees")].some((p) => existsSync(p) && !visible(this.opts.policy, p))) return "That project's worktree folder is outside Driver's visible folders.";
+        if ([join(root, ".claude"), join(root, ".claude", "worktrees")].some((p) => existsSync(p) && !visible(this.opts.policy, p))) return "That project's worktree folder is outside 10 & 2's visible folders.";
       }
       return null;
     }
     const row = this.rows.get(action.itemId);
-    if (!row) return "That session isn't visible to Driver.";
+    if (!row) return "That session isn't visible to 10 & 2.";
     if (action.kind === "snooze" && !iso(action.until)) return "That snooze time isn't valid.";
     if (action.kind === "follow_up") return this.followUpRefusal(action.itemId, row, registrySnapshot(this.configDir, this.opts.log).uncertain);
     return null;
@@ -380,10 +380,10 @@ export class ClaudeAdapter implements Adapter {
     // Driver's own run) takes the message in its inbox, between steps or as its next turn.
     if (this.asks.has(id)) return null;
     if (row.live.length) return !steers(this.opts.policy, "claude") ? NO_STEERING : row.live.some((l) => l.socket) ? null : HELD;
-    if (this.store.run(id)) return "Driver is already running that session, or can't yet verify that its previous run ended.";
-    if (holdersUncertain) return "Driver can't verify whether a terminal holds that session right now.";
-    if (row.transcript.unknown) return "This session uses a Claude transcript version Driver doesn't understand yet.";
-    if (resumeMode(row.transcript.permissionMode, ceilingFor(this.opts.policy, "claude")) === null) return "Driver can't tell what permissions that session runs with, so it won't send to it.";
+    if (this.store.run(id)) return "10 & 2 is already running that session, or can't yet verify that its previous run ended.";
+    if (holdersUncertain) return "10 & 2 can't verify whether a terminal holds that session right now.";
+    if (row.transcript.unknown) return "This session uses a Claude transcript version 10 & 2 doesn't understand yet.";
+    if (resumeMode(row.transcript.permissionMode, ceilingFor(this.opts.policy, "claude")) === null) return "10 & 2 can't tell what permissions that session runs with, so it won't send to it.";
     return null;
   }
   /** Follow-ups this machine would refuse right now, per session, from the last scan; checked again on execute. */
@@ -430,11 +430,11 @@ export class ClaudeAdapter implements Adapter {
       if (live.length) return { ok: false, error: HELD };
     }
     if (holders.live.some((l) => l.sessionId === id)) return { ok: false, error: HELD };
-    if (action.kind === "follow_up" && holders.uncertain) return { ok: false, error: "Driver can't verify whether a terminal holds that session right now." };
-    if (this.store.run(id)) return { ok: false, error: "Driver is already running that session." };
+    if (action.kind === "follow_up" && holders.uncertain) return { ok: false, error: "10 & 2 can't verify whether a terminal holds that session right now." };
+    if (this.store.run(id)) return { ok: false, error: "10 & 2 is already running that session." };
     if (!this.store.begin(key, digest, id)) {
       const existing = this.store.operation(key);
-      return existing ? existing.hash !== digest ? { ok: false, error: "That operation key was already used for different words or settings." } : existing.receipt ? JSON.parse(existing.receipt) : UNKNOWN : { ok: false, error: "Driver is already running that session." };
+      return existing ? existing.hash !== digest ? { ok: false, error: "That operation key was already used for different words or settings." } : existing.receipt ? JSON.parse(existing.receipt) : UNKNOWN : { ok: false, error: "10 & 2 is already running that session." };
     }
     return this.tracked(this.background ? this.launchBackground(action, key, id) : this.launch(action, key, id));
   }
@@ -466,7 +466,7 @@ export class ClaudeAdapter implements Adapter {
     let baseline = 0;
     try { baseline = statSync(path).size; } catch { /* No transcript yet: everything in it is new. */ }
     if (!(await post(target.socket!, peerToken(this.configDir, target.pid), id, uuid, content))) {
-      return this.store.finish(key, { ok: false, error: "Driver couldn't reach that session. Is it still open?" });
+      return this.store.finish(key, { ok: false, error: "10 & 2 couldn't reach that session. Is it still open?" });
     }
     const lines = new TranscriptLines(path, baseline);
     // One Claude Code will hold for the user's approval needs no long wait (unless its settings accept every message).
@@ -497,7 +497,7 @@ export class ClaudeAdapter implements Adapter {
       ask.socket.end(JSON.stringify(reply) + "\n");
     });
     this.schedule();
-    return this.store.finish(key, passed ? { ok: true } : { ok: false, unknown: true, error: "Claude may have had its answer already. Driver won't send it again." });
+    return this.store.finish(key, passed ? { ok: true } : { ok: false, unknown: true, error: "Claude may have had its answer already. 10 & 2 won't send it again." });
   }
 
   /**
@@ -513,7 +513,7 @@ export class ClaudeAdapter implements Adapter {
     const mode = starting ? action.profile.interactionMode === "plan" ? "plan" : permissionMode(action.profile.runtimeMode) : resumeMode(this.row(id).transcript.permissionMode, ceilingFor(this.opts.policy, "claude"))!;
     // A name the user gave the session stays; otherwise Claude Code keeps titling it itself.
     const name = starting ? action.title : this.rows.get(id)?.transcript.named ? this.rows.get(id)?.transcript.title ?? undefined : undefined;
-    const worktree = starting && action.profile.workspace === "worktree" ? `driver-${id.slice(0, 13)}` : null;
+    const worktree = starting && action.profile.workspace === "worktree" ? `10and2-${id.slice(0, 13)}` : null;
     // Without a worktree profile it stays where it is: Claude Code would otherwise move a background session into a
     // worktree before its first edit, a user's own session included.
     const args = ["--bg", "--permission-mode", mode, ...(name ? ["--name", name] : []),
@@ -542,7 +542,7 @@ export class ClaudeAdapter implements Adapter {
     if (!short) { this.store.ended(id); return this.store.finish(key, UNKNOWN); }
     const finish = (receipt: Receipt) => { this.store.ended(id); this.scan(); return this.store.finish(key, receipt); };
     if (copy || (!starting && short !== id.slice(0, 8))) {
-      return finish({ ok: false, unknown: true, error: "It was open somewhere else, so Claude started a copy with your message. Driver won't send it again." });
+      return finish({ ok: false, unknown: true, error: "It was open somewhere else, so Claude started a copy with your message. 10 & 2 won't send it again." });
     }
     // The session's transcript: the one Driver read, or a new one under its working folder (or worktree).
     // The supervisor starts the session's own process before its first record, so this waits twice as long.
@@ -582,7 +582,7 @@ export class ClaudeAdapter implements Adapter {
       "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--replay-user-messages"];
     // With no title, Claude Code names the session itself.
     if (action.kind === "start_work" && action.title) args.push(`--name=${action.title}`);
-    const worktreeName = action.kind === "start_work" && action.profile.workspace === "worktree" ? `driver-${id.slice(0, 13)}` : null;
+    const worktreeName = action.kind === "start_work" && action.profile.workspace === "worktree" ? `10and2-${id.slice(0, 13)}` : null;
     if (worktreeName) args.push("--worktree", worktreeName);
     // Driver's own headless records follow in this transcript; the session stays listed as Driver's whatever they say.
     this.store.markStarted(id);
@@ -599,7 +599,7 @@ export class ClaudeAdapter implements Adapter {
     };
     let out: number, err: number;
     try { out = openSync(stdoutPath, "wx", 0o600); try { err = openSync(stderrPath, "wx", 0o600); } catch (e) { closeSync(out); throw e; } }
-    catch { this.store.ended(id); return finish({ ok: false, error: "Driver couldn't create a private run log." }); }
+    catch { this.store.ended(id); return finish({ ok: false, error: "10 & 2 couldn't create a private run log." }); }
     const previous = this.rows.get(id)?.transcript;
     const baseline = previous?.offset ?? 0;
     const runCwd = worktreeName ? join(cwd, ".claude", "worktrees", worktreeName) : cwd;
@@ -609,7 +609,7 @@ export class ClaudeAdapter implements Adapter {
       child = spawn(this.opts.claudeBin ?? "claude", args, { cwd, detached: true, env: this.childEnv(), stdio: ["pipe", out, err] });
     } catch {
       closeSync(out); closeSync(err); this.store.ended(id);
-      return finish({ ok: false, error: "Driver couldn't start Claude on this machine." });
+      return finish({ ok: false, error: "10 & 2 couldn't start Claude on this machine." });
     }
     closeSync(out); closeSync(err);
     const pid = child.pid;

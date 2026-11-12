@@ -33,8 +33,6 @@ export const MINUTES = {
   trialDailySeconds: 600,
   /** …on up to this many different days. */
   trialDays: 3,
-  /** The subscription's minutes each week, from Monday 00:00 UTC. */
-  weeklySeconds: 35 * 60,
 } as const;
 export type Minutes = { -readonly [K in keyof typeof MINUTES]: number };
 
@@ -66,7 +64,7 @@ export type Settings = {
   voice: string;
   /** What every reading voice's sample says (`GET /api/voices/sample`); a change makes each sample again, once. */
   sampleText: string;
-  /** How fast things use minutes, the trial and the subscription's weekly minutes (`MINUTES`). */
+  /** How fast things use minutes, and the trial (`MINUTES`). A plan's weekly minutes are its level's (cloud/src/plan.ts). */
   minutes: Minutes;
   allowances: Record<AllowanceLabel, number>;
   /** The background work's daily ceiling per account, in cents (`BACKGROUND_CENTS_PER_DAY`). */
@@ -173,7 +171,7 @@ const prompts: Check = (v) => {
     if (new RegExp(PLACEHOLDER.source).test(text) || text.includes("{{")) return `${id} has placeholder syntax ({{…}})`;
     for (const d of DELIMITERS) if ((text.match(d) ?? []).length > (section.template.match(d) ?? []).length) return `${id} names a data block (${d.source.replace(/\\/g, "")}) more than its default does`;
     if (/[\u0000-\u0008\u000b-\u001f]/.test(text)) return `${id} must be plain text`;
-    if (FORBIDDEN.test(text)) return `${id} names the AI provider or a model, which Driver must never say`;
+    if (FORBIDDEN.test(text)) return `${id} names the AI provider or a model, which users must never hear`;
   }
   return null;
 };
@@ -183,15 +181,15 @@ const prompts: Check = (v) => {
  * models it makes (§5): a version with any of these needs a pass for its template hash on the code that reads it.
  */
 export const SETTINGS: Record<string, { label: string; check: Check; gated?: boolean }> = {
-  speakFirstNew: { label: "Driver speaks first on a new call", check: bool },
+  speakFirstNew: { label: "The voice speaks first on a new call", check: bool },
   idleSeconds: { label: "Hang up after this many seconds of silence", check: int(30, 300) },
   maxMinutes: { label: "Minutes before a session rolls over into the next", check: int(5, MAX_MINUTES_CAP) },
   liveNotices: { label: "Tell starred threads' replies during a call", check: bool },
   voice: { label: "Conversation voice, unless the phone chose one", check: oneOf(CONVERSATION_VOICES) },
   sampleText: { label: "What each reading voice's sample says", check: sampleText },
   minutes: {
-    label: "How fast minutes are used, the trial and the subscription",
-    check: fields({ fastPercent: int(100, 400), readingCharsPerSecond: int(10, 200), pickupSeconds: int(0, 60), trialDailySeconds: int(0, 3600), trialDays: int(0, 14), weeklySeconds: int(0, 36_000) }),
+    label: "How fast minutes are used, and the trial",
+    check: fields({ fastPercent: int(100, 400), readingCharsPerSecond: int(10, 200), pickupSeconds: int(0, 60), trialDailySeconds: int(0, 3600), trialDays: int(0, 14) }),
   },
   allowances: { label: "Free seconds each UTC day, by account label", check: fields({ tester: int(0, 3600), presenter: int(0, 14_400) }) },
   backgroundCentsPerDay: { label: "Background work (briefing, rewrites) each account may cost us a UTC day (cents)", check: int(0, 500) },
@@ -215,6 +213,9 @@ export type Overrides = Record<string, unknown>;
  * and nothing is kept. Otherwise (a brain reading a version newer code wrote): each unknown key or bad value is
  * dropped, so it falls back to its default, and the rest apply.
  */
+/** Keys a setting once had: a version saved with one still applies without it when read (saving one refuses it). */
+const RETIRED: Record<string, string[]> = { minutes: ["weeklySeconds"] };
+
 export function parseOverrides(raw: unknown, strict: boolean): { overrides: Overrides; problems: string[] } {
   let value = raw;
   if (typeof raw === "string") {
@@ -227,7 +228,9 @@ export function parseOverrides(raw: unknown, strict: boolean): { overrides: Over
   if (!value || typeof value !== "object" || Array.isArray(value)) return { overrides: {}, problems: ["must be an object"] };
   const overrides: Overrides = {};
   const problems: string[] = [];
-  for (const [key, v] of Object.entries(value)) {
+  for (const [key, stored] of Object.entries(value)) {
+    const retired = !strict && Object.hasOwn(RETIRED, key) && stored && typeof stored === "object" ? RETIRED[key] : [];
+    const v = retired.length ? Object.fromEntries(Object.entries(stored as object).filter(([k]) => !retired.includes(k))) : stored;
     const setting = Object.hasOwn(SETTINGS, key) ? SETTINGS[key] : null;
     const why = setting ? setting.check(v) : "isn't a setting";
     if (why) problems.push(`${key} ${why}`);

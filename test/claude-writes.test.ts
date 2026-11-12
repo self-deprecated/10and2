@@ -89,7 +89,7 @@ test("a reused key with changed words is rejected before any spawn", async (t) =
   assert.equal(calls(h.config).length, 1);
 });
 
-test("Driver-started run blocks a different follow-up while held, including across adapter restart", async (t) => {
+test("a run 10 & 2 started blocks a different follow-up while held, including across adapter restart", async (t) => {
   env(t, "FAKE_CLAUDE_HOLD_MS", "1500"); const h = harness(t), f = h.completed(); await h.adapter.start();
   assert.equal((await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "One" }, "one")).ok, true);
   unlinkSync(join(h.config, "sessions", `${calls(h.config)[0].pid}.json`));

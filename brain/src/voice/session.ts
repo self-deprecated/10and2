@@ -1288,7 +1288,7 @@ export class VoiceSession {
       const result = await runTool("dictate", args, this.toolContext(about), this.deps);
       this.counts.toolCalls++;
       this.toolCalled("dictate", args, result, false, 0, {});
-      this.log(`asked to dictate, nothing handed to the backend in ${DICTATE_UNHEEDED_MS / 1000} s: Driver started it → ${JSON.stringify(result).slice(0, 200)}`);
+      this.log(`asked to dictate, nothing handed to the backend in ${DICTATE_UNHEEDED_MS / 1000} s: the app started it → ${JSON.stringify(result).slice(0, 200)}`);
       this.deps.record?.({ type: "tool", callId: "brain", name: "dictate", args, result });
       try {
         this.deps.view?.tool("dictate", args, result, about);
@@ -1314,7 +1314,7 @@ export class VoiceSession {
     if (!this.deps.flags || !this.userSaid || this.ended || this.endState.closing || this.backendBusy) return;
     if (now - this.endState.lastUserDelta < FLAG_UNHEEDED_MS || now - this.userSoundAt < SOUND_HOLD_MS) return;
     if (!asksToFlag(vocabularyOf(this.deps.store).correct(this.userSaid))) return;
-    this.log(`"debug this" unanswered ${this.since()}: flagging it, and asking Driver to answer`);
+    this.log(`"debug this" unanswered ${this.since()}: flagging it, and asking the app to answer`);
     this.endUserTurn(true);
   }
 
@@ -1394,9 +1394,9 @@ export class VoiceSession {
    * flagged twice; the voice model has been told of that one.
    */
   private async flagFromTool(note: string | null): Promise<ToolResult> {
-    if (!this.deps.flags) return { error: "Driver can't flag moments here. Say so in a few words." };
+    if (!this.deps.flags) return { error: "The app can't flag moments here. Say so in a few words." };
     if (this.flaggedTurn === this.counts.userTurns) {
-      return { flagged: true, already: true, result: "Driver already flagged this moment.", instruction: "Driver already flagged it and has told the voice model to say so: don't say \"Flagged.\" or call flag again. Answer anything else they said, or reply with nothing." };
+      return { flagged: true, already: true, result: "The app already flagged this moment.", instruction: "The app already flagged it and has told the voice model to say so: don't say \"Flagged.\" or call flag again. Answer anything else they said, or reply with nothing." };
     }
     const user = spokenWords(this.deps.conversations.lastUserTurn(this.ids.conversationId).text);
     const said = [user, note?.trim() ? `(Noted: ${note.trim().slice(0, 500)})` : ""].filter(Boolean).join(" ") || "Flagged in the call.";
@@ -1406,7 +1406,7 @@ export class VoiceSession {
       ? {
           flagged: true, result: "Flagged this moment for review.",
           instruction: ask
-            ? "Say \"Flagged.\" once and ask them, in a few words, what went wrong: Driver adds their answer to the flag. Answer anything else they said."
+            ? "Say \"Flagged.\" once and ask them, in a few words, what went wrong: the app adds their answer to the flag. Answer anything else they said."
             : "Say \"Flagged.\" once, then answer anything else they said.",
         }
       : { error: "The flag couldn't be written just now, so nothing was flagged. Say so in a few words." };
@@ -1555,10 +1555,10 @@ export class VoiceSession {
     this.corrected.set(c.claim, note);
     this.conn.send({ type: "session.commentary.append", content: fill("call.correction", { claim: as, truth, next }), delegation_id: null });
     if (c.spoken) this.deps.conversations.correct(this.ids.conversationId, c.sentence, note);
-    this.log(`corrected a claim: Driver said "${c.sentence.slice(0, 120)}", but ${truth}`);
+    this.log(`corrected a claim: the voice said "${c.sentence.slice(0, 120)}", but ${truth}`);
     this.deps.record?.({ type: "correction", claim: c.claim, said: c.sentence, truth });
     const threads = waiting && waiting.action !== "settle_subagents" && waiting.action !== "start_work" && waiting.targets.length === 1 ? { threadId: waiting.targets[0].itemId } : {};
-    this.receipt({ kind: "correction", text: `Driver said it was ${as}, but ${truth.replace(/\.$/, "")}. It corrected itself.`, ...threads });
+    this.receipt({ kind: "correction", text: `The voice said it was ${as}, but ${truth.replace(/\.$/, "")}. It corrected itself.`, ...threads });
   }
 
   private heard() {
