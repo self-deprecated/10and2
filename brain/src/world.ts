@@ -9,9 +9,10 @@ import { namedItems } from "./voice/tools.ts";
 import { Conversations } from "./voice/session.ts";
 import { Waits } from "./waits.ts";
 
-export function wire(o: { adapter: Adapter; store: Store; classify: Classifier; writeOpener: OpenerWriter; profiles: LaunchProfile[]; log: (m: string) => void; track?: Track }) {
+/** `onDemand`: changed threads are summarized only while someone looks (briefing.ts); the demo summarizes at once. */
+export function wire(o: { adapter: Adapter; store: Store; classify: Classifier; writeOpener: OpenerWriter; profiles: LaunchProfile[]; log: (m: string) => void; track?: Track; onDemand?: boolean }) {
   const { adapter, store, log } = o;
-  const briefing = new Briefing({ adapter, store, classify: o.classify, writeOpener: o.writeOpener, log });
+  const briefing = new Briefing({ adapter, store, classify: o.classify, writeOpener: o.writeOpener, log, onDemand: o.onDemand });
   const conversations = new Conversations(store);
   const proposals = new Proposals({
     store,

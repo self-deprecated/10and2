@@ -3,29 +3,29 @@
 import type { Report } from "../adapter.ts";
 import { briefedMark, headTail, type Briefing, type BriefingView } from "../briefing.ts";
 import { mentionsThread, tellsAbout, UTTERANCE, withGroup } from "../handles.ts";
-import { agrees, KEPT, READBACK_ALL, spokenWords, trackChange, type ConfirmLevels, type KeepReplies, type ToolResult, type UserTurn } from "../proposals.ts";
+import { agrees, KEPT, notAYes, READBACK_ALL, spokenWords, trackChange, type ConfirmLevels, type KeepReplies, type ToolResult, type UserTurn } from "../proposals.ts";
 import type { Proposal, Seen, Store } from "../store.ts";
 import { isNewThread } from "../drafts.ts";
-import { spokenPlaces } from "../places.ts";
+import { spokenPlaces, type NewThreadDefaults } from "../places.ts";
 import type { WatchedReplies } from "../updates.ts";
 import type { LiveConn, SessionConfig } from "./live.ts";
-import { asOf, backendInstructions, briefed, briefingBlock, frontendInstructions, keptNote, launchNote, type Recent } from "./prompts.ts";
+import { asOf, backendInstructions, briefed, briefingBlock, frontendInstructions, keptNote, launchNote, type NewThreadPrompt, type Recent, type ThreadNames } from "./prompts.ts";
 import { namedItems, runTool, seenOf, TOOLS, type ToolDeps, type Watched } from "./tools.ts";
 import { masked, type ReadingStyle } from "../reading.ts";
 import { datedLine, driveBlock, historyLine } from "../drives.ts";
 import { ago, describe, realClock, type Clock, type Timer } from "../util.ts";
-import { endsWithGoodbye, initialEndState, step, type EndInput, type EndState } from "./endPolicy.ts";
+import { asksOnlyToStop, endsWithGoodbye, initialEndState, step, type EndInput, type EndState } from "./endPolicy.ts";
 import { deliberate, reasonText, type EndReason } from "./endReason.ts";
 import { asksToFlag, issueIn, type Flags } from "../flags.ts";
 import { fill, type Prompts } from "./sections.ts";
 import { median, type Calls } from "../calls.ts";
 import type { Track } from "../analytics.ts";
 import type { About, CallState, CallView } from "./callview.ts";
-import { asksAbout, asksRecap, CLAIM_OF, claimsIn, isRecap, type Claim } from "./claims.ts";
+import { asksAbout, asksRecap, CLAIM_OF, claimsIn, claimsOf, isRecap, type Claim } from "./claims.ts";
 import { correctArgs, vocabularyOf } from "../vocabulary.ts";
 import { tokensOf, type RecordSpend } from "../spend.ts";
 
-export { asksToPause, endsWithGoodbye } from "./endPolicy.ts";
+export { asksOnlyToStop, asksToPause, endsWithGoodbye } from "./endPolicy.ts";
 
 /** What each conversation has said, across the sessions (bursts) it spans. */
 export class Conversations {
@@ -111,12 +111,20 @@ export type SessionOptions = {
    * for the user, as before 3 November.
    */
   speakFirstNew?: boolean;
+  /** How Driver opens a new call it speaks first in (the phone's setting `greeting`); absent: "news". */
+  greeting?: Greeting;
   /** What a reply Driver words for a thread does (the phone's setting `keepReplies`); absent: "send". */
   keepReplies?: KeepReplies;
   /** The user's wake word (the phone's setting `wakeWord`); absent: "10 & 2". */
   wakeWord?: string;
+  /** How thread names are said (the phone's setting `threadNames`); absent: "called". */
+  threadNames?: ThreadNames;
   /** How the user agrees to each kind of change (the phone's setting `confirm`); absent: every change read back and heard. */
   confirm?: ConfirmLevels;
+  /** What asking for a new thread without saying what it's for does (the phone's setting `newThreadPrompt`); absent: "ask". */
+  newThreadPrompt?: NewThreadPrompt;
+  /** What a new thread uses where the user doesn't say (the phone's Settings → New threads); absent: none. */
+  newThreadDefaults?: NewThreadDefaults;
 };
 
 /** The user's notes and the changes from other conversations, since `memoryStart`. */
@@ -140,7 +148,8 @@ export type CallbackReply = { handle: string; outcome: string; report: Report; u
  * A reply the phone read out: how much of it the user heard, and its text (the reply as written, never a rewrite).
  * `itemId` and `at`: its thread, and when the reply finished, so it isn't told again as a new arrival.
  */
-export type ReadOut = { handle: string; heard: "all" | "part" | "none"; parts: number; of: number; text: string; itemId?: string; at?: string };
+/** `texts`: each reply of several read in a row, oldest first (`text` is them joined), each given its share of the room. */
+export type ReadOut = { handle: string; heard: "all" | "part" | "none"; parts: number; of: number; text: string; texts?: string[]; itemId?: string; at?: string };
 /**
  * A reply the user dictated on the phone and heard back there, open as proposal `proposalId` for them to agree to.
  * `keep` (the user's setting `keepReplies`): "ask" whether to send it now or keep it for later; "kept" for later already
@@ -150,9 +159,10 @@ export type ReadOut = { handle: string; heard: "all" | "part" | "none"; parts: n
 export type DictatedOut = { handle: string; proposalId: string | null; readback: string; newThread?: NewThreadOut; keep?: "ask" | "kept" };
 /**
  * A new thread's dictated prompt, kept as `keptId` (Not sent) until the user says what to do with it: `words` long, for
- * `place` if they named the project before dictating, else perhaps for a project it names (`suggested`).
+ * `place` if they named the project before dictating, else perhaps for a project it names (`suggested`). `named`: the
+ * project as they named it before dictating when it couldn't be settled, and `suggested` are its places to choose from.
  */
-export type NewThreadOut = { keptId: string; words: number; place: string | null; suggested: string[] };
+export type NewThreadOut = { keptId: string; words: number; place: string | null; suggested: string[]; named?: string };
 /** A reply the user was dictating when they went back to the conversation: saved on the phone, not sent. */
 /**
  * A reply left unsent when the user came back to the call: its thread and parts, and once the brain has kept it
@@ -198,6 +208,12 @@ function newsOf(replies: CallbackReply[], name: Name): string {
     return fill("news.reply", { what, report: data(report.text, Math.round(1500 / replies.length)) || fill("news.empty") });
   }).join("\n");
 }
+
+/**
+ * How Driver opens a new call (the phone's Settings → Calls → When a call starts): "news" says what happened since the
+ * last drive or what's waiting; "hello" only says it's there, and waits.
+ */
+export type Greeting = "news" | "hello";
 
 /** What a session's opening tells the voice model, from its sections (sections.ts); `prompts` overrides editable ones. */
 /** How long a hold was, as the voice model is told it: "less than a minute", "6 minutes", "1 hour and 5 minutes". */
@@ -282,7 +298,7 @@ const wordsOf = (n: number) => (n < 20 ? `${n} ${n === 1 ? "word" : "words"}` : 
 function readOut(read: ReadOut[], name: Name): string {
   const heard = read.map((r) => fill(r.heard === "all" ? "read.all" : r.heard === "part" ? "read.part" : "read.none", { name: name(r.handle, true), parts: r.parts, of: r.of }));
   const texts = read.filter((r) => r.heard !== "none").map((r) =>
-    fill("read.text", { name: name(r.handle), amount: fill(r.heard === "all" ? "read.text.all" : "read.text.start"), report: data(r.text, Math.round(1500 / read.length)) || fill("news.empty") }),
+    fill("read.text", { name: name(r.handle), amount: fill(r.heard === "all" ? "read.text.all" : "read.text.start"), report: (r.texts && r.texts.length > 1 ? r.texts.map((t) => data(t, Math.round(1500 / read.length / r.texts!.length))).join("\n\n") : data(r.text, Math.round(1500 / read.length))) || fill("news.empty") }),
   );
   return fill("read", { heard: heard.join("; "), texts: texts.join("\n") });
 }
@@ -305,6 +321,7 @@ export function backendNote(opening: Opening, name: Name = (h) => h): string | n
       size: wordsOf(t.words),
       kept: t.keptId,
       project: t.place ? fill("backend-note.draft.new-thread.placed", { place: t.place })
+        : t.named && t.suggested.length ? fill("backend-note.draft.new-thread.named", { named: t.named, projects: t.suggested.join("; or ") })
         : t.suggested.length ? fill("backend-note.draft.new-thread.suggested", { projects: t.suggested.join(" or ") }) : fill("backend-note.draft.new-thread.unplaced"),
     });
   }
@@ -338,7 +355,10 @@ export function preload(briefing: Briefing, now: Date): { block: string; key: st
     const item = items.get(c.itemId);
     const report = briefing.report?.(c.itemId);
     const running = c.status === "running";
-    const about = `"${c.handle}" [${c.group}] ${c.state.replace(/_/g, " ")}${c.reply ? ` ${asOf(c.reply.at, t)}` : ""}, last active ${ago(c.updatedAt, t)}${c.starred ? ", starred" : ""}`;
+    // The report is the reply as last read: a card behind it (`newer`) has no state for it yet, only its date.
+    const about = c.newer
+      ? `"${c.handle}" [${c.group}] replied ${ago(c.newer.at, t)} (not summarized yet), last active ${ago(c.updatedAt, t)}${c.starred ? ", starred" : ""}`
+      : `"${c.handle}" [${c.group}] ${c.state.replace(/_/g, " ")}${c.reply ? ` ${asOf(c.reply.at, t)}` : ""}, last active ${ago(c.updatedAt, t)}${c.starred ? ", starred" : ""}`;
     const entry = item && report?.text
       ? `${about}${running ? ", still working (this is its previous reply; details has its progress)" : ""}:\n<report>${data(report.text, 1200)}</report>${report.question ? `\nIts question to the user: ${data(report.question, 300)}` : ""}`
       : null;
@@ -395,7 +415,7 @@ export function buildSessionConfig(opts: SessionOptions, deps: ToolDeps, convers
   const name: Name = (h, mid) => (groups.has(h) ? withGroup(h, groups.get(h)!, mid) : h);
   // A new call that waits for the user (speak-first switched off) has no note for either model, as before 3 November.
   const silentNew = opening.kind === "new" && opts.speakFirstNew === false;
-  const text = silentNew ? null : openingNote(opening, changes, name, opts.prompts);
+  const text = silentNew ? null : opening.kind === "new" && opts.greeting === "hello" ? fill("opening.hello", {}, opts.prompts) : openingNote(opening, changes, name, opts.prompts);
   // The note of a call Driver opens by speaking (a new call, a call-back, back from a reading or a dictation) is the
   // user's turn, which the voice model answers. As a developer message, GPT-Live often began with a burst of another
   // language (eval, 4 November: 2 of 8 runs, none of 8 as the user's), and every burst in a recording since was at a
@@ -414,17 +434,18 @@ export function buildSessionConfig(opts: SessionOptions, deps: ToolDeps, convers
   const after = opening.kind === "callback" || opening.kind === "reading" || opening.kind === "draft" || opening.kind === "rejoin" || opening.kind === "continue";
   const input = after ? [...turns, ...note, ...said] : history.length || (opening.kind === "new" && !silentNew) ? [...note, ...turns] : undefined;
   const always = [{ type: "session.closed" }, { type: "error" }];
-  // The words the user says, for both models: their speech can come through misheard (vocabulary.ts).
+  // The words the user says, for both models: their speech can come through misheard (vocabulary.ts). Their own, as they
+  // made them (a machine's name too, "Quartz" heard as "Courts"), never added by the app.
   const words = vocabularyOf(deps.store).words();
   return {
     model: opts.liveModel,
-    instructions: frontendInstructions(block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL, opts.wakeWord, words),
+    instructions: frontendInstructions(block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL, opts.wakeWord, words, opts.threadNames),
     audio: opts.transport === "ws" ? { format: { type: "audio/pcm", rate: 24000 }, output: { voice: opts.voice } } : { output: { voice: opts.voice } },
     delegation: {
       type: "responses",
       responses: {
         model: opts.backendModel,
-        instructions: backendInstructions(block, now, silentNew ? null : backendNote(opening, name), deps.adapter.actions.includes("start_work") ? launchNote(spokenPlaces(deps.adapter.places?.() ?? []), deps.profiles ?? []) : null, preload(deps.briefing, now).block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL, keptFor(deps, now.getTime()), words),
+        instructions: backendInstructions(block, now, silentNew ? null : backendNote(opening, name), deps.adapter.actions.includes("start_work") ? launchNote(spokenPlaces(deps.adapter.places?.() ?? []), deps.profiles ?? []) : null, preload(deps.briefing, now).block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL, keptFor(deps, now.getTime()), words, opts.newThreadPrompt, opts.newThreadDefaults, opts.threadNames),
         tools: TOOLS.map((t) => ({ type: "function", strict: true, ...t })),
         // Never "required": it would loop on the answering response.
         tool_choice: "auto",
@@ -456,6 +477,10 @@ export function buildSessionConfig(opts: SessionOptions, deps: ToolDeps, convers
 const SPEECH_LEVEL = 0.02;
 /** News waits this long after the user's last loud sound. */
 const SOUND_HOLD_MS = 1500;
+/** News waits this long, at most, for the voice to start saying the backend's answer. */
+const ANSWER_SPOKEN_MS = 5000;
+/** News waits for the user's answer to a readback until nobody has spoken for this long. */
+const READBACK_HOLD_MS = 30_000;
 
 /** The RMS level of base64 16-bit little-endian PCM, 0 to 1. */
 export function level(b64: string): number {
@@ -588,6 +613,10 @@ export class VoiceSession {
     confirm?: ConfirmLevels;
     /** The phone brings a new thread's dictated prompt back to the call (`newThreads` "talk"): `dictate` needs no project. */
     promptsBack?: boolean;
+    /** What asking for a new thread without saying what it's for does (the phone's setting `newThreadPrompt`); absent: "ask". */
+    newThreadPrompt?: NewThreadPrompt;
+    /** What a new thread uses where the user doesn't say (the phone's Settings → New threads); absent: none. */
+    newThreadDefaults?: NewThreadDefaults;
     /**
      * The backend's instructions built afresh from the briefing: when given, a briefing refresh that changes the threads'
      * replies (`preload`) brings the backend up to date mid-session.
@@ -639,6 +668,7 @@ export class VoiceSession {
   private preloaded: Preloaded[];
   private preloadKey: string;
   private stopRefresh?: () => void;
+  private stopWatching?: () => void;
   /** Things to mark heard once the assistant names their thread, counted from when they were expected. */
   /**
    * `summary`: the thread's summary (its project named), which marks only that (`markBriefed`), never its reply heard,
@@ -667,6 +697,8 @@ export class VoiceSession {
    * the backend hung up on "Debug this again. Yeah, debug this", though its instructions say those words call no tool.
    */
   private onlyFlagged = false;
+  /** The user's latest turn was only "stop" (`asksOnlyToStop`): stop talking, so `hold` and `end_session` are refused. */
+  private onlyStopped = false;
   /**
    * The user's latest turn asked to dictate (`asksToDictate`) and the voice model began answering it, at `at`, with no
    * hand-off to the backend yet. On 9 November it said "Go ahead, I'm listening." and "Okay." and handed nothing over,
@@ -676,6 +708,8 @@ export class VoiceSession {
   /** When the user's microphone last carried speech-loud sound, and since when news has waited for them to be quiet. */
   private userSoundAt = 0;
   private heldSince = 0;
+  /** When the backend last finished answering: the voice says that answer next. */
+  private answeredAt = 0;
   /** For analytics: when the user's latest turn began waiting for an answer, the delegation under way, and counts. */
   private turnAt = 0;
   private delegatedAt = 0;
@@ -734,7 +768,9 @@ export class VoiceSession {
     // A reply the opening tells (a call-back's news, a reply the phone just read out) is where watching it begins: on
     // 7 November a call-back's reply, newer than the briefing's, was told again 24 s in as if it had just come.
     for (const o of [...(deps.news ?? []), ...(deps.read ?? [])]) if (o.itemId && o.at) this.opened.set(o.itemId, o.at);
-    if (deps.liveNotices !== false) for (const c of deps.briefing.view().cards) if (c.starred) this.watching.set(c.itemId, { handle: c.handle, baseline: this.later(c.itemId, c.reply?.at ?? null) });
+    this.watchStars();
+    // While the call is on, threads are summarized as they change (briefing.ts `onDemand`).
+    this.stopWatching = deps.briefing.watching?.();
     this.stopRefresh = deps.briefing.onRefresh?.(() => {
       this.refreshBackend();
       this.checkArrivals();
@@ -781,6 +817,27 @@ export class VoiceSession {
     }
   }
 
+  /**
+   * Watches every starred thread not yet watched (Settings `liveNotices`), from the stars themselves: on 14 November a
+   * thread started and starred minutes before the call had no card yet, so it wasn't watched, and its reply came during
+   * the call untold while the phone's tone rang. Run again before each look, so a thread starred during the call (star,
+   * start_work) is watched too. Where watching begins: the card's reply, or else the reply the star last saw.
+   */
+  private watchStars() {
+    if (this.deps.liveNotices === false) return;
+    const cards = new Map(this.deps.briefing.view().cards.map((c) => [c.itemId, c]));
+    const names = this.deps.briefing.names();
+    for (const [id, seen] of this.deps.store.starsSeen()) {
+      if (this.watching.has(id)) continue;
+      const card = cards.get(id);
+      // Not in the briefing's list yet (just started): a later look adds it, any reply it has by then being news.
+      const handle = card?.handle ?? names.get(id);
+      if (!handle) continue;
+      const at = card?.reply?.at ?? (seen.runAt ? new Date(seen.runAt).toISOString() : null);
+      this.watching.set(id, { handle, baseline: this.later(id, at) });
+    }
+  }
+
   /** Tells the user during this call when any of `threads` replies (`wait_for` staying on). */
   watch(threads: Watched[]) {
     const cards = new Map(this.deps.briefing.view().cards.map((c) => [c.itemId, c]));
@@ -816,7 +873,9 @@ export class VoiceSession {
 
   /** After a briefing refresh: watched threads with a reply newer than they had, not running and not yet told here. */
   private checkArrivals() {
-    if (this.ended || this.endState.closing || !this.watching.size) return;
+    if (this.ended || this.endState.closing) return;
+    this.watchStars();
+    if (!this.watching.size) return;
     const items = new Map(this.deps.briefing.allItems().map((i) => [i.id, i]));
     for (const c of this.deps.briefing.view().cards) {
       if (!c.reply || c.status === "running" || !this.isNews(c.itemId, c.reply.at)) continue;
@@ -833,7 +892,9 @@ export class VoiceSession {
    * and the briefing is refreshed at once so the backend has the reply too.
    */
   private async checkLive() {
-    if (this.ended || this.endState.closing || !this.watching.size || this.checkingLive || !this.deps.updates) return;
+    if (this.ended || this.endState.closing || this.checkingLive || !this.deps.updates) return;
+    this.watchStars();
+    if (!this.watching.size) return;
     this.checkingLive = true;
     try {
       const live = await this.deps.updates.replies([...this.watching.keys()]);
@@ -862,9 +923,10 @@ export class VoiceSession {
   }
 
   /**
-   * Tells the voice model, at a quiet moment (nobody speaking for 2 s, the backend and tools idle, no hang-up coming),
-   * which watched threads replied (`session.commentary.append`: context it's to tell the user). The backend has their
-   * replies from the refresh that found them, or the one a live look asks for. One the user heard meanwhile is dropped.
+   * Tells the voice model, at a quiet moment (nobody speaking for 2 s, the backend and tools idle and its answer said,
+   * no readback waiting for its yes, no hang-up coming), which watched threads replied (`session.commentary.append`:
+   * context it's to tell the user). The backend has their replies from the refresh that found them, or the one a live
+   * look asks for. One the user heard meanwhile is dropped.
    */
   private tellArrivals() {
     if (!this.arrived.length || this.ended) return;
@@ -872,6 +934,11 @@ export class VoiceSession {
     const now = this.clock.now();
     if (e.closing || e.endRequestedAt || e.awaitingReply || this.backendBusy || this.toolsRunning > 0 || this.pending.size > 0) return;
     if (now - Math.max(e.lastUserDelta, e.lastAssistantDelta) < 2000) return;
+    // On 14 November news went 0.3 s after the backend's readback, before the voice had begun saying it, and the voice
+    // put it straight after "Send it now, or keep it for later?". The backend's answer is said first, and a readback
+    // waiting for its yes is answered first, unless nobody speaks for a long while.
+    if (this.answeredAt > e.lastAssistantDelta && now - this.answeredAt < ANSWER_SPOKEN_MS) return;
+    if (this.holdingYes() && now - Math.max(e.lastUserDelta, e.lastAssistantDelta) < READBACK_HOLD_MS) return;
     // The user's words reach the transcript a second or more after they start: on 5 November news broke in as Jordan
     // began a question, and the question went unanswered. Their microphone is a sooner sign, for 20 s at most (a noisy car).
     this.heldSince ||= now;
@@ -1175,6 +1242,7 @@ export class VoiceSession {
       this.log(`backend answered ${this.since()}`);
       this.counts.backendAnswers++;
       const now = this.clock.now();
+      this.answeredAt = now;
       this.track("backend_answered", {
         ms: this.delegatedAt ? now - this.delegatedAt : null,
         after_speech_ms: this.endState.lastUserDelta ? now - this.endState.lastUserDelta : null,
@@ -1261,10 +1329,13 @@ export class VoiceSession {
       watch: (threads) => this.watch(threads),
       userSpoke: () => this.endState.userWords.trim() !== "",
       onlyFlagged: () => this.onlyFlagged,
+      onlyStopped: () => this.onlyStopped,
       keepReplies: this.deps.keepReplies,
       confirm: this.deps.confirm,
       awaitingDraft: () => this.deps.opening === "draft" && this.endState.userWords.trim() === "",
       promptsBack: this.deps.promptsBack,
+      newThreadPrompt: this.deps.newThreadPrompt,
+      newThreadDefaults: this.deps.newThreadDefaults,
       about: (threads) => about.push(...threads),
       flag: (note) => this.flagFromTool(note),
     };
@@ -1328,6 +1399,7 @@ export class VoiceSession {
     this.userSaid = "";
     // Only a turn with words in it changes what the user last asked; "debug this" alone (no goodbye) never ends the call.
     if (spokenWords(said)) this.onlyFlagged = asksToFlag(spokenWords(said)) && !endsWithGoodbye(said);
+    if (spokenWords(said)) this.onlyStopped = asksOnlyToStop(spokenWords(said), this.deps.wakeWord);
     if (spokenWords(said) && !BACKCHANNEL.test(spokenWords(said))) {
       this.floor = this.userTurnAt;
       this.floorSaid = spokenWords(said);
@@ -1336,6 +1408,10 @@ export class VoiceSession {
       this.corrected.clear();
     }
     if (spokenWords(said) && agrees(said)) void this.yesHeard();
+    // The first answer to a readback: anything but a yes or a keep ends it ("debug this" and "mm-hmm" aren't answers).
+    if (spokenWords(said) && !BACKCHANNEL.test(spokenWords(said)) && !asksToFlag(said)) {
+      this.answered(said, this.deps.conversations.lastUserTurn(this.ids.conversationId).atSpoken);
+    }
     if (spokenWords(said)) {
       const names = namedItems(this.deps.briefing).map((n) => n.handle);
       this.dictateAsked = this.deps.promptsBack && asksToDictate(said, names) ? { turn: this.counts.userTurns, at: this.clock.now() } : null;
@@ -1413,6 +1489,35 @@ export class VoiceSession {
   }
 
   /**
+   * The user's first answer to a readback (their turn began after it was proposed, at `atSpoken`): a yes or a keep marks
+   * it answered, for the backend's (or the brain's, `yesHeard`) confirm or keep; anything else (`notAYes`) cancels it,
+   * as the backend's `cancel` would, so its Send card goes and the call carries on as a conversation; if they still want
+   * it, it's proposed and read back again. On 14 November the voice model answered a "No" over a readback with "Okay.
+   * Not doing that." and handed nothing to the backend: the card stayed. Once answered, later turns leave it be (17
+   * October: "Do it", then "Well" while the voice model stalled). A change at "tap" waits for Send on the phone.
+   */
+  private answered(said: string, atSpoken: number) {
+    if (this.ended || this.endState.closing) return;
+    const waiting = this.deps.store.openProposals(this.ids.conversationId)
+      .filter((p) => p.state === "proposed" && !p.fields.answered && p.fields.confirm !== "tap" && p.createdFrom < atSpoken);
+    const no = notAYes(said);
+    for (const p of waiting) {
+      try {
+        if (!no) {
+          this.deps.store.putProposal({ ...p, fields: { ...p.fields, answered: true } });
+          continue;
+        }
+        this.deps.proposals.cancel(this.ids.conversationId, p.id);
+        this.deps.record?.({ type: "not_agreed", proposalId: p.id });
+        this.log(`the user's answer to ${p.id} wasn't a yes: cancelled`);
+        this.track("proposal_answered", { answer: "no", via: "voice", action: p.action });
+      } catch (e) {
+        this.log(`couldn't cancel ${p.id} (${describe(e)})`);
+      }
+    }
+  }
+
+  /**
    * The user's turn is a clear yes, and one change is waiting for it at "Ask" (`confirm` level "yes"): the brain carries
    * it out itself, as it does a tap on Send, and tells the voice model the result. On 7 November (22:43) the voice model
    * answered "Send it now" with "Sent." three times without handing the yes to the backend, so nothing was sent until the
@@ -1436,7 +1541,7 @@ export class VoiceSession {
       this.log(`heard the user's yes for ${p.id}: carried out (${after.state})`);
       this.track("proposal_answered", { answer: "yes", via: "voice", action: after.action });
       trackChange(this.track, after, "voice");
-      if ((after.state === "executed" || after.state === "partial") && CLAIM_OF[after.action]) this.didNow(CLAIM_OF[after.action]);
+      this.didChange(after);
       if (this.ended || this.endState.closing) return;
       this.conn.send({
         type: "session.commentary.append",
@@ -1465,6 +1570,11 @@ export class VoiceSession {
     this.did.push({ claim, at: this.clock.now() });
   }
 
+  /** A change carried out just now: each claim it makes (claims.ts `claimsOf`). */
+  private didChange(p: Proposal) {
+    for (const claim of claimsOf(p)) this.didNow(claim);
+  }
+
   /** What a tool that ran did, for the claim check: a change carried out, a reply kept, a thread starred, a flag. */
   private didBy(name: string, args: any, result: Record<string, unknown>) {
     if (!result || "error" in result) return;
@@ -1473,7 +1583,7 @@ export class VoiceSession {
     if (name === "remember" && result.saved === true) return this.didNow("done");
     const id = name === "confirm" ? args?.proposal_id : result.proposal_id;
     const p = typeof id === "string" ? this.deps.store.proposal(id) : null;
-    if (p && (p.state === "executed" || p.state === "partial") && CLAIM_OF[p.action]) this.didNow(CLAIM_OF[p.action]);
+    if (p) this.didChange(p);
   }
 
   /** Driver's sentences that are over since the last look: their claims, to judge once the backend is idle. */
@@ -1535,7 +1645,7 @@ export class VoiceSession {
     try {
       return this.deps.store.proposalsFor(this.ids.conversationId).some((p) => claim === "kept"
         ? p.state === "cancelled" && p.result === KEPT
-        : (p.state === "executed" || p.state === "partial") && CLAIM_OF[p.action] === claim);
+        : claimsOf(p).includes(claim));
     } catch {
       return false;
     }
@@ -1592,7 +1702,7 @@ export class VoiceSession {
   tapped(verb: "confirm" | "cancel", p: Proposal) {
     if (this.ended || this.endState.closing) return;
     this.deps.record?.({ type: "tap", verb, proposalId: p.id, state: p.state });
-    if (verb === "confirm" && (p.state === "executed" || p.state === "partial") && CLAIM_OF[p.action]) this.didNow(CLAIM_OF[p.action]);
+    if (verb === "confirm") this.didChange(p);
     this.log(`the user tapped ${verb === "confirm" ? "Send" : "Don't"} for ${p.id} (${p.state})`);
     const content = verb === "confirm"
       ? fill("call.tapped-yes", { readback: p.readback, result: p.result ?? fill("call.tapped-yes.nothing") })
@@ -1673,6 +1783,7 @@ export class VoiceSession {
     if (this.ended) return;
     this.ended = true;
     this.stopRefresh?.();
+    this.stopWatching?.();
     this.clock.clear(this.tick);
     if (this.liveTimer) this.clock.clear(this.liveTimer);
     if (this.closeTimer) this.clock.clear(this.closeTimer);

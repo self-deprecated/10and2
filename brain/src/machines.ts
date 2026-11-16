@@ -81,6 +81,8 @@ export class Machines implements Adapter {
           id: this.id(m, i.id),
           parentId: i.parentId === null ? null : this.id(m, i.parentId),
           group: `${i.group}, on ${spoken(m.name)}`,
+          project: i.group,
+          machine: spoken(m.name),
         }));
       }),
     );

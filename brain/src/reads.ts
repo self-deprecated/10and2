@@ -25,7 +25,7 @@ export async function newReplies(deps: Pick<ReadDeps, "adapter" | "briefing">) {
 export async function markRead(deps: ReadDeps, itemId: string, messageId: string, conversationId: string | null): Promise<{ ok: true } | { error: string }> {
   const card = () => deps.briefing.view().cards.find((c) => c.itemId === itemId)?.reply;
   if (card()?.messageId !== messageId && (await deps.adapter.replies?.(itemId).catch(() => null))?.[0]?.messageId === messageId) {
-    await deps.briefing.refresh([itemId]);
+    await deps.briefing.refresh([itemId], true);
   }
   const reply = card();
   if (!reply) return { error: "no reply to mark read for that thread" };

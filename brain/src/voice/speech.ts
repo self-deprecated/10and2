@@ -15,6 +15,12 @@ const INSTRUCTIONS = "Read this aloud clearly and naturally, at a calm, steady p
 /** Turns text into AAC audio; tests swap in a fake. */
 export type Synthesize = (text: string, voice: string) => Promise<Buffer>;
 
+/**
+ * Audio a meter charged for (the cloud's `metered`): `charged`, the seconds of minutes making it used. Absent where
+ * nothing is metered (Lattice, the account's own key, a demo).
+ */
+export type Spoken = Buffer & { charged?: number };
+
 /** What one synthesis made: characters spoken, seconds of audio (measured from it), retries. */
 export type SpeechUsed = { chars: number; seconds: number | undefined; retries: number };
 
@@ -46,6 +52,11 @@ export function openAiSpeech(apiKey: string, model: string, spent?: (u: SpeechUs
  */
 export class Speech {
   private readonly making = new Map<string, Promise<Buffer>>();
+  /**
+   * Seconds of minutes audio used when it was made and nobody has been told yet: made ahead (`warmUp`), or asked for
+   * twice at once. The first request served that audio says so (`charge`), so the phone counts each charge once.
+   */
+  private readonly unreported = new Map<string, number>();
   /** Paid: three at a time, however many segments a phone asks for. */
   private readonly speaking = limiter(3);
   private written = 0;
@@ -59,11 +70,12 @@ export class Speech {
   }
 
   audio(text: string, voice: string): Promise<Buffer> {
-    const key = createHash("sha256").update(JSON.stringify([this.opts.model, voice, INSTRUCTIONS, text])).digest("hex").slice(0, 32);
+    const key = this.key(text, voice);
     let made = this.making.get(key);
     if (!made) {
       const path = `speech/${key}.aac`;
-      made = this.files.read(path).catch(() => null).then((kept) => kept ? Buffer.from(kept) : this.speaking(() => this.opts.synthesize(text, voice)).then(async (audio) => {
+      made = this.files.read(path).catch(() => null).then((kept) => kept ? Buffer.from(kept) : this.speaking(() => this.opts.synthesize(text, voice)).then(async (audio: Spoken) => {
+        if (audio.charged) this.remember(key, audio.charged);
         try {
           await this.files.write(path, audio);
           // The size limit holds between the hourly tidies too.
@@ -76,6 +88,24 @@ export class Speech {
       this.making.set(key, made);
     }
     return made;
+  }
+
+  /** The seconds of minutes making this audio used, if nobody has been told yet; told once. */
+  charge(text: string, voice: string): number {
+    const key = this.key(text, voice);
+    const seconds = this.unreported.get(key) ?? 0;
+    this.unreported.delete(key);
+    return seconds;
+  }
+
+  private key(text: string, voice: string): string {
+    return createHash("sha256").update(JSON.stringify([this.opts.model, voice, INSTRUCTIONS, text])).digest("hex").slice(0, 32);
+  }
+
+  /** Kept for the next request of that audio; the oldest forgotten past a few hundred (made ahead and never asked for). */
+  private remember(key: string, seconds: number) {
+    this.unreported.set(key, (this.unreported.get(key) ?? 0) + seconds);
+    if (this.unreported.size > 500) this.unreported.delete(this.unreported.keys().next().value!);
   }
 
   async prune(now = Date.now()) {

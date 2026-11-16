@@ -11,7 +11,7 @@ import { FORBIDDEN } from "./user-text.ts";
  * The eval suite a pass was measured with: part of the template hash, so a pass from an older suite doesn't count for
  * this one. Raise it whenever the scenarios in eval/run.ts, or how they're judged, change.
  */
-export const EVAL_SUITE_VERSION = 2;
+export const EVAL_SUITE_VERSION = 7;
 
 /** Free seconds a day (UTC) for each allowance label (Clerk `public_metadata.driver.allowance`): testers, and the stage account. */
 export const ALLOWANCES = { tester: 600, presenter: 3 * 3600 } as const;
@@ -37,11 +37,12 @@ export const MINUTES = {
 export type Minutes = { -readonly [K in keyof typeof MINUTES]: number };
 
 /**
- * The most an account's background work (spend.ts `BACKGROUND`: the briefing's classifier, opener and writer, and
- * rewrites) may cost Driver in a UTC day, in cents. Past it, that work waits for the next day: the briefing is put
- * together from the cards, as at zero minutes (cloud/src/costs.ts). Provisional until measured (cost-tracking.md).
+ * A safety limit, in cents, on what an account's background work (spend.ts `BACKGROUND`: the briefing's classifier,
+ * opener and writer, and rewrites) may cost Driver in a UTC day: a fuse against a fault, never reached in normal use
+ * (summaries are made only when someone looks, cost-tracking.md). Past it, that work waits for the next day: cards say
+ * a thread has a newer reply rather than give an old summary as current, and Ops' Costs shows the day.
  */
-export const BACKGROUND_CENTS_PER_DAY = 25;
+export const BACKGROUND_CENTS_PER_DAY = 200;
 
 /**
  * The longest a session may be set to run before it rolls over: with `ROLL_LATE` it still ends before a deferred code
@@ -192,7 +193,7 @@ export const SETTINGS: Record<string, { label: string; check: Check; gated?: boo
     check: fields({ fastPercent: int(100, 400), readingCharsPerSecond: int(10, 200), pickupSeconds: int(0, 60), trialDailySeconds: int(0, 3600), trialDays: int(0, 14) }),
   },
   allowances: { label: "Free seconds each UTC day, by account label", check: fields({ tester: int(0, 3600), presenter: int(0, 14_400) }) },
-  backgroundCentsPerDay: { label: "Background work (briefing, rewrites) each account may cost us a UTC day (cents)", check: int(0, 500) },
+  backgroundCentsPerDay: { label: "Safety limit on background work (briefing, rewrites) per account per UTC day (cents)", check: int(0, 500) },
   banner: { label: "Banner in the app, shown once", check: banner },
   minBuild: { label: "Oldest iOS build that may start a new call", check: fields({ ios: (v) => (v === null || (typeof v === "string" && /^\d{12}$/.test(v)) ? null : "must be a 12-digit build or none") }) },
   liveModel: { label: "Voice model", check: oneOf(LIVE_MODELS), gated: true },

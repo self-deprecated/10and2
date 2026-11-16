@@ -264,7 +264,11 @@ export class RemoteAdapter implements Adapter {
     try {
       const r = await this.request("tools/call", { name: kind, arguments: args, _meta: { "tenandtwo/key": key, "tenandtwo/ttlMs": this.opts.timeoutMs } });
       if (!validReceipt(r?.structuredContent)) return { ok: false, unknown: true, error: `${spoken(this.name)} answered with something the app doesn't understand; the outcome may be unknown.` };
-      return r.structuredContent;
+      const receipt: Receipt = r.structuredContent;
+      // The connector answers a start once its own view has the thread; read that view now, rather than on its notice,
+      // so the new thread is listed, with its name, as Driver says it started (14 November).
+      if (receipt.ok && receipt.itemId && !this.state.items.some((i) => i.id === receipt.itemId) && this.wire) await this.read(this.wire).catch(() => {});
+      return receipt;
     } catch (e) { return this.failed(e); }
   }
 

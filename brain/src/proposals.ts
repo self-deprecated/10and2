@@ -10,7 +10,7 @@ import { dictatedParts, DRAFT_MAX, draftState, newThreadName, newThreadTarget, p
 import { inGroup, isMark, keyWords, nameKey, norm, pick, resolve, sayKey, saysHead, speechTokens, spokenTitle, withGroup, type Named } from "./handles.ts";
 import { TAP, type KeptReply, type Proposal, type ProposalTarget, type Store } from "./store.ts";
 import { mapLimit } from "./util.ts";
-import { otherNames, spokenPlaces } from "./places.ts";
+import { NO_DEFAULTS, otherNames, preferred, spokenPlaces, type NewThreadDefaults } from "./places.ts";
 import type { Track } from "./analytics.ts";
 
 export type ProposeAction = "follow_up" | "settle" | "snooze" | "archive" | "settle_subagents" | "start_work";
@@ -28,6 +28,8 @@ export type ProposeInput = {
   until: string | null;
   project?: string | null;
   profile?: string | null;
+  /** start_work: what it uses where the user didn't say (Settings → New threads); absent: nothing, so Driver asks. */
+  defaults?: NewThreadDefaults;
 };
 export type ToolResult = Record<string, unknown>;
 /** The user's latest turn and how much the assistant had said when it began. */
@@ -106,8 +108,11 @@ export type ProposalDeps = {
   /** Where new work can start (the adapter's places), and what it may run with: the first profile is the default. */
   places?: () => Place[];
   profiles?: LaunchProfile[];
-  /** A new thread was started: let the briefing know it (and what Driver calls it, where), so it can be named straight away. */
-  started?: (itemId: string, started: { title: string; group: string }) => Promise<void>;
+  /**
+   * A new thread was started: let the briefing know it (and what Driver calls it, where), so it can be named straight
+   * away. Gives the name the work system gave it, once it lists it, else null.
+   */
+  started?: (itemId: string, started: { title: string; group: string }) => Promise<string | null | void>;
   /** Everything the assistant has said aloud in this conversation. */
   spoken: (conversationId: string) => string;
   lastUserTurn: (conversationId: string) => UserTurn;
@@ -183,11 +188,14 @@ function lookalike(targets: { itemId: string; handle: string; group?: string }[]
     for (const o of others) {
       if (o.id === t.itemId || sayKey(o.handle) === sayKey(t.handle)) continue;
       const mine = one ? nameTokens(`${verb} ${t.handle}`) : nameTokens(t.handle);
-      // An open thread's readback, said with its project or without. A settled one is never read back, so only its
-      // bare name could be taken for this one's.
-      for (const name of new Set([o.handle, ...(isOpen.has(o.id) ? [said(o)] : [])])) {
-        const theirs = one ? speechTokens(`${verb} ${name}${next ? ` ${next}` : "."}`) : speechTokens(name);
-        if (saysHead(theirs, mine, one ? next : null, whereTokens(t))) return { target: t.handle, other: o.handle };
+      // An open thread's readback, said with its project or without, and with "the thread called" before the name (the
+      // setting threadNames). A settled one is never read back, so only its bare name could be taken for this one's.
+      const read = isOpen.has(o.id) ? [said(o)] : [];
+      for (const name of new Set([o.handle, ...read, ...read.flatMap((r) => [`the thread called ${o.handle}`, `the thread called ${r}`])])) {
+        // In a list, each name ends its clause ("…: Agent Reel; Dashboard.").
+        const theirs = one ? speechTokens(`${verb} ${name}${next ? ` ${next}` : "."}`) : speechTokens(`${name};`);
+        // Where the name starts, as `heard` allows "the thread called" there.
+        if (saysHead(theirs, mine, one ? next : null, whereTokens(t), one ? 1 : 0)) return { target: t.handle, other: o.handle };
       }
     }
   }
@@ -260,7 +268,7 @@ function inOrder(wanted: string[], said: string[]): number {
 /** True when every must-hear group appears in what was spoken after that group's starting point. */
 export function heard(p: Pick<Proposal, "mustHear">, spoken: string, atSpoken = spoken.length): boolean {
   return p.mustHear.every((g) => {
-    if (g.head) return saysHead(speechTokens(spoken.slice(g.from)), g.head, g.next ?? null, g.where);
+    if (g.head) return saysHead(speechTokens(spoken.slice(g.from)), g.head, g.next ?? null, g.where, g.named);
     if (g.message !== undefined) {
       // Only an empty message prefix may carry into the immediately following utterance. Either question after a
       // readback ends it: its words are never the message's.
@@ -286,6 +294,11 @@ export function heard(p: Pick<Proposal, "mustHear">, spoken: string, atSpoken = 
         const midWord = /[a-z0-9'’]$/i.test(before) && /^[a-z0-9'’]/i.test(said.slice(cut));
         const completeWords = midWord ? before.replace(/[a-z0-9'’]+$/i, "") : before;
         const words = messageWords(completeWords);
+        // A message with no key words ("on it") has nothing to count, so all of its words must have been heard.
+        if (g.words.length === 0) {
+          const whole = speechTokens(messageText(g.message));
+          if (inOrder(whole, speechTokens(messageText(completeWords))) < whole.length) continue;
+        }
         let expected = g.message;
         let need = g.words.length - Math.floor(g.words.length / 10);
         // A continuation proves a cut-in only if we can map the heard prefix and its next word.
@@ -329,6 +342,18 @@ export const agrees = (said: string) => {
   return (YES.test(s) || SEND_NOW.test(s)) && !NO.test(s);
 };
 
+// "Keep it", "later", "not now": the backend's `keep`, for a reply asked about with "Send it now, or keep it for later?".
+const KEEP_IT = /\b(keep|later|not now|save)\b/i;
+/**
+ * The user's answer to a readback is neither a yes (`agrees`, the only answer a spoken confirm takes) nor a keep: "No",
+ * "No, on Quartz", "What's in it?". The change waiting for it is cancelled (`VoiceSession.notAgreed`), as the backend is
+ * told to do for a decline, a hesitation or a change, and proposed again if they want it.
+ */
+export const notAYes = (said: string) => {
+  const s = spokenWords(said);
+  return s !== "" && !agrees(s) && !KEEP_IT.test(s);
+};
+
 /** What a spoken message can't contain, or null: the readback's own markers, and more than a voice follow-up holds. */
 function badMessage(message: string): string | null {
   if (!message) return "What should the message say? Ask the user.";
@@ -340,28 +365,64 @@ function badMessage(message: string): string | null {
 
 /**
  * Which place the user means: their words for a project, with or without its machine ("driver", "expo on Quartz"). The
- * same project on two machines is theirs to settle. Pure, for tests.
+ * same project on two machines is theirs to settle, unless they already did: their latest words (`hint.said`) name one
+ * of its machines ("start a thread in driver on Lattice", which the backend passed on as "driver" on 14 November), or
+ * it's the place the prompt was dictated for (`hint.placeId`). Pure, for tests.
  */
-export function pickPlace(spoken: string, given: Place[]): { place: Place } | { error: string } {
+export function pickPlace(spoken: string, given: Place[], hint: { said?: string; placeId?: string | null } = {}): { place: Place } | { error: string } {
   // Said as the user can say them: no two alike (places.ts).
   const places = spokenPlaces(given);
   if (!places.length) return { error: "The app can't see any projects right now: their machines may be unreachable. Say so." };
+  const found = lookUp(spoken, places);
+  if ("place" in found) return found;
+  const settled = settle(found.options, hint);
+  if (settled) return { place: settled };
+  // Each option a clause of its own: names have commas in them ("nix, on Lattice").
+  if (found.options.length > 1) return { error: `"${spoken}" could mean ${found.options.map((o) => o.name).join("; or ")}. Ask the user which, in those words.` };
+  const recent = [...places].sort((a, b) => (b.activeAt ?? "").localeCompare(a.activeAt ?? "")).slice(0, 6).map((p) => p.name);
+  return { error: `${found.words ? `No project matches "${spoken}".` : "Which project?"} Projects active lately: ${recent.join("; ")}. Ask the user which.` };
+}
+
+/**
+ * The places the user's words for a project could be when `pickPlace` can't settle them without asking: the same project
+ * on two machines ("driver, on Lattice" and "driver, on Quartz"), as said among `given`. Empty for one match or none.
+ */
+export function placeOptions(spoken: string, given: Place[]): string[] {
+  const found = lookUp(spoken, spokenPlaces(given));
+  return "options" in found && found.options.length > 1 ? found.options.map((o) => o.name) : [];
+}
+
+/** The place the user's words name, or the ones they could mean (`places` as `spokenPlaces` says them). */
+function lookUp(spoken: string, places: Place[]): { place: Place } | { options: Place[]; words: string } {
   const words = spoken.replace(/\b(project|repo|repository|machine)\b/gi, " ").trim();
   const named = places.map((p) => ({ id: p.id, handle: p.name, group: "", title: p.name.replace(/, on [\w-]+$/, "") }));
   const r = words ? resolve(words, named) : { kind: "none" as const };
   if (r.kind === "match") return { place: places.find((p) => p.id === r.item.id)! };
-  // Each option a clause of its own: names have commas in them ("nix, on Lattice").
-  if (r.kind === "ambiguous") return { error: `"${spoken}" could mean ${r.options.map((o) => o.handle).join("; or ")}. Ask the user which, in those words.` };
+  if (r.kind === "ambiguous") return { options: r.options.map((o) => places.find((p) => p.id === o.id)!), words };
   // Another name for it: its repository's or its folder's ("mono nix" is the project "nix" in mono/nix), with the machine
   // if they said one.
   const key = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
   const machine = / on ([\w-]+)$/i.exec(words.replace(/,/g, ""))?.[1]?.toLowerCase();
   const said = key(machine ? words.replace(/,?\s+on\s+[\w-]+$/i, "") : words);
   const also = said ? places.filter((p) => otherNames(p).some((n) => key(n) === said) && (!machine || p.name.toLowerCase().endsWith(`, on ${machine}`))) : [];
-  if (also.length === 1) return { place: also[0] };
-  if (also.length > 1) return { error: `"${spoken}" could mean ${also.map((p) => p.name).join("; or ")}. Ask the user which, in those words.` };
-  const recent = [...places].sort((a, b) => (b.activeAt ?? "").localeCompare(a.activeAt ?? "")).slice(0, 6).map((p) => p.name);
-  return { error: `${words ? `No project matches "${spoken}".` : "Which project?"} Projects active lately: ${recent.join("; ")}. Ask the user which.` };
+  return also.length === 1 ? { place: also[0] } : { options: also, words };
+}
+
+/**
+ * One project on several machines (`options`, "driver, on Lattice" and "driver, on Quartz"), settled by the user's own
+ * words naming exactly one of those machines ("… on Lattice"), else by the place it was meant for already. Options that
+ * are different projects are never settled here.
+ */
+function settle(options: Place[], hint: { said?: string; placeId?: string | null }): Place | null {
+  const project = (p: Place) => sayKey(p.name.replace(/, on [\w-]+$/, ""));
+  if (options.length < 2 || options.some((o) => project(o) !== project(options[0]))) return null;
+  const said = ` ${(hint.said ?? "").toLowerCase().replace(/[^\p{L}\p{N}-]+/gu, " ")} `;
+  const byWords = options.filter((o) => {
+    const machine = /, on ([\w-]+)$/.exec(o.name)?.[1]?.toLowerCase();
+    return machine && said.includes(` on ${machine} `);
+  });
+  if (byWords.length === 1) return byWords[0];
+  return options.find((o) => o.id === hint.placeId) ?? null;
 }
 
 /** How long a dictated draft is, as its readback says it: "about 310 words in 3 parts". */
@@ -430,7 +491,7 @@ export class Proposals {
       readback = `Settle ${ids.length} finished subagent ${ids.length === 1 ? "thread" : "threads"} under ${groups.length} parent ${groups.length === 1 ? "thread" : "threads"}.`;
       entities.push({ words: ["subagent", "sub", "agent", "review", "finish"], need: 1 });
     } else if (input.action === "start_work") {
-      const start = this.newThread({ project: input.project ?? "" }, input.profile ?? null);
+      const start = this.newThread({ project: input.project ?? "", conversationId, defaults: input.defaults }, input.profile ?? null);
       if ("error" in start) return start;
       const message = (input.message ?? "").trim();
       const bad = badMessage(message);
@@ -489,10 +550,10 @@ export class Proposals {
         readback = one ? `${verb} ${listed}.` : `${verb} ${targets.length} threads: ${listed}.`;
       }
       if (one) {
-        entities.push({ words: [], need: 0, head: nameTokens(`${verb} ${targets[0].handle}`), where: whereTokens(targets[0]), next });
+        entities.push({ words: [], need: 0, head: nameTokens(`${verb} ${targets[0].handle}`), named: 1, where: whereTokens(targets[0]), next });
       } else {
         entities.push({ words: [], need: 0, head: nameTokens(`${verb} ${targets.length} threads`), next: input.action === "snooze" ? "until" : null });
-        for (const t of targets) entities.push({ words: [], need: 0, head: nameTokens(t.handle), where: whereTokens(t), next: null });
+        for (const t of targets) entities.push({ words: [], need: 0, head: nameTokens(t.handle), named: 0, where: whereTokens(t), next: null });
       }
       const clash = lookalike(targets, verb, next, named, this.d.settled?.() ?? []);
       if (clash) return { error: tooAlike(clash) };
@@ -539,7 +600,7 @@ export class Proposals {
       const kept = this.keep(conversationId, p.id);
       const words = fields.message!.split(/\s+/);
       const first = words.length <= 6 ? `${fields.message!.replace(/[\s.!?,;:]+$/, "")}.` : `${words.slice(0, 6).join(" ").replace(/[\s.!?,;:]+$/, "")}…`;
-      return { kept: true, kept_id: kept.kept_id, result: `Kept your reply to ${targets[0].handle}, unsent: it's in Not sent on the phone.`, instruction: `Say only "Kept: ${first} It's in Not sent." (no readback: nothing was sent), then carry on with what they want next.` };
+      return { kept: true, kept_id: kept.kept_id, result: `Kept your reply to ${targets[0].handle}, unsent: it's in Drafts on the phone.`, instruction: `Say only "Kept: ${first} It's in Drafts." (no readback: nothing was sent), then carry on with what they want next.` };
     }
     if (atOnce) {
       // The user's settings ask no yes for this: asking for it was enough.
@@ -562,16 +623,20 @@ export class Proposals {
   /**
    * Where a new thread starts and with which profile, from the user's words (`project`) or, for a dictated start, the
    * place it was dictated for (`placeId`). `head` is the readback up to its message, all heard word for word. The work
-   * system names the thread.
+   * system names the thread. `defaults` (Settings → New threads) fill in what the user didn't say: the project when they
+   * named none, and the machine and coding app of a project in several (`preferred`).
    */
-  newThread(where: { project: string } | { placeId: string }, asked: string | null): { place: Place; profile: LaunchProfile; head: string; heard: MustHear[] } | { error: string } {
+  newThread(where: { project: string; conversationId?: string; defaults?: NewThreadDefaults } | { placeId: string }, asked: string | null): { place: Place; profile: LaunchProfile; head: string; heard: MustHear[] } | { error: string } {
     const profiles = this.d.profiles ?? [];
     const profile = this.profileOf(asked);
     if ("error" in profile) return profile;
-    const places = spokenPlaces(this.d.places?.() ?? []);
+    const given = this.d.places?.() ?? [];
+    const places = spokenPlaces(given);
     let place: Place;
     if ("project" in where) {
-      const found = pickPlace(where.project, places);
+      // The user's latest words may settle a project on two machines that the backend passed on without its machine.
+      const said = where.conversationId ? this.d.lastUserTurn(where.conversationId).text : "";
+      const found = this.pickWithDefaults(where.project, given, said, null, where.defaults);
       if ("error" in found) return found;
       place = found.place;
     } else {
@@ -583,6 +648,19 @@ export class Proposals {
     const twin = places.find((o) => o.id !== place.id && sayKey(o.name) === sayKey(place.name));
     if (twin) return { error: tooAlike({ target: place.name, other: twin.name }) };
     return { place, profile, head: `Start a new thread in ${place.name}, with the ${profile.name} profile`, heard: startHeard(place, places, profile, profile === profiles[0]) };
+  }
+
+  /**
+   * `pickPlace` with the user's defaults: the default project when they named none, and of a project's places only those
+   * on the default machine and in the default coding app (`preferred`), unless their words (`said`, and the project as
+   * passed on) name another. The place comes back as `spokenPlaces` says it among all of them ("nix (Claude Code), on
+   * Lattice"), so the readback says which one was picked.
+   */
+  private pickWithDefaults(project: string, given: Place[], said: string, placeId: string | null, defaults: NewThreadDefaults = NO_DEFAULTS): { place: Place } | { error: string } {
+    const words = project.trim() || defaults.project || "";
+    const found = pickPlace(words, spokenPlaces(preferred(given, defaults, `${project} ${said}`, placeId)), { said, placeId });
+    if ("error" in found) return found;
+    return { place: spokenPlaces(given).find((p) => p.id === found.place.id) ?? found.place };
   }
 
   /** The launch profile the user asked for by name, or with none, the default. */
@@ -678,7 +756,7 @@ export class Proposals {
       targets,
       fields: { message: d.message, draftId: d.draftId, confirm: draftLevel(level) },
       readback: `Send ${saidBefore(targets[0])} your dictated reply, ${size(d.words, d.parts)}.`,
-      mustHear: [{ words: [], need: 0, from: createdFrom, head: nameTokens(`Send ${target.handle}`), where: whereTokens(targets[0]), next: "your" }],
+      mustHear: [{ words: [], need: 0, from: createdFrom, head: nameTokens(`Send ${target.handle}`), named: 1, where: whereTokens(targets[0]), next: "your" }],
       createdFrom,
       expiresAt: now + EXPIRY_MS,
       state: "proposed",
@@ -716,7 +794,7 @@ export class Proposals {
 
   /**
    * The user's "keep it for later" for open proposal `id`, a reply to one thread (`keep`): nothing is sent. The reply is
-   * kept, unsent, for the phone's Not sent (a dictated one without its first line, which goes back on when it's sent),
+   * kept, unsent, for the phone's Drafts (a dictated one without its first line, which goes back on when it's sent),
    * and the proposal is closed as kept (`KEPT`). The same dictated draft kept again replaces the one kept before.
    */
   keep(conversationId: string, id: string): ToolResult {
@@ -725,14 +803,14 @@ export class Proposals {
       // A reply or a new thread's prompt kept already (its kept id, "K-…"): "keep it" is done. On 8 November the backend
       // passed a dictated prompt's kept id and got "No such proposal.".
       const kept = /^K-/.test(id) ? this.d.store.keptReply(id) : null;
-      if (kept) return { kept: true, already: true, kept_id: kept.id, result: "It's kept already, in Not sent on the phone.", instruction: "Say only that it's kept, in Not sent on their phone (\"Kept. It's in Not sent on your phone.\"), then carry on with what they want next." };
+      if (kept) return { kept: true, already: true, kept_id: kept.id, result: "It's kept already, in Drafts on the phone.", instruction: "Say only that it's kept, in Drafts on their phone (\"Kept. It's in Drafts on your phone.\"), then carry on with what they want next." };
       return { error: "No such proposal." };
     }
     if (p.action === "start_work" && p.fields.keptId) return this.keepStart(p);
     if (p.action !== "follow_up" || p.targets.length !== 1) return { error: "Only a reply to a thread or a dictated prompt can be kept for later. Say so, and ask whether to go ahead or leave it." };
     const target = p.targets[0];
-    const said = `Kept your reply to ${target.handle}. It's in Not sent on the phone.`;
-    const instruction = "Say only that it's kept, in Not sent on their phone (\"Kept. It's in Not sent on your phone.\"), then carry on with what they want next.";
+    const said = `Kept your reply to ${target.handle}. It's in Drafts on the phone.`;
+    const instruction = "Say only that it's kept, in Drafts on their phone (\"Kept. It's in Drafts on your phone.\"), then carry on with what they want next.";
     const keptBefore = p.fields.keptId ? this.d.store.keptReply(p.fields.keptId) : null;
     if (p.state === "cancelled" && p.result === KEPT) return { kept: true, ...(keptBefore ? { kept_id: keptBefore.id } : {}), result: said, instruction };
     if (p.state !== "proposed") return { error: `That reply can't be kept: it's already ${p.state}${p.result ? ` (${p.result})` : ""}.` };
@@ -752,11 +830,11 @@ export class Proposals {
   /** "Keep it for later" for a kept prompt proposed to start (`sendKept`): it stays kept, and nothing is started. */
   private keepStart(p: Proposal): ToolResult {
     const kept = this.d.store.keptReply(p.fields.keptId!);
-    const instruction = "Say only that it's kept, in Not sent on their phone (\"Kept. It's in Not sent on your phone.\"), then carry on with what they want next.";
+    const instruction = "Say only that it's kept, in Drafts on their phone (\"Kept. It's in Drafts on your phone.\"), then carry on with what they want next.";
     if (p.state === "proposed") this.d.store.putProposal({ ...p, state: "cancelled", result: KEPT });
     else if (!(p.state === "cancelled" && p.result === KEPT)) return { error: `That prompt can't be kept: it's already ${p.state}${p.result ? ` (${p.result})` : ""}.` };
     if (!kept) return { error: "That prompt isn't kept any more: it was started or discarded. Say so." };
-    return { kept: true, kept_id: kept.id, result: "Kept your prompt for a new thread. It's in Not sent on the phone.", instruction };
+    return { kept: true, kept_id: kept.id, result: "Kept your prompt for a new thread. It's in Drafts on the phone.", instruction };
   }
 
   /** Follow-ups whose repeat the backend was told of once already (`sentAlready`): conversation, thread and words. */
@@ -787,21 +865,21 @@ export class Proposals {
   /**
    * The user asked to send reply `keptId`, kept for later (the backend's `send_kept`), at their reply level (`levels`):
    * asking is the yes for "none" and "yes", so it's sent now; "readback" proposes it, to read back and agree to; "tap"
-   * sends nothing (Send on it in Not sent does). Sent, it's no longer kept; the call's receipt is a change like any.
+   * sends nothing (Send on it in Drafts does). Sent, it's no longer kept; the call's receipt is a change like any.
    */
-  async sendKept(conversationId: string, keptId: string, levels: ConfirmLevels = READBACK_ALL, where: { project?: string | null; profile?: string | null } = {}): Promise<ToolResult> {
+  async sendKept(conversationId: string, keptId: string, levels: ConfirmLevels = READBACK_ALL, where: { project?: string | null; profile?: string | null; defaults?: NewThreadDefaults } = {}): Promise<ToolResult> {
     const kept = this.d.store.keptReply(keptId);
     if (!kept) return { error: "That reply isn't kept any more: it was sent or discarded. Say so." };
     const start = parseNewThread(kept.threadId);
     if (start) return this.startKept(conversationId, kept, start, levels, where);
     const level = levels.reply ?? "readback";
     if (level === "tap") {
-      return { sent: false, result: "Nothing was sent.", instruction: "Nothing was sent: the user's settings send replies only with a tap. Tell them to tap Send on it in Not sent on their phone." };
+      return { sent: false, result: "Nothing was sent.", instruction: "Nothing was sent: the user's settings send replies only with a tap. Tell them to tap Send on it in Drafts on their phone." };
     }
     if (this.sendingKept.has(kept.id)) return { error: "That reply is being sent right now." };
     if (!this.d.adapter.actions.includes("follow_up")) return { error: "This system can't take follow-ups." };
     const target = this.d.named().find((n) => n.id === kept.threadId);
-    if (!target) return { error: "That thread is settled or gone, so nothing was sent. Say so: the reply is still in Not sent on their phone." };
+    if (!target) return { error: "That thread is settled or gone, so nothing was sent. Say so: the reply is still in Drafts on their phone." };
     const targets = [{ itemId: target.id, handle: target.handle, group: target.group }];
     const message = kept.note ? `${kept.note}\n\n${kept.text}` : kept.text;
     const current = this.preparing(conversationId);
@@ -811,7 +889,7 @@ export class Proposals {
     const now = this.now();
     const createdFrom = this.d.spoken(conversationId).length;
     const words = kept.text.split(/\s+/).filter(Boolean).length;
-    // Read back as a dictated reply is: its name, and how long it is (its words are on the phone, in Not sent).
+    // Read back as a dictated reply is: its name, and how long it is (its words are on the phone, in Drafts).
     const readback = `Send ${saidBefore(targets[0])} your kept reply, ${size(words, 1)}.`;
     const base = {
       id: `P-${randomUUID().slice(0, 8)}`, conversationId, action: "follow_up", targets, readback, createdFrom, expiresAt: now + EXPIRY_MS, createdAt: now, result: null,
@@ -821,7 +899,7 @@ export class Proposals {
       const clash = lookalike(targets, "Send", "your", this.d.named(), this.d.settled?.() ?? []);
       if (clash) return { error: tooAlike(clash) };
       for (const old of this.d.store.openProposals(conversationId)) this.d.store.putProposal({ ...old, state: "cancelled", result: "superseded" });
-      this.d.store.putProposal({ ...base, state: "proposed", mustHear: [{ words: [], need: 0, from: createdFrom, head: nameTokens(`Send ${target.handle}`), where: whereTokens(targets[0]), next: "your" }] });
+      this.d.store.putProposal({ ...base, state: "proposed", mustHear: [{ words: [], need: 0, from: createdFrom, head: nameTokens(`Send ${target.handle}`), named: 1, where: whereTokens(targets[0]), next: "your" }] });
       return { proposal_id: base.id, readback, instruction: "Say the readback word for word, then ask \"Shall I go ahead?\" and stop. Nothing has been sent yet." };
     }
     this.sendingKept.add(kept.id);
@@ -839,17 +917,19 @@ export class Proposals {
   /**
    * The user asked to start the new thread whose prompt they dictated and kept (`sendKept`), at their start level: in
    * the project they name now (`where.project`), else the one it was dictated for; with neither, they're asked which.
-   * Placed, the kept prompt says where from then on, so Send in Not sent can start it too. Then, as for a kept reply:
-   * asking is the yes for "none" and "yes", "readback" reads it back first, and "tap" waits for Send in Not sent.
+   * Placed, the kept prompt says where from then on, so Send in Drafts can start it too. Then, as for a kept reply:
+   * asking is the yes for "none" and "yes", "readback" reads it back first, and "tap" waits for Send in Drafts.
    */
-  private async startKept(conversationId: string, kept: KeptReply, start: NewThread, levels: ConfirmLevels, where: { project?: string | null; profile?: string | null }): Promise<ToolResult> {
+  private async startKept(conversationId: string, kept: KeptReply, start: NewThread, levels: ConfirmLevels, where: { project?: string | null; profile?: string | null; defaults?: NewThreadDefaults }): Promise<ToolResult> {
     if (!this.d.adapter.actions.includes("start_work")) return { error: "This system can't start work." };
     if (this.sendingKept.has(kept.id)) return { error: "That prompt is being started right now." };
     const places = spokenPlaces(this.d.places?.() ?? []);
     // A place no longer there (its machine asleep, or gone from T3) is asked about again, as none is.
     let placeId = places.some((p) => p.id === start.placeId) ? start.placeId : null;
-    if (where.project?.trim()) {
-      const found = pickPlace(where.project, places);
+    // With no project named and none dictated for, the default project (Settings → New threads), if there is one.
+    if (where.project?.trim() || (!placeId && where.defaults?.project)) {
+      // "driver" for a prompt dictated for "driver, on Lattice" is that place (14 November: Driver asked which machine).
+      const found = this.pickWithDefaults(where.project ?? "", this.d.places?.() ?? [], this.d.lastUserTurn(conversationId).text, placeId, where.defaults);
       if ("error" in found) return found;
       placeId = found.place.id;
     }
@@ -860,8 +940,8 @@ export class Proposals {
       return {
         sent: false,
         kept: true,
-        result: "Nothing was started: it has no project yet. It stays kept, in Not sent on the phone.",
-        instruction: `If the user wanted it kept, or didn't clearly ask to start it, say only "Kept. It's in Not sent on your phone." and don't ask about a project. If they asked to start it, ask which project.${recent.length ? ` Projects active lately: ${recent.join("; ")}.` : ""}`,
+        result: "Nothing was started: it has no project yet. It stays kept, in Drafts on the phone.",
+        instruction: `If the user wanted it kept, or didn't clearly ask to start it, say only "Kept. It's in Drafts on your phone." and don't ask about a project. If they asked to start it, ask which project.${recent.length ? ` Projects active lately: ${recent.join("; ")}.` : ""}`,
       };
     }
     const profile = where.profile?.trim() || start.profile;
@@ -872,7 +952,7 @@ export class Proposals {
     }
     const level = levels.start ?? "readback";
     if (level === "tap") {
-      return { sent: false, result: "Nothing was started.", instruction: `Nothing was started: the user's settings start threads only with a tap. Tell them it's set to start in ${placed.place.name}: they tap Send on it in Not sent on their phone.` };
+      return { sent: false, result: "Nothing was started.", instruction: `Nothing was started: the user's settings start threads only with a tap. Tell them it's set to start in ${placed.place.name}: they tap Send on it in Drafts on their phone.` };
     }
     const message = kept.note ? `${kept.note}\n\n${kept.text}` : kept.text;
     const words = kept.text.split(/\s+/).filter(Boolean).length;
@@ -1210,22 +1290,30 @@ export class Proposals {
     }
     this.d.store.finishOperation(key, "done", null);
     const itemId = r.itemId ?? null;
-    const result = f.title ? `Started ${f.title} in ${f.place}${itemId ? ", and starred it" : ""}.` : `Started ${name}${itemId ? ", and starred it" : ""}.`;
-    this.d.store.putProposal({ ...p, state: "executed", result, fields: { ...f, ...(itemId ? { itemId } : {}) } });
+    let called: string | null = null;
     if (itemId) {
-      // Named in this conversation as Driver called it ("your new thread in driver", "the new thread") until the work
-      // system's name for it is in the briefing.
-      if (!tapped) for (const n of new Set([name, name.replace(/^your /, ""), "new thread", "your new thread"])) this.d.store.alias(p.conversationId, nameKey(n), itemId);
+      // Named in this conversation as Driver called it ("your new thread in driver", "new thread in driver", "the new
+      // thread") as well as by the work system's name for it.
+      const project = f.place!.replace(/, on [\w-]+$/, "");
+      const names = [name, newThreadName(project)].flatMap((n) => [n, n.replace(/^your /, "")]);
+      if (!tapped) for (const n of new Set([...names, "new thread", "your new thread"])) this.d.store.alias(p.conversationId, nameKey(n), itemId);
       this.d.store.star(itemId, true);
-      await this.d.started?.(itemId, { title: f.title ?? "Your new thread", group: f.place! }).catch((e) => this.d.log?.(`proposal ${p.id}: couldn't list the new thread (${String(e)})`));
+      called = (await this.d.started?.(itemId, { title: f.title ?? "Your new thread", group: f.place! }).catch((e) => this.d.log?.(`proposal ${p.id}: couldn't list the new thread (${String(e)})`))) || null;
+      if (called && !tapped) this.d.store.alias(p.conversationId, nameKey(called), itemId);
     }
+    // 14 November: "Started your new thread in driver" and then "what's it called?" got "it isn't in the list yet",
+    // twice. The work system names it from its first words; once it lists it, the result says that name.
+    const result = f.title ? `Started ${f.title} in ${f.place}${itemId ? ", and starred it" : ""}.`
+      : called ? `Started your new thread in ${f.place}, called “${called}”, and starred it.`
+      : `Started ${name}${itemId ? ", and starred it" : ""}.`;
+    this.d.store.putProposal({ ...p, state: "executed", result, fields: { ...f, ...(itemId ? { itemId } : {}) } });
     this.d.log?.(`proposal ${p.id} start_work → executed`);
     return {
       done: true,
       result,
       // Not "Driver … calls back with its reply": on 3 November the voice read that out as it stood, or said "I'll call back
       // with its reply", which hangs up as a promise to (endPolicy) when the user was carrying on.
-      instruction: "Tell the user this result in your own short words: it has started and is starred, so they'll hear its reply. You stay on the call: don't say you'll hang up or call back. Add no details that are not in it.",
+      instruction: `Tell the user this result in your own short words${called ? ", with its name" : ""}: it has started and is starred, so they'll hear its reply. You stay on the call: don't say you'll hang up or call back. Add no details that are not in it.`,
     };
   }
 }

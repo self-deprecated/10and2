@@ -106,6 +106,7 @@ export class Hangups {
     if (this.closed(sessionId)) return void this.trying.delete(sessionId);
     try {
       await this.hangup(sessionId);
+      if (this.trying.get(sessionId) !== t) return; // stopped meanwhile: the next start confirms it
     } catch (e) {
       if (this.trying.get(sessionId) !== t) return; // stopped meanwhile
       if (this.closed(sessionId)) return void this.trying.delete(sessionId);

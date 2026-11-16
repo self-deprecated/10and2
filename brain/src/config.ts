@@ -95,7 +95,7 @@ export function loadConfig(o: { cloud?: boolean } = {}) {
     launchProfiles: parseProfiles(env.DRIVER_LAUNCH_PROFILES ?? ""),
     liveModel: env.DRIVER_LIVE_MODEL ?? LIVE_MODELS[0],
     backendModel: env.DRIVER_BACKEND_MODEL ?? BACKEND_MODELS[0],
-    classifyModel: env.DRIVER_CLASSIFY_MODEL ?? "gpt-6.1-sol",
+    classifyModel: env.DRIVER_CLASSIFY_MODEL ?? "gpt-6-luna",
     openerModel: env.DRIVER_OPENER_MODEL ?? "gpt-6-luna",
     voice: env.DRIVER_VOICE ?? "marin",
     /** Reading replies aloud: the text-to-speech model, and how long and how much of its audio is kept. */

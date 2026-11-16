@@ -23,7 +23,12 @@ type TapThread = Omit<Thread, "id"> & { id: string | null };
 type Change = { text: string; result: string | null; state: string; at: number; threads: string[] };
 export type TimelineItem =
   | { kind: "reply"; id: string; at: number; thread: Thread; messageId: string; ask: string | null; summary: string | null; unread: boolean }
-  | { kind: "call"; id: string; at: number; conversationId: string; startedAt: number; endedAt: number; title: string; changes: Change[]; agenda: AgendaItem[] | null }
+  | {
+    kind: "call"; id: string; at: number; conversationId: string; startedAt: number; endedAt: number;
+    /** The minutes its calls used, in seconds, as the phone showed them; null for a call no phone reported. */
+    usedSeconds: number | null;
+    title: string; changes: Change[]; agenda: AgendaItem[] | null;
+  }
   | { kind: "action"; id: string; at: number; action: string; thread: TapThread; until: string | null; state: string; result: string | null; text?: string };
 export type TimelineQuery = { before: string | null; limit: number; project: string | null; kind: (typeof KINDS)[number] | null; thread: string | null };
 
@@ -61,7 +66,10 @@ export async function timeline(deps: ReadDeps, q: TimelineQuery): Promise<{ item
     const i = items.get(id);
     return { id, name: names.get(id) ?? i?.title ?? was?.handle ?? "", project: i?.group ?? was?.group ?? "" };
   };
-  const wanted = (t: TapThread) => (q.thread === null || t.id === q.thread) && (q.project === null || t.project === q.project);
+  // A project is asked for as `/api/threads` names it: without its computer ("expo": on every computer), or as an older
+  // phone has it, with ("expo, on Quartz").
+  const inProject = (t: TapThread) => t.project === q.project || (t.id !== null && items.get(t.id)?.project === q.project);
+  const wanted = (t: TapThread) => (q.thread === null || t.id === q.thread) && (q.project === null || inProject(t));
   const out: TimelineItem[] = [];
 
   if (q.kind === null || q.kind === "replies") {
@@ -78,12 +86,13 @@ export async function timeline(deps: ReadDeps, q: TimelineQuery): Promise<{ item
       if (!i || !wanted(threadOf(id))) continue;
       const all = q.thread === null ? [] : await pastReplies(deps, id).catch(() => []);
       const refs = all.length ? all.map((r) => ({ messageId: r.messageId, at: r.finishedAt, firstSentence: r.firstSentence })) : card?.reply ? [{ ...card.reply, firstSentence: "" }] : [];
-      refs.forEach((r, n) => {
+      refs.forEach((r) => {
         const latest = card?.reply?.messageId === r.messageId;
         out.push({
           kind: "reply", id: `reply:${id}:${r.messageId}`, at: Date.parse(r.at), thread: threadOf(id), messageId: r.messageId,
           ask: latest ? card!.ask : null, summary: latest ? card!.summary : r.firstSentence || null,
-          unread: n === 0 && isNew({ runId: null, messageId: r.messageId, at: r.at }, reads.get(id), visited.has(id) ? visited.get(id) : i.visitedAt),
+          // Every reply the user hasn't heard, not only the newest: hearing that one marks the rest heard too.
+          unread: isNew({ runId: null, messageId: r.messageId, at: r.at }, reads.get(id), visited.has(id) ? visited.get(id) : i.visitedAt),
         });
       });
     }
@@ -95,6 +104,7 @@ export async function timeline(deps: ReadDeps, q: TimelineQuery): Promise<{ item
   if (q.kind === null || q.kind === "calls") {
     const byCall = Map.groupBy(changes.filter((p) => p.conversationId !== TAP), (p) => p.conversationId);
     const ended = store.lastActivity();
+    const used = store.usedSeconds();
     for (const c of store.conversations(CALLS)) {
       const endedAt = ended.get(c.id) ?? c.lastActive;
       const made = (byCall.get(c.id) ?? []).map((p) => ({ p, threads: threadsOf(p).map((id) => threadOf(id, p.targets.find((t) => t.itemId === id))) }));
@@ -102,7 +112,7 @@ export async function timeline(deps: ReadDeps, q: TimelineQuery): Promise<{ item
       const kept = q.thread === null && q.project === null ? made : made.filter((m) => m.threads.some(wanted));
       if (!kept.length && (q.thread !== null || q.project !== null)) continue;
       out.push({
-        kind: "call", id: `call:${c.id}`, at: endedAt, conversationId: c.id, startedAt: c.startedAt, endedAt, title: c.title, agenda: null,
+        kind: "call", id: `call:${c.id}`, at: endedAt, conversationId: c.id, startedAt: c.startedAt, endedAt, usedSeconds: used.get(c.id) ?? null, title: c.title, agenda: null,
         changes: kept.map(({ p, threads }) => {
           const change = { text: p.readback, result: p.result, state: p.state, at: p.createdAt, threads: threads.map((t) => t.id) };
           proposalOf.set(change, p);

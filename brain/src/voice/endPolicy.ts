@@ -42,6 +42,18 @@ export const asksToPause = (said: string, wake = STANDARD_WAKE_WORD) =>
   !STAY_ON.test(said) &&
   said.split(/[.!?;]+/).some((sentence) => PAUSE_COMMAND.test(withoutWakeWord(sentence.trim(), wake).replace(LEAD, "")));
 
+/** One sentence that only tells Driver to stop talking: "Stop", "okay, stop", "stop it", "please stop talking", "shh". */
+const STOP_ONLY =
+  /^(?:(?:ok(?:ay)?|alright|all right|no|wait|hey|oh|um|uh|please|just)\b[\s,.!]*)*(?:stop(?: (?:it|that|there|now|please|talking|speaking))?|sh+|shush|be quiet)(?: please)?$/i;
+/**
+ * The turn is only "stop" (said again, with filler or the wake word in front): stop talking, not hang up. On 15 November
+ * a bare "Stop" over Driver's opener got `hold` from the backend, and the user's next words ("Start a new…") were cut off.
+ */
+export const asksOnlyToStop = (said: string, wake = STANDARD_WAKE_WORD) => {
+  const sentences = said.split(/[.!?;]+/).map((s) => withoutWakeWord(s.trim(), wake).replace(/[\s,]+$/, "")).filter(Boolean);
+  return sentences.length > 0 && sentences.every((s) => STOP_ONLY.test(s));
+};
+
 /** A short objection opening the turn: "Oh! Don't", "wait", "no, hold on". */
 const OBJECTION = /^(?:(?:oh|no|hey|um|uh|er|ah)\b[\s,.!]*)*(?:don'?t|don’t|do not|wait|hold on|hang on)\b/i;
 

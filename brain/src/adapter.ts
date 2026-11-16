@@ -8,6 +8,12 @@ export type WorkItem = {
   title: string;
   /** What the item belongs to, spoken as-is ("nix", "screen-gate"). */
   group: string;
+  /**
+   * On a computer that isn't the brain's own, `group` says which ("expo, on Quartz"): the project alone ("expo") and
+   * the computer as it's said ("Quartz"). Unset otherwise: the group is the project.
+   */
+  project?: string;
+  machine?: string;
   status: ItemStatus;
   updatedAt: string;
   settled: boolean;
@@ -30,10 +36,15 @@ export type WorkItem = {
 /**
  * Which reply a report's text is: the run it ended, the message, and when that run finished. A later run that ends
  * without a reply (a failure, a cancel) moves `lastRunAt` but not this, so it never makes an old reply look new.
+ * `byAgent`: the agent started that run itself, as T3 does when a background task it left running finishes, so the reply
+ * goes on from the one before it rather than answering the user.
  */
-export type ReplyRef = { runId: string | null; messageId: string; at: string };
+export type ReplyRef = { runId: string | null; messageId: string; at: string; byAgent?: true };
 
-/** One of an item's replies, from any finished run: its text, and the user's message that started that run. */
+/**
+ * One of an item's replies, from any finished run: its text, and the user's message that started that run (none for a
+ * run the agent started itself).
+ */
 export type PastReply = ReplyRef & { text: string; prompt: string | null };
 
 export type Report = {
@@ -45,6 +56,11 @@ export type Report = {
   question: string | null;
   /** Which reply `text` is, when the system says. */
   reply?: ReplyRef | null;
+  /**
+   * When the replies before it finished, newest first (a few), when the system says: what counts how many the user
+   * hasn't heard without fetching them (`replies`).
+   */
+  earlier?: string[];
 };
 
 /** Where new work can start: a project, named as it's said, with where it is ("driver, on Quartz"). */

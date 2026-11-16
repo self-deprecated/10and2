@@ -8,6 +8,7 @@ import { ago } from "../util.ts";
 import { fill, type Prompts } from "./sections.ts";
 import { READBACK_ALL, type ConfirmLevels, type KeepReplies, type Level } from "../proposals.ts";
 import { STANDARD_WAKE_WORD } from "./wakeWord.ts";
+import { APPS, hasDefaults, NO_DEFAULTS, type NewThreadDefaults } from "../places.ts";
 
 /**
  * What Driver may recall from earlier conversations: the user's notes and the changes made, both dated. A change is a
@@ -46,8 +47,12 @@ export function briefingBlock(view: BriefingView, recent: Recent | null, now: Da
   const t = now.getTime();
   // How old what a card says is: its state and summary come from the thread's last reply (2 November: a 28-minute-old
   // "needs a system switch" was told as how things stood).
+  // A thread that replied after its summary was made says so first (14 November: a three-hour-old summary was told as
+  // the update on a thread that had replied 8 minutes before).
   const card = (c: BriefingView["cards"][number]) =>
-    `- "${c.handle}" [${c.group}] ${c.state.replace(/_/g, " ")}${c.reply ? ` ${asOf(c.reply.at, t)}` : ""}, last active ${ago(c.updatedAt, t)}: ${c.summary}${c.ask ? ` Waiting on the user: ${c.ask}` : ""}`;
+    c.newer
+      ? `- "${c.handle}" [${c.group}] replied again ${ago(c.newer.at, t)}, not summarized yet: say so, and have the backend read it before saying how it stands. Its summary before that${c.reply ? `, ${asOf(c.reply.at, t)}` : ""}: ${c.summary}`
+      : `- "${c.handle}" [${c.group}] ${c.state.replace(/_/g, " ")}${c.reply ? ` ${asOf(c.reply.at, t)}` : ""}, last active ${ago(c.updatedAt, t)}: ${c.summary}${c.ask ? ` Waiting on the user: ${c.ask}` : ""}`;
   const starredSnoozed = view.snoozed.filter((s) => s.starred);
   const { focus, shown, heard } = briefed(view, t);
   const left = view.cards.length - shown.length - heard.length;
@@ -67,7 +72,7 @@ export function briefingBlock(view: BriefingView, recent: Recent | null, now: Da
     : "";
   const fresh = shown.filter((c) => c.unread && !told.has(c.itemId));
   const unread = fresh.length
-    ? `New replies the user hasn't read yet (each thread's latest, not yet read out to them in full or opened in T3; read_aloud reads one out): ${fresh.slice(0, 8).map((c) => `"${c.handle}" [${c.group}]`).join(", ")}${fresh.length > 8 ? `, and ${fresh.length - 8} more` : ""}.`
+    ? `New replies the user hasn't read yet (not yet read out to them in full or opened in T3; how many when a thread has more than one; read_aloud's latest reads a thread's all in a row): ${fresh.slice(0, 8).map((c) => `"${c.handle}" [${c.group}]${c.unheard > 1 ? ` (${c.unheard} replies)` : ""}`).join(", ")}${fresh.length > 8 ? `, and ${fresh.length - 8} more` : ""}.`
     : "";
   const clutter = focus
     ? ""
@@ -109,6 +114,28 @@ const KEEP_NOTES = {
 } as const;
 const keepNote = (who: "voice" | "backend", keep: KeepReplies) => (keep === "send" ? "" : ` ${fill(KEEP_NOTES[who][keep])}`);
 
+/**
+ * What a request for a new thread that doesn't say what it's for does (the phone's setting `newThreadPrompt`): ask
+ * whether to dictate it or say it now, dictate it at once, or ask what it should say (dictating only when asked).
+ */
+export const NEW_THREAD_PROMPTS = ["ask", "dictate", "say"] as const;
+export type NewThreadPrompt = (typeof NEW_THREAD_PROMPTS)[number];
+/** The section that tells the backend what each does. */
+const NEW_THREAD_NOTES = { ask: "backend.new-thread.ask", dictate: "backend.new-thread.dictate", say: "backend.new-thread.say" } as const satisfies Record<NewThreadPrompt, string>;
+/** The phone's value, or "ask" for anything else (an older phone sends none). */
+export const newThreadPromptOf = (v: unknown): NewThreadPrompt => (NEW_THREAD_PROMPTS.includes(v as NewThreadPrompt) ? (v as NewThreadPrompt) : "ask");
+
+/**
+ * What a new thread uses where the user doesn't say (Settings → New threads), for the backend's start-work rules: a line
+ * of its own, or nothing when none is set. The app applies them (proposals.ts `pickWithDefaults`); the backend is told so
+ * it doesn't ask what they settle.
+ */
+function defaultsNote(d: NewThreadDefaults): string {
+  if (!hasDefaults(d)) return "";
+  const set = [d.project && `project ${d.project}`, d.machine && `machine ${d.machine}`, d.app && `coding app ${APPS[d.app]}`].filter(Boolean).join("; ");
+  return `\n${fill("backend.new-thread.defaults", { defaults: set })}`;
+}
+
 /** Each kind of change, as the confirm-level notes name it. */
 const KINDS: Record<keyof ConfirmLevels, string> = {
   reply: "replies to threads", start: "new threads", archive: "archiving", settle: "settling", snooze: "snoozing", tidy: "tidying finished subagent threads",
@@ -135,12 +162,21 @@ function confirmNote(who: "voice" | "backend", levels: ConfirmLevels): string {
   return ` ${fill(CONFIRM_NOTES[who].all, { levels: each.join(" ") })}`;
 }
 
+/**
+ * How thread names are said (the phone's setting `threadNames`): "called" introduces each with "the thread called", so
+ * a title isn't heard as part of the sentence; "plain" says the name alone. Absent (an older phone): "called".
+ */
+export type ThreadNames = "called" | "plain";
+export const threadNamesOf = (body: { threadNames?: unknown }): ThreadNames => (body.threadNames === "plain" ? "plain" : "called");
+const NAMES_NOTES = { voice: "voice.thread-names", backend: "backend.thread-names" } as const;
+const namesNote = (who: keyof typeof NAMES_NOTES, names: ThreadNames) => (names === "plain" ? "" : ` ${fill(NAMES_NOTES[who])}`);
+
 /** The words the user says (vocabulary.ts `words`), for `who`'s instructions: a line of its own, or nothing. */
 const VOCABULARY = { voice: "voice.vocabulary", backend: "backend.vocabulary" } as const;
 const vocabularyNote = (who: keyof typeof VOCABULARY, words: readonly string[]) => (words.length ? `\n${fill(VOCABULARY[who], { words: words.join(", ") })}` : "");
 
-export function frontendInstructions(briefing: string, prompts: Prompts = {}, keep: KeepReplies = "send", confirm: ConfirmLevels = READBACK_ALL, wake = STANDARD_WAKE_WORD, words: readonly string[] = []): string {
-  return fill("voice", { briefing, keep_replies: keepNote("voice", keep), confirm_levels: confirmNote("voice", confirm), wake, vocabulary: vocabularyNote("voice", words) }, prompts);
+export function frontendInstructions(briefing: string, prompts: Prompts = {}, keep: KeepReplies = "send", confirm: ConfirmLevels = READBACK_ALL, wake = STANDARD_WAKE_WORD, words: readonly string[] = [], names: ThreadNames = "called"): string {
+  return fill("voice", { briefing, keep_replies: keepNote("voice", keep), confirm_levels: confirmNote("voice", confirm), wake, vocabulary: vocabularyNote("voice", words), thread_names: namesNote("voice", names) }, prompts);
 }
 
 /** Where new threads can start, the most recently active first, and the profiles they can start with. */
@@ -154,13 +190,14 @@ export function launchNote(places: Place[], profiles: LaunchProfile[]): string {
 /**
  * `note`: what this session's opening needs the backend to know (session.ts `backendNote`); `launch`: `launchNote`;
  * `reports`: the threads' last replies (session.ts `preload`); `kept`: the replies kept for later (`keptNote`);
- * `words`: the words the user says (vocabulary.ts).
+ * `words`: the words the user says (vocabulary.ts); `newThread`: the user's setting `newThreadPrompt`; `defaults`: what a
+ * new thread uses where the user doesn't say (`defaultsNote`); `names`: how thread names are said (`ThreadNames`).
  */
-export function backendInstructions(briefing: string, now: Date, note: string | null = null, launch: string | null = null, reports: string | null = null, prompts: Prompts = {}, keep: KeepReplies = "send", confirm: ConfirmLevels = READBACK_ALL, kept: string | null = null, words: readonly string[] = []): string {
+export function backendInstructions(briefing: string, now: Date, note: string | null = null, launch: string | null = null, reports: string | null = null, prompts: Prompts = {}, keep: KeepReplies = "send", confirm: ConfirmLevels = READBACK_ALL, kept: string | null = null, words: readonly string[] = [], newThread: NewThreadPrompt = "ask", defaults: NewThreadDefaults = NO_DEFAULTS, names: ThreadNames = "called"): string {
   const local = now.toLocaleString("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric", hour: "2-digit", minute: "2-digit", timeZoneName: "short" });
   return fill("backend", {
     now: local,
-    start_work: launch ? `${fill("backend.start-work", { launch })}\n` : "",
+    start_work: launch ? `${fill("backend.start-work", { launch, new_thread: `${fill(NEW_THREAD_NOTES[newThread])}${defaultsNote(defaults)}` })}\n` : "",
     note: note ? `\n${note}\n` : "",
     briefing,
     reports: reports ? `\n\n${reports}` : "",
@@ -168,6 +205,7 @@ export function backendInstructions(briefing: string, now: Date, note: string | 
     confirm_levels: confirmNote("backend", confirm),
     kept: kept ? `\n${kept}\n` : "",
     vocabulary: vocabularyNote("backend", words),
+    thread_names: namesNote("backend", names),
   }, prompts);
 }
 
@@ -182,7 +220,7 @@ export function keptNote(kept: { id: string; handle: string; group: string; text
     return words.length <= 12 ? words.join(" ") : `${words.slice(0, 12).join(" ")}…`;
   };
   return [
-    "Replies the user kept for later, unsent, in Not sent on their phone (newest first), and prompts for new threads they dictated and kept. When they ask to send one now (\"send that now\", \"you can send it\") or start one, call send_kept with its id (with project for a new thread, if they name one), and never propose it again:",
+    "Replies the user kept for later, unsent, in Drafts on their phone (newest first), and prompts for new threads they dictated and kept. When they ask to send one now (\"send that now\", \"you can send it\") or start one, call send_kept with its id (with project for a new thread, if they name one), and never propose it again:",
     ...kept.slice(0, 10).map((k) => `- ${k.id}: to "${k.handle}" [${k.group}], kept ${ago(k.keptAt, now)}: “${first(k.text)}”`),
   ].join("\n");
 }

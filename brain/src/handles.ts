@@ -105,6 +105,8 @@ export function speechTokens(s: string): string[] {
 export const sayKey = (s: string) => speechTokens(s).filter((w) => !mark(w)).join(" ");
 
 const mark = (w: string | undefined) => w === BREAK || w === COMMA || w === START;
+/** "the thread called" (or "your thread called", "… named") at `at`, as speechTokens. */
+const calledAt = (s: string[], at: number) => (s[at] === "the" || s[at] === "your") && s[at + 1] === "thread" && (s[at + 2] === "called" || s[at + 2] === "named");
 /** Whether a speechTokens token is a clause mark rather than a word. */
 export const isMark = (w: string) => mark(w);
 
@@ -115,16 +117,21 @@ export const isMark = (w: string) => mark(w);
  * "Archive Agent Reel's dashboard", "Archive Agent Reel, the dashboard", "Archive Agent Reel Dashboard" and "Archive
  * Archive Agent Reel" don't. `where` may follow the head, word for word: the thread's project, "in sd", which a
  * readback says but which the name alone already identifies, or only its first clauses ("in sd" of "in sd, on
- * Quartz"), when `where` keeps its clause marks.
+ * Quartz"), when `where` keeps its clause marks. `named`: where in `head` the thread's name starts, before which "the
+ * thread called" (the setting `threadNames`, which the voice model says in readbacks too) is passed over: "Snooze the
+ * thread called Agent Reel" says "snooze agent reel" (named 1), but "The thread called Archive Agent Reel" doesn't say
+ * "archive agent reel": there "archive" is part of a name.
  */
-export function saysHead(spoken: string[], head: string[], next: string | string[] | null, where: string[] = []): boolean {
+export function saysHead(spoken: string[], head: string[], next: string | string[] | null, where: string[] = [], named?: number): boolean {
   const after = typeof next === "string" ? [next] : next;
   start: for (let i = 0; i < spoken.length; i++) {
     // A clause starts after any mark, including where a new utterance began.
     if (i > 0 && !mark(spoken[i - 1])) continue;
     let j = i;
-    for (const w of head) {
+    for (const [n, w] of head.entries()) {
       if (j > i) while (mark(spoken[j])) j++;
+      // Only where the name starts, and not when the head says it there itself.
+      if (n === named && calledAt(spoken, j) && !calledAt(head, n)) j += 3;
       if (spoken[j++] !== w) continue start;
     }
     if (where.length) {

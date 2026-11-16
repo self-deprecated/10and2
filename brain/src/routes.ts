@@ -81,6 +81,7 @@ export const ROUTES: Route[] = [
   { method: "POST", path: "/internal/delete", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/end-call", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/grant", access: "internal", by: "brain", where: "cloud" },
+  { method: "POST", path: "/internal/flag-work", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/close-active", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/analytics-consent", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/devices/add", access: "internal", by: "brain", where: "cloud" },
@@ -95,7 +96,7 @@ export const ROUTES: Route[] = [
   {
     method: "POST", path: "/stripe/webhook", access: "webhook", signature: "stripe", by: "worker", where: "cloud",
     body: { id: "evt_1", type: "checkout.session.completed", data: { object: { id: "cs_test_1", client_reference_id: "user_a", payment_status: "paid", metadata: { pack: "minutes_60" } } } },
-    idempotent: { key: "the Checkout Session (`stripe:<id>`)", tested: ["cloud/test/workerd.test.ts", "credits: a new account's trial, metered by"] },
+    idempotent: { key: "the Checkout Session (`stripe:<id>`)", tested: ["cloud/test/workerd.test.ts", "credits: a new account has no trial and no free minutes"] },
   },
   {
     method: "POST", path: "/revenuecat/webhook", access: "webhook", signature: "revenuecat", by: "worker", where: "cloud",
@@ -147,6 +148,8 @@ export const ROUTES: Route[] = [
   { method: "POST", path: "/api/session/stop", access: "signed_in", by: "brain", where: "both", body: { cancelWaits: false } },
   { method: "GET", path: "/api/wait", access: "signed_in", by: "brain", where: "both", query: "conversation=c-0123456789&wait=0", ids: [query("conversation", "conversation")] },
   { method: "POST", path: "/api/wait/cancel", access: "signed_in", by: "brain", where: "both", body: {} },
+  { method: "POST", path: "/api/phone", access: "signed_in", by: "brain", where: "both", body: { token: "ab".repeat(32), env: "sandbox" } },
+  { method: "DELETE", path: "/api/phone", access: "signed_in", by: "brain", where: "both", body: {} },
   { method: "GET", path: "/api/drafts/:id", access: "signed_in", by: "brain", where: "both", ids: [pathId("draft")] },
   { method: "GET", path: "/api/calls/current", access: "signed_in", by: "brain", where: "both" },
   {
@@ -160,6 +163,10 @@ export const ROUTES: Route[] = [
   { method: "GET", path: "/api/updates", access: "signed_in", by: "brain", where: "both" },
   { method: "GET", path: "/api/conversations", access: "signed_in", by: "brain", where: "both" },
   { method: "GET", path: "/api/conversations/:id", access: "signed_in", by: "brain", where: "both", ids: [pathId("conversation")] },
+  {
+    method: "PUT", path: "/api/conversations/:id/used", access: "signed_in", by: "brain", where: "both", body: { call: "call-1", seconds: 372 }, ids: [pathId("conversation")],
+    idempotent: { key: "call: one figure per call, kept at the most said" },
+  },
   { method: "POST", path: "/api/memory/forget", access: "signed_in", by: "brain", where: "both", body: {} },
 
   // Threads and taps.
@@ -181,7 +188,7 @@ export const ROUTES: Route[] = [
   },
   {
     method: "POST", path: "/api/reply", access: "signed_in", by: "brain", where: "both", body: { id: "t-12", text: "Run it tonight.", requestId: REQUEST_ID }, ids: [body("id", "thread"), body("keptId", "kept"), body("messageId", "message", { with: { id: "<own:thread>" }, unused: "the brain quotes `quote`, never looks the message up" }),
-      // A new thread's prompt with no project (`new:` and {"n":"iso00001"}), started where Not sent's picker says.
+      // A new thread's prompt with no project (`new:` and {"n":"iso00001"}), started where Drafts' picker says.
       body("placeId", "place", { with: { id: "new:eyJuIjoiaXNvMDAwMDEifQ", requestId: "<fresh>" } }),
       // A thread's drafts sent as one message, a reply kept in a call among them.
       body("parts.0.keptId", "kept", { with: { id: "<own:thread>", requestId: "<fresh>", parts: [{ text: "Ship it tonight." }] } })],
@@ -192,7 +199,7 @@ export const ROUTES: Route[] = [
   { method: "GET", path: "/api/kept", access: "signed_in", by: "brain", where: "both" },
   // What the account has done with the app lately: the paywall's header.
   { method: "GET", path: "/api/usage", access: "signed_in", by: "brain", where: "both" },
-  // Where a new thread can start, as Driver says them: Not sent's project picker.
+  // Where a new thread can start, as Driver says them: Drafts' project picker.
   { method: "GET", path: "/api/places", access: "signed_in", by: "brain", where: "both" },
   {
     method: "POST", path: "/api/kept/send", access: "signed_in", by: "brain", where: "both", body: { items: [{ keptId: "K-0123456789", requestId: REQUEST_ID }] }, ids: [body("items.0.keptId", "kept")],

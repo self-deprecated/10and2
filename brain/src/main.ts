@@ -14,6 +14,7 @@ import { modelClassifier, modelOpener } from "./briefing.ts";
 import { modelBriefingWriter } from "./briefing-reading.ts";
 import { startServer, type DemoWorlds, type ServerDeps } from "./server.ts";
 import { wire } from "./world.ts";
+import { Ringer } from "./ring.ts";
 import { demoWorld, demoWriter } from "./demo/world.ts";
 import { hangup } from "./voice/live.ts";
 import { nodeSocket } from "./voice/socket-node.ts";
@@ -100,7 +101,7 @@ if (cfg.demo === "only") {
   const adapter = new Machines(connectors.map((c) => ({ ...c, said: c.local ? spokenHost() : undefined })), log);
   const { briefing, conversations, proposals, waits } = wire({
     adapter, store, classify: modelClassifier(spending("classifier"), cfg.classifyModel), writeOpener: modelOpener(spending("opener"), cfg.openerModel), profiles: cfg.launchProfiles, log,
-    track: analytics.track,
+    track: analytics.track, onDemand: true,
   });
   adapter.watch((ids, urgent) => briefing.onChange(ids, urgent));
   void briefing.refresh().catch((e) => {
@@ -117,7 +118,9 @@ if (cfg.demo === "only") {
     void syncVisits({ adapter, briefing, store, log });
   }, 3600_000).unref();
   store.forgetReadings(Date.now() - 30 * 86_400_000);
-  deps = { ...common, connectors, adapter, briefing, proposals, store, conversations, waits, hangups, flags: flagsIn("flags", store), refresh: () => briefing.refresh() };
+  // A phone can register to be rung, but this brain has no push key, so nothing rings (docs/launch/ring.md).
+  const ringer = new Ringer({ waits, store, log, track: analytics.track });
+  deps = { ...common, connectors, adapter, briefing, proposals, store, conversations, waits, hangups, flags: flagsIn("flags", store), refresh: () => briefing.refresh(), ringer };
   closeWork = () => adapter.close();
 }
 const server = startServer(cfg, deps, demo);

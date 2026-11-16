@@ -103,10 +103,14 @@ export function sayable(text: string, max: number): boolean {
   return t.length > 0 && t.length <= max && !/```|\*\*|\]\(|^\s*#{1,6}\s|^\s*[-*]\s|https?:\/\//m.test(t) && !FORBIDDEN.test(t);
 }
 
-const inputOf = (c: Card): BriefInput => ({
-  threadId: c.itemId, name: masked(c.handle), project: masked(c.group), state: c.state, summary: masked(c.summary),
-  ask: c.ask ? masked(c.ask) : null, suggested: c.suggested, starred: c.starred,
-});
+/** A thread's part: from its card, or for one that replied after its card was made (`newer`), only that it did. */
+const inputOf = (c: Card): BriefInput =>
+  c.newer
+    ? { threadId: c.itemId, name: masked(c.handle), project: masked(c.group), state: c.status === "running" ? "running" : "done_unreviewed", summary: NOT_CAUGHT_UP, ask: null, suggested: "none", starred: c.starred }
+    : { threadId: c.itemId, name: masked(c.handle), project: masked(c.group), state: c.state, summary: masked(c.summary), ask: c.ask ? masked(c.ask) : null, suggested: c.suggested, starred: c.starred };
+
+/** What a briefing says of a thread whose latest reply isn't summarized yet, rather than an older summary. */
+const NOT_CAUGHT_UP = "It has replied again, and I haven't caught up with that reply yet.";
 
 /**
  * A briefing's id, by what it says: the threads in order with their cards and update times, the greeting, the style,

@@ -91,9 +91,35 @@ export function toWorkItem(t: ShellThread, projects: Map<string, string>, now: n
 }
 
 /** Which reply a message is: its run's end, or (for a message outside any run) when it was last written. */
-function replyRef(m: any, runs: any[]): ReplyRef | null {
-  const at = (m.runId ? runs.find((r) => r.id === m.runId)?.completedAt : null) ?? m.updatedAt ?? m.createdAt;
-  return m.id && at ? { runId: m.runId ?? null, messageId: m.id, at } : null;
+function replyRef(m: any, runs: any[], messages: any[]): ReplyRef | null {
+  const run = m.runId ? runs.find((r) => r.id === m.runId) : null;
+  const at = run?.completedAt ?? m.updatedAt ?? m.createdAt;
+  return m.id && at ? { runId: m.runId ?? null, messageId: m.id, at, ...(startedBy(run, messages)?.createdBy === "agent" ? { byAgent: true as const } : {}) } : null;
+}
+
+/**
+ * The message that started a run: the user's, or, when a background task the agent left running finishes, the note T3
+ * writes as the agent's own to wake it.
+ */
+const startedBy = (run: any, messages: any[]) =>
+  run ? (run.userMessageId && messages.find((m) => m.id === run.userMessageId)) || messages.find((m) => m.runId === run.id && m.role === "user") : undefined;
+
+/** How many earlier replies' times a report carries: enough to count what's unheard ("Seven replies you haven't heard"). */
+const EARLIER_MAX = 9;
+
+/** Every finished run's reply in a thread's projection, newest first. */
+function pastReplies(p: any): PastReply[] {
+  const messages: any[] = p.messages ?? [];
+  const out: PastReply[] = [];
+  for (const run of (p.runs ?? []).filter((r: any) => FINISHED.has(r.status))) {
+    const said = messages.filter((m) => m.runId === run.id && m.role === "assistant" && !m.streaming && m.text?.trim());
+    const last = said.at(-1);
+    const ref = last ? replyRef(last, p.runs, messages) : null;
+    if (!ref) continue;
+    // The agent's own note isn't anything the user asked: not read as what they asked, nor matched as their words.
+    out.push({ ...ref, text: last.text, prompt: ref.byAgent ? null : startedBy(run, messages)?.text?.trim() || null });
+  }
+  return out.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
 }
 
 /** What a change has to touch before the briefing cares (updatedAt and item counts churn constantly). */
@@ -318,24 +344,17 @@ export class T3Adapter implements Adapter {
             .join(" ")
         : `A ${pending.kind.replace(/_/g, " ")} is waiting.`;
     }
-    return { text: last?.text ?? "", progress, question, reply: last ? replyRef(last, p.runs ?? []) : null };
+    const reply = last ? replyRef(last, p.runs ?? [], p.messages ?? []) : null;
+    // When the replies before it finished, from the same projection: so the brain counts those the user hasn't heard.
+    const earlier = reply ? pastReplies(p).filter((r) => Date.parse(r.at) < Date.parse(reply.at)).slice(0, EARLIER_MAX).map((r) => r.at) : [];
+    return { text: last?.text ?? "", progress, question, reply, earlier };
   }
 
   async replies(id: string): Promise<PastReply[]> {
     this.requireVisible(id);
     const p = await this.rpc().request<any>(M.getThreadProjection, { threadId: id });
     this.requireVisible(id);
-    const messages: any[] = p.messages ?? [];
-    const out: PastReply[] = [];
-    for (const run of (p.runs ?? []).filter((r: any) => FINISHED.has(r.status))) {
-      const said = messages.filter((m) => m.runId === run.id && m.role === "assistant" && !m.streaming && m.text?.trim());
-      const last = said.at(-1);
-      const ref = last ? replyRef(last, p.runs) : null;
-      if (!ref) continue;
-      const prompt = (run.userMessageId && messages.find((m) => m.id === run.userMessageId)) || messages.find((m) => m.runId === run.id && m.role === "user");
-      out.push({ ...ref, text: last.text, prompt: prompt?.text?.trim() || null });
-    }
-    return out.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+    return pastReplies(p);
   }
 
   async markRead(itemId: string, watermark: string, idempotencyKey: string): Promise<Receipt | "unsupported"> {
@@ -398,6 +417,8 @@ export class T3Adapter implements Adapter {
     // A retry reuses the key, and T3 never runs a command id twice, whichever command it was.
     const pending = action.kind === "follow_up" ? this.threads.get(action.itemId)?.pendingRuntimeRequest : null;
     if (action.kind === "follow_up" && pending?.kind === "user_input") return this.answer(action.itemId, pending.id, action.message, idempotencyKey);
+    // Driver never gives a permission (release.md): a follow-up would only queue behind it, so the user hears where to answer.
+    if (action.kind === "follow_up" && pending) return { ok: false, error: "It's waiting for your OK in T3 Code. 10 & 2 doesn't give that; answer it in T3 Code." };
     return this.dispatch(toCommand(action, idempotencyKey));
   }
 

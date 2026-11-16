@@ -149,8 +149,11 @@ test("T3Adapter: lists from the shell, ignores thread-less snapshots, reports ch
         // A run is going: its notes are progress, and the reply is the finished run's last message.
         exit(ws, f.id, {
           // r3 failed without a reply: the reply is still r1's.
-          runs: [{ id: "r1", status: "completed", completedAt: "2026-10-16T07:30:00Z" }, { id: "r3", status: "failed", completedAt: "2026-10-16T07:40:00Z" }, { id: "r2", status: runStatus }],
+          // r0 was the agent's own, woken by a background task finishing.
+          runs: [{ id: "r0", status: "completed", completedAt: "2026-10-16T07:10:00Z", userMessageId: "w0" }, { id: "r1", status: "completed", completedAt: "2026-10-16T07:30:00Z" }, { id: "r3", status: "failed", completedAt: "2026-10-16T07:40:00Z" }, { id: "r2", status: runStatus }],
           messages: [
+            { id: "w0", role: "user", text: 'Background command "tests" completed (exit code 0)', streaming: false, runId: "r0", createdBy: "agent" },
+            { id: "m0", role: "assistant", text: "The tests passed.", streaming: false, runId: "r0" },
             { id: "m1", role: "assistant", text: "Done: it builds.", streaming: false, runId: "r1" },
             { id: "m3", role: "user", text: "try again", streaming: false, runId: "r3" },
             { role: "user", text: "now test it", streaming: false, runId: "r2" },
@@ -199,11 +202,14 @@ test("T3Adapter: lists from the shell, ignores thread-less snapshots, reports ch
     assert.equal(rep.question, "Which host? Options: Prism / Quartz.");
     assert.equal(rep.progress, null);
     assert.equal(rep.reply, null, "a message without an id or a time can't be told apart, so it isn't a reply to track");
-    const kid = { text: "Done: it builds.", progress: "Next I'll run the tests.", question: null, reply: { runId: "r1", messageId: "m1", at: "2026-10-16T07:30:00Z" } };
-    assert.deepEqual(await adapter.report("kid"), kid, "the reply is r1's, finished when r1 did: r3 failed without one");
+    const kid = { text: "Done: it builds.", progress: "Next I'll run the tests.", question: null, reply: { runId: "r1", messageId: "m1", at: "2026-10-16T07:30:00Z" }, earlier: ["2026-10-16T07:10:00Z"] };
+    assert.deepEqual(await adapter.report("kid"), kid, "the reply is r1's, finished when r1 did: r3 failed without one; r0's before it");
     runStatus = "waiting";
     assert.deepEqual(await adapter.report("kid"), kid, "waiting notes are still progress, not a finished reply");
-    assert.deepEqual(await adapter.replies("kid"), [{ ...kid.reply, text: "Done: it builds.", prompt: null }], "only finished runs with a reply; r3 failed without one");
+    assert.deepEqual(await adapter.replies("kid"), [
+      { ...kid.reply, text: "Done: it builds.", prompt: null },
+      { runId: "r0", messageId: "m0", at: "2026-10-16T07:10:00Z", byAgent: true, text: "The tests passed.", prompt: null },
+    ], "only finished runs with a reply, r3 failed without one; a run the agent started itself says so");
 
     assert.deepEqual(await adapter.execute({ kind: "settle", itemId: "a" }, "P-1:a"), { ok: true });
     assert.deepEqual(await adapter.markRead("a", "2026-10-16T08:05:00Z", "driver-visit:m1"), { ok: true });
@@ -212,6 +218,12 @@ test("T3Adapter: lists from the shell, ignores thread-less snapshots, reports ch
     assert.deepEqual(await adapter.execute({ kind: "follow_up", itemId: "kid", message: "Go on." }, "P-3:kid"), { ok: true });
     assert.deepEqual(commands.slice(2).map((c) => [c.type, c.answers]), [["runtime-request.respond", { q1: "Quartz" }], ["message.dispatch", undefined]]);
     assert.deepEqual(commands[2], { type: "runtime-request.respond", commandId: "P-2:a", threadId: "a", requestId: "r1", answers: { q1: "Quartz" } });
+    // An approval isn't Driver's to give: a follow-up says where to answer it, and sends nothing.
+    push({ kind: "thread.updated", location: "active", thread: thread("a", { status: "running", pendingRuntimeRequest: { id: "r2", kind: "command_execution_approval" } }) });
+    await new Promise((r) => setTimeout(r, 100));
+    const sent = commands.length;
+    assert.match((await adapter.execute({ kind: "follow_up", itemId: "a", message: "Yes" }, "P-4:a") as { error: string }).error, /answer it in T3 Code/);
+    assert.equal(commands.length, sent);
     assert.deepEqual(commands.slice(0, 2), [
       { type: "thread.settle", commandId: "P-1:a", threadId: "a" },
       { type: "thread.visit", commandId: "driver-visit:m1", threadId: "a", visitedAt: "2026-10-16T08:05:00Z" },

@@ -16,17 +16,20 @@ export type Draft = { id: string; itemId: string; parts: DraftPart[] };
  * A draft for a thread not started yet (`dictate` with no thread): maybe where to start it (`placeId`, when the user
  * named the project before dictating) and a launch profile they asked for, carried as the draft's target ("new:…"), so
  * the phone keeps and sends it like any other. The work system names the thread. Everything in it is checked again when
- * it's proposed, as a start said aloud is; with no place, Driver asks which project after the dictation.
+ * it's proposed, as a start said aloud is; with no place, Driver asks which project after the dictation. `named`: with
+ * no place, the project as the user named it when it couldn't be settled before dictating ("driver", on two machines),
+ * so Driver asks which of its places rather than which project (14 November).
  */
-export type NewThread = { placeId: string | null; profile: string | null };
+export type NewThread = { placeId: string | null; profile: string | null; named?: string | null };
 
 /**
- * `new:` and, base64url, `{"n": <a fresh id, so two prompts never share a draft>, "p": place, "f": profile}`. Phones in
+ * `new:` and, base64url, `{"n": <a fresh id, so two prompts never share a draft>, "p": place, "f": profile, "w": named}`
+ * (`named` cut to 60 characters, and only with no place: the target stays well under `parseDraft`'s 300). Phones in
  * TestFlight before 8 November keep `[placeId, title, profile]` instead: still read, the title ignored. That shape can go
  * once every tester's build is from 8 November or later (voice-new-thread.md).
  */
 export const newThreadTarget = (t: NewThread, id = randomUUID().slice(0, 8)) =>
-  `new:${Buffer.from(JSON.stringify({ n: id, ...(t.placeId ? { p: t.placeId } : {}), ...(t.profile ? { f: t.profile } : {}) })).toString("base64url")}`;
+  `new:${Buffer.from(JSON.stringify({ n: id, ...(t.placeId ? { p: t.placeId } : t.named?.trim() ? { w: t.named.trim().slice(0, 60) } : {}), ...(t.profile ? { f: t.profile } : {}) })).toString("base64url")}`;
 
 export const isNewThread = (itemId: string) => itemId.startsWith("new:");
 
@@ -39,14 +42,14 @@ export function parseNewThread(itemId: string): NewThread | null {
       const [placeId, title, profile] = t;
       return [placeId, title, profile].every((v) => typeof v === "string" && v) ? { placeId, profile } : null;
     }
-    return t && typeof t === "object" && given(t.n) ? { placeId: given(t.p), profile: given(t.f) } : null;
+    return t && typeof t === "object" && given(t.n) ? { placeId: given(t.p), profile: given(t.f), ...(given(t.w) && !given(t.p) ? { named: given(t.w) } : {}) } : null;
   } catch {
     return null;
   }
 }
 
 /**
- * The same new thread, to start in `placeId` (picked on the phone, in Not sent): its own id kept, so the same pick sent
+ * The same new thread, to start in `placeId` (picked on the phone, in Drafts): its own id kept, so the same pick sent
  * again is the same target. Null when `target` isn't a new thread's.
  */
 export function placedTarget(target: string, placeId: string): string | null {
@@ -173,7 +176,7 @@ export function assemble(draft: Draft, segments: (readingId: string) => { itemId
 
 /**
  * How the phone learns what became of a draft it handed over: sent, maybe sent (the outcome was lost), kept for later on
- * the brain (`keptId`: it's in Not sent), or not.
+ * the brain (`keptId`: it's in Drafts), or not.
  */
 export type DraftState = "sent" | "unknown" | "kept" | "unsent";
 

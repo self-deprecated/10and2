@@ -2,9 +2,9 @@
 // kept, so the phone can fetch each one's audio, a restart loses nothing, and reading it again costs nothing.
 import { createHash } from "node:crypto";
 import type { AnalyticsSink } from "./analytics.ts";
-import type { WorkItem } from "./adapter.ts";
+import type { PastReply, WorkItem } from "./adapter.ts";
 import type { ReadDeps } from "./reads.ts";
-import { headTail } from "./briefing.ts";
+import { headTail, isNew } from "./briefing.ts";
 import type { Speech } from "./voice/speech.ts";
 import { describe, limiter, mapLimit, redactWhole } from "./util.ts";
 
@@ -38,8 +38,13 @@ export type Reading = {
   group: string;
   messageId: string;
   finishedAt: string;
-  /** The thread's latest reply: only that one is marked read when it's been heard. */
+  /**
+   * The thread's latest reply: only that one is marked read when it's been heard. A reading of several replies in a row
+   * (`together`) is the newest one's, and is latest when that one is.
+   */
   latest: boolean;
+  /** The replies it reads, oldest first, when it's several in a row; its last is `messageId`. */
+  messageIds?: string[];
   segments: Segment[];
 };
 
@@ -141,8 +146,8 @@ const PARTS_AT_ONCE = 4;
 const making = new Map<string, Promise<Segment[] | null>>();
 
 /**
- * A reading's id, by thread, reply and style; one without a lead-in or a title keeps the id it had before there were
- * either.
+ * A reading's id, by thread, reply (or several in a row, as their range: `rangeOf`) and style; one without a lead-in or
+ * a title keeps the id it had before there were either.
  */
 export const readingId = (itemId: string, messageId: string, style: ReadingStyle) =>
   createHash("sha256").update(JSON.stringify([
@@ -310,10 +315,60 @@ async function withLead(deps: ReadingDeps, itemId: string, style: ReadingStyle, 
   return asked ? { style: { ...style, leadIn: "prompt" }, prompt: asked } : none;
 }
 
+/** The most replies of one thread read in a row: the newest of them, when there are more. */
+export const TOGETHER_MAX = 5;
+
+/**
+ * A thread's replies the user hasn't heard (`replies` newest first, as the adapter gives them), oldest first: those
+ * that finished after the last one they heard in full here (`readAt`, its reply's time) and after they last opened the
+ * thread in the system, the rule `isNew` keeps for the latest. 14 November: an agent's long reply, then a short one when
+ * the background task it left running finished; only the short one was read, and hearing it marked both heard.
+ */
+export function unheard(replies: PastReply[], readAt: string | undefined, visitedAt: string | null | undefined): PastReply[] {
+  return replies.filter((r) => isNew(r, readAt, visitedAt)).reverse();
+}
+
+/**
+ * What reading a thread's latest reply reads (`replies` newest first): every reply the user hasn't heard, the newest
+ * `TOGETHER_MAX` of them, oldest first; the latest alone when that's all that's new, or nothing is.
+ */
+export function latestParts(replies: PastReply[], readAt: string | undefined, visitedAt: string | null | undefined): PastReply[] {
+  const fresh = unheard(replies, readAt, visitedAt).slice(-TOGETHER_MAX);
+  return fresh.length > 1 && fresh.at(-1)!.messageId === replies[0]?.messageId ? fresh : replies.slice(0, 1);
+}
+
+/** What several replies read in a row start with: how many the user hasn't heard when they're those, else how many. */
+function introFor(parts: PastReply[], replies: PastReply[], readAt: string | undefined, visitedAt: string | null | undefined): string | null {
+  if (parts.length < 2) return null;
+  const fresh = unheard(replies, readAt, visitedAt);
+  const all = parts.at(-1)!.messageId === replies[0].messageId && parts.every((p) => fresh.some((f) => f.messageId === p.messageId));
+  return introOf(parts.length, all ? fresh.length : null);
+}
+
+/**
+ * What the phone is handed to ask for several replies of a thread read in a row (`read_aloud`), as a reply's message:
+ * the oldest and the newest, oldest first. One reply is just its message, as before; a phone passes either back as is.
+ */
+export const rangeOf = (parts: Pick<PastReply, "messageId">[]) =>
+  parts.length > 1 ? `${parts[0].messageId}..${parts.at(-1)!.messageId}` : parts[0].messageId;
+
+/**
+ * The replies a message or range (`rangeOf`) names, oldest first, from `replies` (newest first): the newest
+ * `TOGETHER_MAX` of a longer range. Empty when a message isn't among them, or the range runs backwards.
+ */
+export function inRange(replies: PastReply[], key: string): PastReply[] {
+  const [first, last = first] = key.split("..");
+  const from = replies.findIndex((r) => r.messageId === first);
+  const to = replies.findIndex((r) => r.messageId === last);
+  if (from < 0 || to < 0 || to > from) return [];
+  return replies.slice(to, from + 1).slice(0, TOGETHER_MAX).reverse();
+}
+
 /**
  * The readings for `ids` (every reply new to the user when omitted), newest first: each thread's latest reply. One the
  * briefing hasn't caught up with yet is refreshed first, so a reading is always of the reply `POST /api/read` takes.
- * Threads whose reply can't be read now are left out.
+ * Threads whose reply can't be read now are left out. A thread with several replies the user hasn't heard has them all
+ * read in a row, oldest first, in one reading of the latest, for "Read new replies" and its page alike.
  */
 export async function prepare(deps: ReadingDeps, ids: string[] | null, asked: ReadingStyle): Promise<Reading[]> {
   const live = await deps.adapter.list().catch(() => undefined);
@@ -327,18 +382,24 @@ export async function prepare(deps: ReadingDeps, ids: string[] | null, asked: Re
     try {
       const rep = await deps.adapter.report(card.itemId);
       if (rep.reply && rep.reply.messageId !== card.reply!.messageId) {
-        await deps.briefing.refresh([card.itemId]);
+        await deps.briefing.refresh([card.itemId], true);
         const fresh = view().cards.find((c) => c.itemId === card.itemId);
         if (!fresh?.reply || fresh.reply.messageId !== rep.reply.messageId) return;
         card = fresh;
       }
       const reply = card.reply!;
+      // Every reply the user hasn't heard, when there's more than this one.
+      const all = card.unread ? await deps.adapter.replies?.(card.itemId).catch(() => null) : null;
+      const [readAt, visitedAt] = [deps.store.reads().get(card.itemId), live?.find((l) => l.id === card.itemId)?.visitedAt];
+      const several = all?.[0]?.messageId === reply.messageId ? latestParts(all, readAt, visitedAt) : [];
+      const parts: Part[] = several.length > 1 ? several : [{ messageId: reply.messageId, text: rep.text }];
+      const intro = several.length > 1 ? introFor(several, all!, readAt, visitedAt) : null;
       const { style, prompt } = await withLead(deps, card.itemId, asked, live, async () =>
-        (await deps.adapter.replies?.(card.itemId))?.find((r) => r.messageId === reply.messageId)?.prompt);
-      const id = readingId(card.itemId, reply.messageId, style);
-      const segments = await segmentsOf(deps, id, { itemId: card.itemId, messageId: reply.messageId, text: rep.text, name: card.handle, group: card.group }, style, prompt);
+        (all ?? (await deps.adapter.replies?.(card.itemId)))?.find((r) => r.messageId === parts[0].messageId)?.prompt);
+      const id = readingId(card.itemId, keyOf(parts, intro), style);
+      const segments = await segmentsOf(deps, id, { itemId: card.itemId, parts, intro, name: card.handle, group: card.group }, style, prompt);
       if (!segments) return;
-      out[i] = { id, itemId: card.itemId, name: card.handle, group: card.group, messageId: reply.messageId, finishedAt: reply.at, latest: true, segments };
+      out[i] = { id, itemId: card.itemId, name: card.handle, group: card.group, messageId: reply.messageId, finishedAt: reply.at, latest: true, ...idsOf(parts), segments };
     } catch (e) {
       deps.log(`reading: couldn't read ${card.itemId} (${describe(e)})`);
     }
@@ -346,8 +407,18 @@ export async function prepare(deps: ReadingDeps, ids: string[] | null, asked: Re
   return out.filter((r): r is Reading => r !== null);
 }
 
-/** The reply a reading is of: its thread, message and text, and the thread's name and project for its title. */
-type Source = { itemId: string; messageId: string; text: string; name: string; group: string };
+/** A reading's `messageIds`, when it's of several replies. */
+const idsOf = (parts: Pick<Part, "messageId">[]) => (parts.length > 1 ? { messageIds: parts.map((p) => p.messageId) } : {});
+
+/** One reply of a reading: its message and text, and whether the agent started its run itself. */
+type Part = Pick<PastReply, "messageId" | "text" | "byAgent">;
+/**
+ * The replies a reading is of, oldest first (one, but for several read in a row), their thread, and the thread's name and
+ * project for its title.
+ */
+type Source = { itemId: string; parts: Part[]; intro: string | null; name: string; group: string };
+/** What a reading's id is made from: its reply, or its range and what it starts with (which can change as they're heard). */
+const keyOf = (parts: Part[], intro: string | null) => (parts.length > 1 ? `${rangeOf(parts)} ${intro ?? ""}` : parts[0].messageId);
 
 /**
  * A reading's segments: kept ones, or made from the reply (and `prompt`, its lead-in) and kept. Asked for again while
@@ -370,12 +441,17 @@ async function makeSegments(deps: ReadingDeps, id: string, src: Source, style: R
   // put words in Driver's mouth.
   // Both are masked already, and the models only ever see masked text. Masking again would say a mask twice ("a hidden
   // credential hidden credential").
-  const [body, lead] = await Promise.all([spoken(deps, src.text, style, src.itemId), prompt ? leadIn(deps, prompt, src.itemId, style.fast) : null]);
-  const segments = segment(body.text);
+  const [spokenParts, lead] = await Promise.all([
+    Promise.all(src.parts.map((p) => spoken(deps, p.text, style, src.itemId))),
+    prompt ? leadIn(deps, prompt, src.itemId, style.fast) : null,
+  ]);
+  const segments = togetherSegments(spokenParts.map((b) => b.text), src.parts, src.intro);
+  const body = { text: spokenParts.map((b) => b.text).join("\n\n"), parts: spokenParts.reduce((n, b) => n + b.parts, 0), fallbacks: spokenParts.reduce((n, b) => n + b.fallbacks, 0) };
   if (!segments.length) return null;
   if (lead) segments.unshift({ text: lead, paragraph: -1, lead: true });
   if (style.announce) segments.unshift({ text: titleOf(src.name, src.group), paragraph: -2, title: true });
-  deps.store.putReading(id, src.itemId, src.messageId, JSON.stringify(style), segments);
+  // Kept by its range, so what was read can be told to the voice model afterwards, every reply of it.
+  deps.store.putReading(id, src.itemId, rangeOf(src.parts), JSON.stringify(style), segments);
   // How long the user waited for it, to compare ways of rewriting; never any of its text.
   const how = body.parts ? `rewritten in ${body.parts} ${body.parts === 1 ? "part" : "parts"}` : "as written";
   deps.analytics?.track("reading_prepared", {
@@ -386,34 +462,82 @@ async function makeSegments(deps: ReadingDeps, id: string, src: Source, style: R
   return segments;
 }
 
-/** A thread's replies, newest first, as the phone lists them: when, the prompt that started each run, its first sentence. */
+/**
+ * The segments of one reply, or of several read in a row. Those start by saying how many there are (`intro`), and each
+ * after the first by what started it, so the user hears where one reply ends and the next begins: the voice model hangs
+ * up before the reading and can't say it. Paragraphs count on across them. A reply with nothing to say is left out.
+ */
+function togetherSegments(texts: string[], parts: Part[], intro: string | null): Segment[] {
+  const said = texts.map((t, i) => ({ segments: segment(t), part: parts[i] })).filter((x) => x.segments.length);
+  if (said.length <= 1) return said[0]?.segments ?? [];
+  const out: Segment[] = intro ? [{ text: intro, paragraph: 0 }] : [];
+  said.forEach(({ segments, part }, k) => {
+    const paragraph = out.length ? out.at(-1)!.paragraph + 1 : 0;
+    if (k > 0) out.push({ text: part.byAgent ? "Then, after a background task finished:" : "Then the next reply:", paragraph });
+    const at = paragraph + (k > 0 ? 1 : 0);
+    for (const s of segments) out.push({ ...s, paragraph: s.paragraph + at });
+  });
+  return out;
+}
+
+const NUMBERS = ["", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"];
+const count = (n: number) => NUMBERS[n] ?? String(n);
+
+/**
+ * What several replies read in a row start with: how many the user hasn't heard (`unheard`, which can be more than are
+ * read: hearing them marks those left out heard too), or else that these are the last few.
+ */
+export function introOf(read: number, unheard: number | null): string {
+  const words = (n: number) => `${count(n)} ${n === 1 ? "reply" : "replies"}`;
+  if (unheard === null) return `The last ${words(read)}.`;
+  const first = words(unheard);
+  return `${first[0].toUpperCase()}${first.slice(1)} you haven't heard${unheard > read ? `. Here are the last ${count(read)}` : ""}.`;
+}
+
+/**
+ * A thread's replies, newest first, as the phone shows them: when, the prompt that started each run and the reply, each
+ * as written (Jordan, 14 November: a thread's page showed a prompt cut to its start and end, which read as a summary),
+ * and the reply's first sentence.
+ */
 export async function pastReplies(deps: ReadDeps, itemId: string) {
   // Masked before they're cut: a cut could drop a credential's name and keep its value.
   return (await deps.adapter.replies?.(itemId) ?? []).map((r, i) => ({
     messageId: r.messageId,
     finishedAt: r.at,
-    prompt: r.prompt ? headTail(masked(r.prompt), 200) : null,
+    prompt: r.prompt ? shownWhole(masked(r.prompt)) : null,
+    text: shownWhole(masked(r.text)),
     firstSentence: firstSentence(masked(speakable(r.text, { skipCode: true }))),
     latest: i === 0,
   }));
 }
 
+/** What a phone shows of a message: all of it, up to a length no one reads on a phone. */
+const SHOWN_MAX = 20_000;
+const shownWhole = (text: string) => (text.length > SHOWN_MAX ? `${text.slice(0, SHOWN_MAX).trimEnd()}\n\n… The rest is too long to show here.` : text);
+
 const firstSentence = (text: string) => headTail(segment(text, 1000)[0]?.text ?? "", 200);
 
-/** One of a thread's replies, any of them (an earlier one when asked for by voice or from the phone), as a reading. */
+/**
+ * One of a thread's replies, any of them (an earlier one when asked for by voice or from the phone), or several in a row
+ * (`messageId` a range, `rangeOf`: `read_aloud` of the new or the last few), as a reading. A range's reading is of its
+ * newest reply, which hearing it marks read.
+ */
 export async function prepareReply(deps: ReadingDeps, itemId: string, messageId: string, asked: ReadingStyle): Promise<Reading | null> {
   const replies = await deps.adapter.replies?.(itemId) ?? [];
-  const reply = replies.find((r) => r.messageId === messageId);
-  if (!reply) return null;
+  const parts = inRange(replies, messageId);
+  if (!parts.length) return null;
+  const reply = parts.at(-1)!;
   const item = deps.briefing.allItems().find((i) => i.id === itemId);
   const name = deps.briefing.names().get(itemId) ?? item?.title ?? "that thread";
   const group = item?.group ?? "";
-  const { style, prompt } = await withLead(deps, itemId, asked, undefined, async () => reply.prompt);
-  const id = readingId(itemId, messageId, style);
-  const segments = await segmentsOf(deps, id, { itemId, messageId, text: reply.text, name, group }, style, prompt);
+  const live = parts.length > 1 ? (await deps.adapter.list().catch(() => null))?.find((i) => i.id === itemId) : null;
+  const intro = introFor(parts, replies, deps.store.reads().get(itemId), (live ?? item)?.visitedAt);
+  const { style, prompt } = await withLead(deps, itemId, asked, undefined, async () => parts[0].prompt);
+  const id = readingId(itemId, keyOf(parts, intro), style);
+  const segments = await segmentsOf(deps, id, { itemId, parts, intro, name, group }, style, prompt);
   if (!segments) return null;
   // Latest by the live list, not the briefing, which may not have caught up with a reply just in.
-  return { id, itemId, messageId, finishedAt: reply.at, latest: replies[0].messageId === messageId, name, group, segments };
+  return { id, itemId, messageId: reply.messageId, finishedAt: reply.at, latest: replies[0].messageId === reply.messageId, ...idsOf(parts), name, group, segments };
 }
 
 /**

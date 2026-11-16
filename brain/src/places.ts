@@ -12,10 +12,12 @@ const parts = (name: string) => {
 };
 const renamed = (p: Place, extra: string) => ({ ...p, name: `${parts(p.name).base} (${extra})${parts(p.name).on}` });
 
-/** The coding agents a connector names by a prefix (after the machine's own); T3 Code's places have none. */
-const AGENTS: Record<string, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", opencode: "OpenCode" };
+/** The coding apps a new thread can start in, as said. A connector names each by a prefix (after the machine's own); T3 Code's places have none. */
+export const APPS = { t3: "T3 Code", claude: "Claude Code", codex: "Codex", pi: "Pi", opencode: "OpenCode" } as const;
+export type App = keyof typeof APPS;
+const appOf = (p: Place): App => (/(?:^|\|)(claude|codex|pi|opencode):/.exec(p.id)?.[1] as App | undefined) ?? "t3";
 /** The agent a place belongs to, said ("Claude Code"), or null for T3 Code's. */
-const agentOf = (p: Place) => AGENTS[/(?:^|\|)(claude|codex|pi|opencode):/.exec(p.id)?.[1] ?? ""] ?? null;
+const agentOf = (p: Place) => (appOf(p) === "t3" ? null : APPS[appOf(p)]);
 
 /** A folder as said: "mono/nix" is "mono nix". */
 const folderWords = (folder: string) => folder.replace(/[/\\]+/g, " ").trim();
@@ -54,4 +56,64 @@ export function spokenPlaces(places: Place[]): Place[] {
 export function otherNames(p: Place): string[] {
   const folder = p.folder ? [folderWords(p.folder), folderWords(p.folder).split(" ").at(-1)!] : [];
   return [...new Set([...(p.repo ? [p.repo] : []), ...folder])].filter(Boolean);
+}
+
+/**
+ * A place as the phone's Settings → New threads lists it: its project (its name without its machine or its coding app,
+ * a folder that tells two apart kept: "nix (mono nix)"), its machine as said ("Lattice"; null on a brain with one) and
+ * its coding app. Takes a name as given or as `spokenPlaces` says it.
+ */
+export function placeParts(p: Place): { project: string; machine: string | null; app: App } {
+  const { base, on } = parts(p.name);
+  const app = appOf(p);
+  const tag = ` (${APPS[app]})`;
+  return { project: base.endsWith(tag) ? base.slice(0, -tag.length) : base, machine: on ? on.slice(", on ".length) : null, app };
+}
+
+/**
+ * What a new thread uses when the user doesn't say (Settings → New threads on the phone, sent with each call): a project
+ * as `placeParts` gives it, a machine, a coding app. Null: not set, so Driver asks, as before.
+ */
+export type NewThreadDefaults = { project: string | null; machine: string | null; app: App | null };
+export const NO_DEFAULTS: NewThreadDefaults = { project: null, machine: null, app: null };
+export const hasDefaults = (d: NewThreadDefaults) => d.project !== null || d.machine !== null || d.app !== null;
+
+/** The phone's `newThreadDefaults`, each part a short string (an app one of `APPS`) or not set. An older phone sends none. */
+export function newThreadDefaultsOf(v: unknown): NewThreadDefaults {
+  const o = v && typeof v === "object" ? (v as Record<string, unknown>) : {};
+  const text = (s: unknown) => (typeof s === "string" && s.trim() && s.trim().length <= 100 ? s.trim() : null);
+  return { project: text(o.project), machine: text(o.machine), app: Object.hasOwn(APPS, String(o.app)) ? (o.app as App) : null };
+}
+
+/** Whether `said` names one of `names`, as whole words. */
+const names = (said: string, names: string[]) => names.some((n) => new RegExp(`(?<![\\p{L}\\p{N}])${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`, "iu").test(said));
+
+/**
+ * `places` with the user's defaults applied, for picking where a new thread starts: a project on several machines keeps
+ * only those on the default machine, then only those in the default coding app, when it has any there. The user's own
+ * words win: what they said (`said`) naming a machine ("… on Quartz") or a coding app ("… in Claude Code") leaves that
+ * choice to them, and a project the prompt was dictated for (`placeId`) keeps all of its places. Order kept. Pure.
+ */
+export function preferred(places: Place[], d: NewThreadDefaults, said = "", placeId: string | null = null): Place[] {
+  if (d.machine === null && d.app === null) return places;
+  const machines = [...new Set(places.map((p) => placeParts(p).machine).filter((m): m is string => m !== null))];
+  const machineSaid = names(said, machines.map((m) => `on ${m}`));
+  const appSaid = names(said, [...Object.values(APPS), "open code"]);
+  const groups = new Map<string, Place[]>();
+  for (const p of places) groups.set(sayKey(placeParts(p).project), [...(groups.get(sayKey(placeParts(p).project)) ?? []), p]);
+  const keep = new Set<string>();
+  for (const group of groups.values()) {
+    let left = group;
+    if (!group.some((p) => p.id === placeId)) {
+      const on = d.machine && !machineSaid ? left.filter((p) => placeParts(p).machine?.toLowerCase() === d.machine!.toLowerCase()) : [];
+      if (on.length) left = on;
+      // The app chooses among one machine's places only: never a machine of its own.
+      if (d.app && !appSaid) {
+        const machine = (p: Place) => placeParts(p).machine ?? "";
+        left = left.filter((p) => placeParts(p).app === d.app || !left.some((o) => machine(o) === machine(p) && placeParts(o).app === d.app));
+      }
+    }
+    for (const p of left) keep.add(p.id);
+  }
+  return places.filter((p) => keep.has(p.id));
 }

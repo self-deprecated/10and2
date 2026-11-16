@@ -50,14 +50,14 @@ export type Proposal = {
    * `keptId`: a reply kept for later, sent by this. `confirm`: how the user must agree to it (proposals.ts `Level`);
    * none (a proposal made before levels): the readback heard, then a yes.
    */
-  fields: { message?: string; until?: string; draftId?: string; placeId?: string; place?: string; title?: string; profile?: LaunchProfile; itemId?: string; target?: string; keptId?: string; confirm?: "none" | "yes" | "readback" | "tap"; /** Carried out by the brain on the user's spoken yes (`VoiceSession.yesHeard`). */ heardYes?: boolean };
+  fields: { message?: string; until?: string; draftId?: string; placeId?: string; place?: string; title?: string; profile?: LaunchProfile; itemId?: string; target?: string; keptId?: string; confirm?: "none" | "yes" | "readback" | "tap"; /** Carried out by the brain on the user's spoken yes (`VoiceSession.yesHeard`). */ heardYes?: boolean; /** The user's first answer to its readback was a yes or a keep (`VoiceSession.answered`). */ answered?: boolean };
   readback: string;
   /**
    * What the user must have heard: for each group, at least `need` of its words, spoken after `from`; or, with `head`,
    * the readback's action and names word for word, then perhaps `where` (the project), followed by `next` (or a clause
-   * break when null). See `saysHead`.
+   * break when null), with "the thread called" allowed before the name where `named` says it starts. See `saysHead`.
    */
-  mustHear: { words: string[]; need: number; from: number; head?: string[]; where?: string[]; next?: string | string[] | null; message?: string; sequence?: string[] }[];
+  mustHear: { words: string[]; need: number; from: number; head?: string[]; named?: number; where?: string[]; next?: string | string[] | null; message?: string; sequence?: string[] }[];
   /** Offset into the conversation's assistant transcript when this proposal was made. */
   createdFrom: number;
   expiresAt: number;
@@ -92,7 +92,7 @@ export type Handoff =
   | { handle: string; hold: true };
 
 /**
- * A reply kept for later in a call (`keep`), unsent: what the phone's Not sent lists, until it's sent or discarded.
+ * A reply kept for later in a call (`keep`), unsent: what the phone's Drafts lists, until it's sent or discarded.
  * `threadName` and `project` as they were when it was kept. `note`: a dictated reply's first line, saying it was
  * dictated, which goes before `text` when it's sent. `draftId`: the phone's draft it was, if it was dictated.
  */
@@ -133,6 +133,8 @@ CREATE TABLE IF NOT EXISTS reads (
   item_id TEXT PRIMARY KEY, run_id TEXT, message_id TEXT NOT NULL, reply_at TEXT NOT NULL, watermark TEXT NOT NULL,
   read_at INTEGER NOT NULL, visit_pending INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS handoffs (conversation_id TEXT PRIMARY KEY, handoff TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS call_used (
+  conversation_id TEXT NOT NULL, call_id TEXT NOT NULL, seconds INTEGER NOT NULL, at INTEGER NOT NULL, PRIMARY KEY (conversation_id, call_id));
 CREATE TABLE IF NOT EXISTS readings (
   id TEXT PRIMARY KEY, item_id TEXT NOT NULL, message_id TEXT NOT NULL, style TEXT NOT NULL, segments TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS kept (
@@ -335,6 +337,20 @@ export class Store {
          COALESCE((SELECT MAX(at) FROM turns WHERE conversation_id = c.id), 0)) AS t
        FROM conversations c`,
     ).all() as any[]).map((r) => [r.id, Number(r.t)]));
+  }
+  /**
+   * The minutes call `callId` of a conversation used, as the phone showed them when it ended (talking, and readings
+   * in 10 & 2's voice): kept at the most it has said, so a retry or a late report changes nothing.
+   */
+  setCallUsed(conversationId: string, callId: string, seconds: number, now = Date.now()) {
+    this.db.prepare(
+      `INSERT INTO call_used (conversation_id, call_id, seconds, at) VALUES (?, ?, ?, ?)
+       ON CONFLICT (conversation_id, call_id) DO UPDATE SET seconds = MAX(seconds, excluded.seconds), at = excluded.at`,
+    ).run(conversationId, callId, seconds, now);
+  }
+  /** The minutes each conversation used, in seconds, over all its calls the phone reported. */
+  usedSeconds(): Map<string, number> {
+    return new Map((this.db.prepare("SELECT conversation_id, SUM(seconds) AS s FROM call_used GROUP BY conversation_id").all() as any[]).map((r) => [r.conversation_id, Number(r.s)]));
   }
   conversation(id: string): { startedAt: number; lastActive: number } | null {
     const r = this.db.prepare("SELECT created_at, last_active FROM conversations WHERE id = ?").get(id) as any;

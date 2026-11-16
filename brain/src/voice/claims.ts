@@ -11,6 +11,16 @@ export const CLAIM_OF: Record<string, Claim> = {
   follow_up: "sent", start_work: "started", settle: "settled", settle_subagents: "settled", snooze: "snoozed", archive: "archived",
 };
 
+/**
+ * What a change claims once carried out: a reply is "sent"; a start is "started", and "starred" too when the new thread
+ * was starred with it (proposals.ts stars every thread it starts and has an id for). On 14 November "it's started, and
+ * it's starred" was corrected to "nothing was starred", and the phone showed Not sent, for a start that did both.
+ */
+export function claimsOf(p: { action: string; state: string; fields: { itemId?: string } }): Claim[] {
+  if ((p.state !== "executed" && p.state !== "partial") || !CLAIM_OF[p.action]) return [];
+  return p.action === "start_work" && p.fields.itemId ? ["started", "starred"] : [CLAIM_OF[p.action]];
+}
+
 const VERBS = ["sent", "started", "settled", "snoozed", "archived", "kept", "flagged", "starred"];
 /** Opening words that don't change what the sentence claims: "Okay, sent." */
 const LEAD = /^(?:(?:okay|ok|right|alright|all right|great|good|so|and|yes|yep|sure|well|hmm)\b[\s,.!—-]*)*/i;

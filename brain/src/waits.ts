@@ -37,7 +37,10 @@ export type Wait = {
   ready: Outcome | null;
   /** When it was over: a call-back not made within `READY_MS` of this is dropped. */
   readyAt?: number;
-  replies: (Watched & { outcome: Outcome; seen: Seen })[];
+  /** When the brain rang the phone for it (ring.ts), so it rings once. */
+  rungAt?: number;
+  /** `gone`: the thread was missing from the list (closed, or a machine's partial view), not a reply seen. */
+  replies: (Watched & { outcome: Outcome; seen: Seen; gone?: boolean })[];
 };
 
 /** A run the user just asked for (a follow-up) may take a moment to show as running. */
@@ -155,6 +158,21 @@ export class Waits {
     return this.waits.get(conversationId) ?? null;
   }
 
+  all(): Wait[] {
+    return [...this.waits.values()];
+  }
+
+  /** Calls `l` whenever a wait starts, ends or is over; returns what stops it. */
+  onChange(l: () => void): () => void {
+    this.listeners.add(l);
+    return () => this.listeners.delete(l);
+  }
+
+  /** A machine reported a change: the open waits are looked at now rather than at the next poll, which may not come. */
+  changed() {
+    if ([...this.waits.values()].some((w) => !w.ready)) void this.check().catch((e) => this.log(`wait: check failed (${describe(e)})`));
+  }
+
   /** The latest wait that's over, not yet called back and not stale, in any conversation. */
   newestReady(): Wait | null {
     this.expire();
@@ -200,9 +218,14 @@ export class Waits {
     this.notify();
   }
 
-  cancelAll() {
+  /** `keep`: waits that outlive a Stop (one that rings the phone, ring.ts `keepsThroughStop`). */
+  cancelAll(keep: (w: Wait) => boolean = () => false) {
     this.generation++;
-    for (const id of [...this.waits.keys()]) {
+    for (const [id, w] of [...this.waits]) {
+      if (keep(w)) {
+        this.log(`wait ${id}: kept through the stop; it rings the phone`);
+        continue;
+      }
       this.log(`wait ${id}: cancelled`);
       this.track("wait_cancelled", { conversation_id: id, by: "stop", wait_s: this.waitedS(id) });
       this.drop(id);
@@ -269,7 +292,7 @@ export class Waits {
       }
       w.replies = ready.map((i) => {
         const item = items.get(w.items[i].itemId);
-        return { ...w.items[i], outcome: outcomes[i]!, seen: { runAt: item?.lastRunAt ? Date.parse(item.lastRunAt) : 0, question: item?.questionId ?? null } };
+        return { ...w.items[i], outcome: outcomes[i]!, seen: { runAt: item?.lastRunAt ? Date.parse(item.lastRunAt) : 0, question: item?.questionId ?? null }, ...(item ? {} : { gone: true }) };
       });
       w.ready = w.replies[0].outcome;
       w.readyAt = now;

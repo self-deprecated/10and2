@@ -57,10 +57,15 @@ const LISTS: Record<string, string> = {
   starred: "the threads you follow", all: "your threads", settled: "your settled threads",
 };
 
-/** The receipt for a tool that ran, or null: a tool refused (an unclear name) or one that's no lookup or change. */
+/**
+ * The receipt for a tool that ran, or null: a tool refused (an unclear name) or one that's no lookup or change. One about
+ * a single thread doesn't name it: the phone shows it under the thread's name ("Looked it up"); one about several names
+ * them ("Looked up Alpha and Beta").
+ */
 export function receiptOf(name: string, args: any, result: Record<string, unknown>, about: About[]): Omit<Kept, "id" | "at"> | null {
   if (!result || typeof result !== "object" || "error" in result) return null;
   const threads = about.map((a) => a.itemId);
+  const one = about.length === 1;
   const names = list(about.map((a) => a.handle));
   switch (name) {
     case "list": {
@@ -69,19 +74,20 @@ export function receiptOf(name: string, args: any, result: Record<string, unknow
       return { kind: "lookup", text: `Looked at ${LISTS[args?.filter] ?? "your threads"}${project}`, threads: [] };
     }
     case "details":
-      return { kind: "lookup", text: `Looked up ${names}`, threads };
+      return { kind: "lookup", text: one ? "Looked it up" : `Looked up ${names}`, threads };
     case "read_aloud":
-      return { kind: "lookup", text: `Reading ${names}'s reply aloud`, threads };
+      return { kind: "lookup", text: one ? "Read its reply aloud" : `Read the replies of ${names} aloud`, threads };
     case "wait_for": {
       if (result.alreadyReplied) {
         const replied = about.filter((a) => a.handle === result.handle);
-        return { kind: "lookup", text: `Looked up ${list(replied.map((a) => a.handle))}: it has replied`, threads: replied.map((a) => a.itemId) };
+        return { kind: "lookup", text: replied.length === 1 ? "Looked it up: it has replied" : `Looked up ${list(replied.map((a) => a.handle))}: it has replied`, threads: replied.map((a) => a.itemId) };
       }
+      if (one) return { kind: "lookup", text: result.watching ? "Watching for its reply" : "Calling you back when it replies", threads };
       const or = list(about.map((a) => a.handle), "or");
       return { kind: "lookup", text: result.watching ? `Watching for ${or} to reply` : `Calling you back when ${or} replies`, threads };
     }
     case "star":
-      return { kind: "change", state: "executed", text: `${args?.starred === false ? "Stopped following" : "Following"} ${names}`, threads };
+      return { kind: "change", state: "executed", text: `${args?.starred === false ? "Stopped following" : "Following"} ${one ? "it" : names}`, threads };
     case "remember":
       return { kind: "change", state: "executed", text: "Noted for your next drives", threads: [] };
     case "dictate":
@@ -100,6 +106,18 @@ export function glance(p: Proposal): string {
   if (p.action === "follow_up") return `Send your reply to ${p.targets[0]?.handle ?? "the thread"}${quote}`;
   if (p.action === "start_work") return p.fields.title ? `Start ${p.fields.title} in ${p.fields.place}${quote}` : `Start a new thread in ${p.fields.place}${quote}`;
   return p.readback.replace(/\.$/, "");
+}
+
+/**
+ * A change's receipt when it's about one thread, which the phone shows under the thread's name: what it will do while
+ * open ("Send your reply: “…”"), what it did once carried out ("Sent your reply"). Null: it's worded as anywhere else.
+ */
+function underThread(p: Proposal, state: ReceiptState): string | null {
+  if (threadsOf(p).length !== 1) return null;
+  if (state === "executed") return p.action === "start_work" ? "Started and starred it" : p.action === "follow_up" ? "Sent your reply" : outcomeOf(p);
+  if (state === "failed" || state === "unknown") return null;
+  if (p.action === "follow_up") return `Send your reply${p.fields.message ? `: “${cut(p.fields.message.replace(/\s+/g, " ").trim(), 80)}”` : ""}`;
+  return null;
 }
 
 /** What the agenda says of a thread once a change to it went through. */
@@ -260,12 +278,12 @@ export class CallView {
         if (p.fields.itemId && !this.known.has(p.fields.itemId)) this.known.set(p.fields.itemId, { name: p.fields.title ?? "New thread", project: p.fields.place ?? "" });
         // A reply kept for later: nothing was sent, but the thread is dealt with for now.
         if (p.state === "cancelled" && p.result === KEPT) {
-          return { id: p.id, at: p.createdAt, kind: "change", text: `Kept your reply to ${p.targets[0]?.handle ?? "the thread"}`, state: "kept", threads: threadsOf(p), done: { at: p.createdAt, outcome: "Reply kept", threads: threadsOf(p) } };
+          return { id: p.id, at: p.createdAt, kind: "change", text: threadsOf(p).length === 1 ? "Kept your reply" : `Kept your reply to ${p.targets[0]?.handle ?? "the thread"}`, state: "kept", threads: threadsOf(p), done: { at: p.createdAt, outcome: "Reply kept", threads: threadsOf(p) } };
         }
         // A change tried says how it went (its receipt); one not carried out says what it was.
         const tried = done || p.state === "failed" || p.state === "unknown";
         return {
-          id: p.id, at: p.createdAt, kind: "change", text: tried && p.result ? p.result : glance(p), state, threads: threadsOf(p),
+          id: p.id, at: p.createdAt, kind: "change", text: underThread(p, state) ?? (tried && p.result ? p.result : glance(p)), state, threads: threadsOf(p),
           ...(done ? { done: { ...this.carriedOutOf(p), outcome: outcomeOf(p) } } : {}),
         };
       });
