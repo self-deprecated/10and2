@@ -12,6 +12,8 @@ import { modelRewriter } from "./reading.ts";
 import { openAiSpeech, Speech } from "./voice/speech.ts";
 import { modelClassifier, modelOpener } from "./briefing.ts";
 import { modelBriefingWriter } from "./briefing-reading.ts";
+import { modelTitler } from "./titles.ts";
+import { modelPurposer } from "./purposes.ts";
 import { startServer, type DemoWorlds, type ServerDeps } from "./server.ts";
 import { wire } from "./world.ts";
 import { Ringer } from "./ring.ts";
@@ -100,7 +102,8 @@ if (cfg.demo === "only") {
   const connectors = cfg.connectors.map((c) => ({ ...c, adapter: new RemoteAdapter(c.name) }));
   const adapter = new Machines(connectors.map((c) => ({ ...c, said: c.local ? spokenHost() : undefined })), log);
   const { briefing, conversations, proposals, waits } = wire({
-    adapter, store, classify: modelClassifier(spending("classifier"), cfg.classifyModel), writeOpener: modelOpener(spending("opener"), cfg.openerModel), profiles: cfg.launchProfiles, log,
+    adapter, store, classify: modelClassifier(spending("classifier"), cfg.classifyModel), writeOpener: modelOpener(spending("opener"), cfg.openerModel),
+    title: modelTitler(spending("titler"), cfg.openerModel), purpose: modelPurposer(spending("purposer"), cfg.classifyModel), profiles: cfg.launchProfiles, log,
     track: analytics.track, onDemand: true,
   });
   adapter.watch((ids, urgent) => briefing.onChange(ids, urgent));

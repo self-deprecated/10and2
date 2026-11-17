@@ -2,21 +2,31 @@
 // runs and how often, what kind of failure each check is, and the rule that says whether a gate passed. Pure: eval/run.ts
 // reports with it, scripts/eval-config sends what it reported, and the cloud judges it before recording a pass.
 
-/** What a full gate runs: each scenario of eval/run.ts, and how many times (19 + 3×10 regular, 7 + 10 demo). */
+/** What a full gate runs: each scenario of eval/run.ts, and how many times (24 + 4×10 regular, 8 + 10 demo). */
 export const GATE = {
   regular: { brief: 1, settle: 1, cancel: 1, "follow-up": 1, snooze: 1, tidy: 1, facts: 1, next: 1, goodbye: 10, "open-bye": 10, "open-ask": 10,
+    // A new call opened with only a hello, and one opened back from dictating a new thread's prompt (14 November).
+    "open-hello": 1, "open-dictated": 1,
+    // One project's threads, and how many there are, from the backend rather than the briefing (14 November).
+    "project-threads": 1, "project-count": 1,
+    // A rundown goes on from what was heard in an earlier call (8 November).
+    "rundown-resume": 1,
+    // A call started again soon after the last, which Driver opens (16 November).
+    "rejoin-open": 10,
     // A new thread asked for, under each of the phone's New threads settings (14 November).
     "new-ask": 1, "new-ask-dictate": 1, "new-ask-tell": 1, "new-ask-said": 1, "new-dictate": 1, "new-dictate-said": 1, "new-say": 1, "new-say-dictate": 1,
     // Settings → New threads' defaults: a default machine, the user's own machine over it, a default project (14 November).
     "new-default-machine": 1, "new-default-said": 1, "new-default-project": 1 },
-  demo: { "demo-brief": 1, "demo-open": 10, "demo-answer": 1, "demo-upload": 1, "demo-rundown": 1, "demo-tidy": 1, "demo-start": 1, "demo-facts": 1 },
+  demo: { "demo-brief": 1, "demo-open": 10, "demo-answer": 1, "demo-upload": 1, "demo-rundown": 1, "demo-tidy": 1, "demo-start": 1, "demo-facts": 1,
+    // What a thread is for, more of it, and the user's own words for it noted (17 November).
+    "demo-purpose": 1 },
 } as const;
 /** The `--times` a full gate passes for the repeated scenarios. */
 export const gateTimes = (suite: keyof typeof GATE) => Object.entries(GATE[suite]).filter(([, n]) => n > 1).map(([id, n]) => `${id}=${n}`).join(",");
 
 /**
  * A failure's kind (§5's table). `unsafe`: something done that wasn't asked for, the wrong thread, or a change without a
- * heard readback answered by yes. `missed`: the user said yes and nothing happened, or the wrong count. `language`: speech
+ * heard readback answered by yes. `missed`: the user said yes and nothing happened, the wrong count, or what they said a thread is for wasn't noted. `language`: speech
  * outside Latin script. `nohangup`: the goodbye didn't end the call. `wording`: an answer or opener missed the expected
  * words (or, with speak-first off, Driver spoke first). `harness`: the session never heard the user: not the prompt's fault.
  */

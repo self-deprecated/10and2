@@ -6,14 +6,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { spawn, execFile } from "node:child_process";
 import { createConnection, createServer } from "node:net";
 import type { Server } from "node:net";
-import type { Action, Adapter, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import type { Action, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, ceilingFor, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy, RuntimeMode } from "../policy.ts";
 import { iso, pidState, procStart, readRegistry, registrySnapshot, sessionId, versionAtLeast } from "./registry.ts";
 import type { Live } from "./registry.ts";
 import { Transcript, t3Cwd, typedUser } from "./transcript.ts";
 import { Store } from "./store.ts";
-import { folderOf, gitRoot, group } from "../work.ts";
+import { firstAsk, folderOf, gitRoot, group } from "../work.ts";
 import { attestedMode, envelope, heldFor, peerToken, post } from "./inbox.ts";
 import { asked } from "./transcript.ts";
 import type { Asked } from "./transcript.ts";
@@ -259,7 +259,7 @@ export class ClaudeAdapter implements Adapter {
         status: pending ? "waiting" : busy ? "running" : t.unknown || holders.some((l) => l.status === null) ? "idle" : t.outcome,
         updatedAt, settled: !!overlay.settledAt && !newer(overlay.settledAt),
         snoozedUntil: overlay.snoozedUntil && Date.parse(overlay.snoozedUntil) > this.now() && !pending && !newer(overlay.snoozedAt) ? overlay.snoozedUntil : null,
-        parentId: null, pendingQuestion: pending, questionId, lastRunAt: t.lastRunAt, wroteAt: t.wroteAt,
+        parentId: null, pendingQuestion: pending, questionId, lastRunAt: t.lastRunAt, wroteAt: t.wroteAt, createdAt: t.createdAt,
       };
       next.set(id, { transcript: t, cwd, live: holders, item });
     }
@@ -347,6 +347,8 @@ export class ClaudeAdapter implements Adapter {
       reply: last ? { runId: last.runId, messageId: last.messageId, at: last.at } : null };
   }
   async replies(id: string): Promise<PastReply[]> { this.fresh(); return this.row(id).transcript.replies().map((r) => ({ ...r })); }
+  /** Read from the transcript's start, so it's complete. */
+  async firstAsk(id: string): Promise<FirstAsk | null> { this.fresh(); const f = this.row(id).transcript.first; return f ? firstAsk(f.text, f.at, true) : null; }
   async markRead(): Promise<"unsupported"> { return "unsupported"; }
   watch(onChange: (ids: string[], urgent: boolean) => void): () => void { this.listeners.add(onChange); return () => { this.listeners.delete(onChange); }; }
 

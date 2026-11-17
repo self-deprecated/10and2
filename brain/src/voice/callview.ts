@@ -75,6 +75,11 @@ export function receiptOf(name: string, args: any, result: Record<string, unknow
     }
     case "details":
       return { kind: "lookup", text: one ? "Looked it up" : `Looked up ${names}`, threads };
+    // What a thread is for: looked up, or the user's own words for it noted (only the app's note changes, as with remember).
+    case "purpose":
+      return result.noted
+        ? { kind: "change", state: "executed", text: one ? "Noted what it's for" : `Noted what ${names} is for`, threads }
+        : { kind: "lookup", text: one ? "Looked up what it's for" : `Looked up what ${names} is for`, threads };
     case "read_aloud":
       return { kind: "lookup", text: one ? "Read its reply aloud" : `Read the replies of ${names} aloud`, threads };
     case "wait_for": {

@@ -2,8 +2,32 @@
 import { handsOff, type EndReason } from "./endReason.ts";
 import { STANDARD_WAKE_WORD, withoutWakeWord } from "./wakeWord.ts";
 
-/** "…that's all, bye." yes; "say bye to the old studio, then…" no. */
-export const endsWithGoodbye = (said: string) => /\b(good ?)?bye( for now| then)?[\s.!?,]*$/i.test(said.trim());
+/** "Bye", "goodbye", "bye-bye", "bye bye then". */
+const BYE = String.raw`(?:good ?)?bye(?:[\s,-]+(?:good ?)?bye)*(?: for now| then)?`;
+/** A question ("why the sudden goodbye?") isn't one, as it isn't a pause. */
+const GOODBYE = new RegExp(String.raw`\b${BYE}[\s.!,]*$`, "i");
+/**
+ * A goodbye talked about, not said: someone else's ("it just suddenly said goodbye", "why did you say bye?", "the call
+ * went bye-bye", "it said, goodbye") or a thing ("without a goodbye", "no goodbye"). On 16 November the answer to "what
+ * went wrong?" ended "…said goodbye", and the brain hung up on it. Only these subjects make it someone else's, so the
+ * user's own still counts: "I'm gonna say bye", "I said bye", "gotta say goodbye", "okay, do what it said, bye"; and a
+ * comma ends the noun: "debug this, bye", "thanks for that, bye", "no, bye".
+ */
+const TALKED_ABOUT =
+  /(?:(?<!\b(?:what|whatever|as)\s+)\b(?:it|its|you|he|she|they|driver|the (?:call|app|voice))(?:['’](?:s|re))?(?:\s+(?:just|suddenly|then|also|always|already|again|even|never|actually|randomly|literally|keeps|kept|started|did|didn['’]?t|would|wouldn['’]?t))*\s+(?:say|says|said|saying|went|tells?|told|telling)(?:\s+(?:me|you|us|them))?[\s,]+|\b(?:a|the|your|no)\s+)$/i;
+/** "…that's all, bye." yes; "say bye to the old studio, then…" and "it just said goodbye" no. */
+export const endsWithGoodbye = (said: string) => {
+  const s = said.trim();
+  const goodbye = GOODBYE.exec(s);
+  return !!goodbye && !TALKED_ABOUT.test(s.slice(0, goodbye.index));
+};
+
+/** A sentence that is only a goodbye: "Never mind, bye.", "That's all, thanks. Bye." ("No goodbye." isn't one.) */
+const OWN_GOODBYE = new RegExp(
+  String.raw`^(?:(?:ok(?:ay)?|alright|all right|right|so|well|anyway|yes|yeah|thanks|thank you|cheers|never ?mind|nothing|that['’]?s (?:all|it))\b[\s,]*)*${BYE}[\s,]*$`,
+  "i",
+);
+const lastSentence = (said: string) => said.split(/[.!?;]+/).map((s) => s.trim()).filter(Boolean).at(-1) ?? "";
 
 /** Filler before a command: "okay, pause", "well. pause". */
 const LEAD = /^(?:(?:ok(?:ay)?|alright|all right|right|so|well|yes|yeah|yep|please|then|and|now|just|you can|can you|could you)\b[\s,.!]*)*/i;
@@ -52,6 +76,37 @@ const STOP_ONLY =
 export const asksOnlyToStop = (said: string, wake = STANDARD_WAKE_WORD) => {
   const sentences = said.split(/[.!?;]+/).map((s) => withoutWakeWord(s.trim(), wake).replace(/[\s,]+$/, "")).filter(Boolean);
   return sentences.length > 0 && sentences.every((s) => STOP_ONLY.test(s));
+};
+
+/** A greeting, or asking whether Driver's there: "Hello", "Hi there", "Are you there", "Can you hear me". */
+const HELLO = String.raw`(?:(?:hello|hallo|hullo|hi|hiya|hey|howdy|good (?:morning|afternoon|evening))(?: there| again)?|(?:(?:are|is) )?(?:you|anyone|anybody|someone|somebody) (?:still )?(?:there|here|with me|listening|on the line)|(?:can|could|do) you (?:still )?hear me(?: now)?|testing)`;
+const GREET_FILLER = String.raw`(?:(?:ah|oh|um|uh|er|erm|hmm|ok(?:ay)?|so|well)\b[\s,]*)`;
+/** One greeting at the start, after filler: "Ah, hello", "are you there". Not "Good night": that's a goodbye. */
+const HELLO_HEAD = new RegExp(String.raw`^${GREET_FILLER}*${HELLO}\b[\s,]*`, "i");
+/** A sentence of filler alone: "Ah." before "Hello." */
+const FILLER_ONLY = new RegExp(String.raw`^${GREET_FILLER}+$`, "i");
+/**
+ * The turn only greets Driver or checks it's there ("Hello", "Are you there?", "Hello, 10 & 2?", the wake word alone):
+ * that never ends a call. On 16 November, back from dictating a new thread's prompt, Driver asked where to start it,
+ * the user said "Hello", and the backend called `end_session`: Driver said goodbye and the call ended.
+ */
+export const onlyGreets = (said: string, wake = STANDARD_WAKE_WORD) => {
+  let greeted = false;
+  for (const sentence of said.split(/[.!?;…]+/)) {
+    let rest = sentence.trim();
+    if (!/[\p{L}\p{N}]/u.test(rest) || FILLER_ONLY.test(rest)) continue;
+    // Greetings and the wake word, in any order, until nothing is left ("Hello, 10 & 2, are you there").
+    while (rest) {
+      const before = rest;
+      rest = withoutWakeWord(rest, wake);
+      const head = HELLO_HEAD.exec(rest);
+      if (head) rest = rest.slice(head[0].length);
+      rest = rest.replace(/^[\s,]+|[\s,]+$/g, "");
+      if (rest === before) return false;
+      greeted = true;
+    }
+  }
+  return greeted;
 };
 
 /** A short objection opening the turn: "Oh! Don't", "wait", "no, hold on". */
@@ -103,6 +158,8 @@ export type EndState = {
    * goodbye: like a hang-up to wait, the user talking over it keeps the call.
    */
   goodbyeUnasked: boolean;
+  /** The user's words since they last began a turn told what went wrong: any goodbye at their end isn't theirs. */
+  told: boolean;
   closing: EndReason | null;
   /** The user's wake word, which the phrase checks take off the front of what they say. */
   wake: string;
@@ -112,6 +169,11 @@ export type EndInput =
   | { type: "user_delta"; delta: string }
   | { type: "assistant_delta"; delta: string }
   | { type: "delegation_created" }
+  /**
+   * The user's turn just over told what went wrong after a flag (`said`: all they've told of it, with words still
+   * coming in after Driver began to answer).
+   */
+  | { type: "issue_told"; said: string }
   | { type: "tool_requested_end"; reason: EndReason }
   /** A tool's result has gone back to the voice model. */
   | { type: "tool_answered" }
@@ -138,7 +200,7 @@ export function initialEndState(now: number, said = "", wake = STANDARD_WAKE_WOR
   return {
     startedAt: now, lastActivity: now, lastAssistantDelta: 0, lastUserDelta: 0,
     userTurn: "", userWords: said.trim().slice(-USER_WORDS), reply: "", pauseAnswered: false, filler: null, awaitingReply: false,
-    endRequestedAt: 0, endReason: { kind: "goodbye" }, goodbyeUnasked: false, closing: null, wake,
+    endRequestedAt: 0, endReason: { kind: "goodbye" }, goodbyeUnasked: false, told: false, closing: null, wake,
   };
 }
 
@@ -162,7 +224,7 @@ export function step(previous: EndState, input: EndInput, now: number, correct: 
   switch (input.type) {
     case "user_delta":
       state.lastActivity = state.lastUserDelta = now;
-      if (!state.userTurn) state.pauseAnswered = false;
+      if (!state.userTurn) state.pauseAnswered = state.told = false;
       state.reply = "";
       state.awaitingReply = true;
       state.filler = null;
@@ -201,10 +263,19 @@ export function step(previous: EndState, input: EndInput, now: number, correct: 
       state.awaitingReply = false;
       state.lastActivity = now;
       break;
+    case "issue_told":
+      // It tells what happened ("it hung up with a quick bye", "call me back, it said"), so it never ends the call itself,
+      // unless it ends with a goodbye of the user's own, in a sentence of its own ("…the wrong thread. Never mind, bye.").
+      // The models can still end the call (`end_session`), and the user talk over that.
+      if (!OWN_GOODBYE.test(lastSentence(correct(input.said)))) {
+        state.userTurn = "";
+        state.told = true;
+      }
+      break;
     case "tool_requested_end":
       request(input.reason);
       // "Okay, thanks" can end a call, but it isn't a goodbye: the user may yet say not to.
-      state.goodbyeUnasked = input.reason.kind === "goodbye" && !endsWithGoodbye(correct(state.userWords));
+      state.goodbyeUnasked = input.reason.kind === "goodbye" && (state.told || !endsWithGoodbye(correct(state.userWords)));
       break;
     case "tool_answered":
       // A hand-off says nothing more (the phone's tone is the cue): hang up now, not once the voice model is quiet.

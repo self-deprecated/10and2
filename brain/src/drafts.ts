@@ -15,7 +15,7 @@ export type Draft = { id: string; itemId: string; parts: DraftPart[] };
 /**
  * A draft for a thread not started yet (`dictate` with no thread): maybe where to start it (`placeId`, when the user
  * named the project before dictating) and a launch profile they asked for, carried as the draft's target ("new:…"), so
- * the phone keeps and sends it like any other. The work system names the thread. Everything in it is checked again when
+ * the phone keeps and sends it like any other. The thread is titled as it starts. Everything in it is checked again when
  * it's proposed, as a start said aloud is; with no place, Driver asks which project after the dictation. `named`: with
  * no place, the project as the user named it when it couldn't be settled before dictating ("driver", on two machines),
  * so Driver asks which of its places rather than which project (14 November).
@@ -62,8 +62,9 @@ export function placedTarget(target: string, placeId: string): string | null {
 }
 
 /**
- * What a new thread is called until the work system has named it: "your new thread in driver". The voice and the
- * receipts say it; T3 Code and Claude Code name the thread from its first prompt.
+ * What a new thread is called before it's titled: "your new thread in driver". The voice says it before the start, and
+ * the receipts of a start with no title (the brain titles a thread as it starts, titles.ts; without one, the work
+ * system names it from its first prompt).
  */
 export const newThreadName = (place: string | null | undefined) => (place ? `your new thread in ${place}` : "your new thread");
 

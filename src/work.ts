@@ -3,6 +3,7 @@
 import { execFile } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import type { FirstAsk } from "./contract.ts";
 
 /** A worktree a coding agent keeps inside its project (`<project>/.claude/worktrees/<name>`, and `.codex`, `.opencode`, `.pi`). */
 const AGENT_WORKTREE = /^(.*?)[/\\]\.(?:claude|codex|opencode|pi)[/\\]worktrees[/\\][^/\\]+(?:[/\\]|$)/;
@@ -18,6 +19,30 @@ export function gitRoot(cwd: string): string | null {
     if (existsSync(join(p, ".git"))) return p;
     if (dirname(p) === p) return null;
   }
+}
+
+const MESSAGE_MAX = 8000;
+const TRUNCATED = "\n[Content truncated]\n";
+/**
+ * A long message's start and end, at most 8000 characters: a pasted log followed by the question keeps the question.
+ * brain/src/titles.ts `limited` is the same (test/protocol.test.ts holds them equal); the connector's own code can't
+ * import the brain's, which isn't beside it in the package it's built and published from.
+ */
+export function limited(text: string): string {
+  if (text.length <= MESSAGE_MAX) return text;
+  const available = MESSAGE_MAX - TRUNCATED.length;
+  const head = Math.ceil(available / 2);
+  return `${text.slice(0, head)}${TRUNCATED}${text.slice(-(available - head))}`;
+}
+
+/**
+ * The user's first message as `first_ask` sends it: their words, cut to their start and end (`limited`) to bound the
+ * frame, the message's time, and whether the work system read the item from its start. Null for words that are only
+ * whitespace.
+ */
+export function firstAsk(text: string, at: string, complete: boolean): FirstAsk | null {
+  const words = text.trim();
+  return words ? { text: limited(words), at, complete } : null;
 }
 
 /** The end of a checkout's path ("mono/nix"), as a place's `folder`; t3/adapter.ts has the same. */

@@ -15,6 +15,14 @@ export type DemoThread = {
   title: string;
   project: string;
   status: ItemStatus;
+  /** When it was started: minutes before the demo starts. Its first message is its oldest reply's prompt. */
+  createdAgoMin: number;
+  /**
+   * Why it was started, as the brain keeps it (purposes.ts), written here rather than by the model: one short line, and
+   * a few sentences more in the second person.
+   */
+  purpose: string;
+  about: string;
   /** Its replies, newest first. A running thread's first is its last finished one. */
   replies: DemoReply[];
   /** The user has opened it since its latest reply, so that reply isn't new. */
@@ -54,6 +62,9 @@ export const THREADS: DemoThread[] = [
     title: "CarPlay reply tone",
     project: "driver",
     status: "waiting",
+    createdAgoMin: 40,
+    purpose: "Getting the reply tone heard in the car, not just on the phone",
+    about: "You asked it to make the reply tone play over CarPlay as well as the phone speaker. It's done that, and now it's asking what should happen to music that's playing when a reply comes in.",
     replies: [{
       agoMin: 14,
       prompt: "Make the reply tone play over CarPlay too, not just the phone speaker.",
@@ -99,6 +110,9 @@ export const THREADS: DemoThread[] = [
     title: "Demo mode for App Review",
     project: "driver",
     status: "running",
+    createdAgoMin: 70,
+    purpose: "Letting Apple's reviewer try the app with no computer connected",
+    about: "You asked it to sketch a demo mode for App Review, where nothing real changes. You liked its plan of a fake workspace and told it to build it with believable threads, and it's building that now.",
     replies: [{
       agoMin: 55,
       prompt: "Sketch how a demo mode could work for Apple's reviewer: no machine connected, nothing real changes.",
@@ -127,6 +141,9 @@ export const THREADS: DemoThread[] = [
     title: "TestFlight build 58",
     project: "driver",
     status: "completed",
+    createdAgoMin: 320,
+    purpose: "Fixing the CarPlay disconnect crash and getting the fix to testers",
+    about: "You first asked it why build 57 crashed when CarPlay disconnected, and it found and fixed that. Then you had it bump the build, run the tests and archive build 58 without uploading it. It's waiting for your go to upload it for review.",
     replies: [
       {
         agoMin: 38,
@@ -153,6 +170,9 @@ export const THREADS: DemoThread[] = [
     title: "Review the reading pipeline",
     project: "driver",
     status: "completed",
+    createdAgoMin: 90,
+    purpose: "Catching bugs in how replies are read aloud, with five reviewers",
+    about: "You asked for five reviewers to go over the reading pipeline, and for it to fix whatever more than one of them found. Three found the same bug, a reply losing its last sentence, and the fix is merged.",
     replies: [{
       agoMin: 70,
       prompt: "Have five reviewers go over the reading pipeline, then fix whatever more than one of them finds.",
@@ -165,6 +185,9 @@ export const THREADS: DemoThread[] = [
     title: `Review round ${k + 1}: ${name}`,
     project: "driver",
     status: "completed",
+    createdAgoMin: 85 + k,
+    purpose: "Looking for correctness bugs in the reading pipeline, as one of five reviewers",
+    about: `Your review thread asked it to go over the reading pipeline for correctness, as reviewer ${k + 1} of five. ${k < 3 ? "It found the bug where a reply loses its last sentence." : "It found no bugs, only two style nits."}`,
     parent: "demo-review-reading",
     visited: true,
     replies: [{
@@ -179,6 +202,9 @@ export const THREADS: DemoThread[] = [
     title: "Dark mode for Settings",
     project: "driver",
     status: "completed",
+    createdAgoMin: 1610,
+    purpose: "Making Settings look right in dark mode",
+    about: "You asked it to fix Settings in dark mode. The section backgrounds and the voice picker were stuck on white; it fixed them and merged it.",
     settled: true,
     visited: true,
     replies: [{
@@ -195,6 +221,9 @@ export const THREADS: DemoThread[] = [
     title: "Checkout with Stripe Payment Element",
     project: "storefront",
     status: "completed",
+    createdAgoMin: 200,
+    purpose: "Taking payments on the checkout page instead of sending shoppers away",
+    about: "You asked it to plan moving checkout from Stripe's redirect to the Payment Element, then to wire it in and test it end to end. It's wired in, but it can't test it without a Stripe test key.",
     replies: [
       {
         agoMin: 55,
@@ -222,6 +251,9 @@ export const THREADS: DemoThread[] = [
     title: "Fix the flaky cart test",
     project: "storefront",
     status: "completed",
+    createdAgoMin: 140,
+    purpose: "Stopping the cart total test from failing one run in ten",
+    about: "You asked it to find out why the cart total test failed about one run in ten, and fix it. It was a race that also showed shoppers a stale total for a moment; both are fixed and merged.",
     visited: true,
     replies: [{
       agoMin: 130,
@@ -235,6 +267,9 @@ export const THREADS: DemoThread[] = [
     title: "Product search with Postgres full text",
     project: "storefront",
     status: "running",
+    createdAgoMin: 60,
+    purpose: "Giving the shop fast product search without another service to run",
+    about: "You asked it to compare Postgres full text search with Meilisearch for product search. It recommended Postgres, and you told it to build that with the backfill, which it's doing now.",
     replies: [{
       agoMin: 45,
       prompt: "Compare Postgres full text search with Meilisearch for product search.",
@@ -257,6 +292,9 @@ export const THREADS: DemoThread[] = [
     title: "Upgrade to Next 16",
     project: "storefront",
     status: "cancelled",
+    createdAgoMin: 4 * 1440 + 10,
+    purpose: "Keeping the storefront on the latest version of Next",
+    about: "You asked it to upgrade the storefront to Next 16. The run was cancelled before it finished.",
     visited: true,
     replies: [{
       agoMin: 4 * 1440,
@@ -272,6 +310,9 @@ export const THREADS: DemoThread[] = [
     title: "Postgres backups to R2",
     project: "infra",
     status: "completed",
+    createdAgoMin: 60,
+    purpose: "Making sure the database can be restored if anything goes wrong",
+    about: "You asked it to set up nightly Postgres backups to R2 and check that a restore works. Both work in testing; deploying restarts Postgres for a few seconds, so it's asking whether to do that now or tonight at 2 AM.",
     replies: [{
       agoMin: 22,
       prompt: "Set up nightly Postgres backups to R2 and check a restore works.",
@@ -290,6 +331,9 @@ export const THREADS: DemoThread[] = [
     title: "Renew the TLS certificates",
     project: "infra",
     status: "completed",
+    createdAgoMin: 1505,
+    purpose: "Making sure no certificate expires without anyone noticing",
+    about: "You asked it when the TLS certificates expire. All four renew by themselves and the earliest has 41 days left, so there's nothing to do yet.",
     visited: true,
     snoozedDays: 3,
     replies: [{
@@ -306,6 +350,9 @@ export const THREADS: DemoThread[] = [
     title: "Write the launch post",
     project: "launch-site",
     status: "completed",
+    createdAgoMin: 75,
+    purpose: "Turning your notes into the post that announces the beta",
+    about: "You asked it to draft the launch post from the notes in the post folder. The draft is done, and it's asking whether to keep the pricing section while prices aren't final.",
     replies: [{
       agoMin: 48,
       prompt: "Draft the launch post from the notes in the post folder.",
@@ -334,6 +381,9 @@ export const THREADS: DemoThread[] = [
     title: "Rate limiting for the public API",
     project: "api",
     status: "completed",
+    createdAgoMin: 175,
+    purpose: "Keeping any one key from overloading the public API",
+    about: "You asked it to add rate limiting to the public API, per API key. It's in, load-tested and merged.",
     visited: true,
     replies: [{
       agoMin: 160,
@@ -347,6 +397,9 @@ export const THREADS: DemoThread[] = [
     title: "Move sign-in to Clerk",
     project: "api",
     status: "completed",
+    createdAgoMin: 225,
+    purpose: "Planning how the 1,800 existing users move to the new sign-in",
+    about: "You asked it to plan moving your 1,800 users' sign-in to Clerk. It found two ways and recommends importing their password hashes so nobody notices; it's asking which you want.",
     replies: [{
       agoMin: 210,
       prompt: "Plan moving our 1,800 users' sign-in to Clerk.",

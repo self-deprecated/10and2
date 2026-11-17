@@ -2,12 +2,12 @@
 // the live shell stream; writes are exactly four thread commands, answering a thread's question (a follow-up to a
 // thread that asked one), launching a thread, and marking a thread read, and nothing else (the connector's allowlist:
 // `orchestration:operate` would also allow provider logins, installs, project changes and more).
-import type { Action, Adapter, ItemStatus, LaunchProfile, PastReply, Place, Receipt, ReplyRef, Report, WorkItem } from "../contract.ts";
+import type { Action, Adapter, FirstAsk, ItemStatus, LaunchProfile, PastReply, Place, Receipt, ReplyRef, Report, WorkItem } from "../contract.ts";
 import { issueSession, revokeSession, CONNECTOR_SCOPES, type Cli, type T3Session } from "./auth.ts";
 import { ConnectionError, RpcClient, RpcError } from "./rpc.ts";
 import { execFile } from "node:child_process";
 import { describe } from "../util.ts";
-import { worktreeStart } from "../work.ts";
+import { firstAsk, worktreeStart } from "../work.ts";
 
 const M = {
   subscribeShell: "orchestration.subscribeShell",
@@ -43,6 +43,9 @@ export type ShellThread = {
   lineage?: { parentThreadId: string | null; relationshipToParent: string | null } | null;
   /** The model the thread runs on, as T3 gives it; passed back unchanged when launching in its project. */
   modelSelection?: unknown;
+  createdAt?: string;
+  /** How many rows the whole thread shows: what tells whether a read of it was a recent window or all of it. */
+  visibleItemCount?: number;
 };
 /** The root is used only for the local policy: no path leaves the machine through Driver. */
 type Project = { id: string; title: string; defaultModelSelection?: unknown; workspaceRoot?: string; repositoryIdentity?: { name?: string } | null };
@@ -87,6 +90,7 @@ export function toWorkItem(t: ShellThread, projects: Map<string, string>, now: n
     questionId: t.pendingRuntimeRequest?.id ?? null,
     visitedAt: t.lastVisitedAt ?? null,
     wroteAt: t.latestUserAuthoredMessageAt ?? null,
+    createdAt: t.createdAt ?? null,
   };
 }
 
@@ -103,6 +107,15 @@ function replyRef(m: any, runs: any[], messages: any[]): ReplyRef | null {
  */
 const startedBy = (run: any, messages: any[]) =>
   run ? (run.userMessageId && messages.find((m) => m.id === run.userMessageId)) || messages.find((m) => m.runId === run.id && m.role === "user") : undefined;
+
+/**
+ * The user's first message in a thread's projection: the oldest one of theirs with words, never a note the agent wrote
+ * itself (`createdBy` "agent", as `startedBy` finds) or the system's, nor a workflow's script.
+ */
+function firstMessage(p: any): any {
+  const own = (p.messages ?? []).filter((m: any) => m.role === "user" && (m.createdBy ?? "user") === "user" && !m.workflowScript && m.text?.trim() && m.createdAt);
+  return own.reduce((first: any, m: any) => (!first || Date.parse(m.createdAt) < Date.parse(first.createdAt) ? m : first), null);
+}
 
 /** How many earlier replies' times a report carries: enough to count what's unheard ("Seven replies you haven't heard"). */
 const EARLIER_MAX = 9;
@@ -355,6 +368,18 @@ export class T3Adapter implements Adapter {
     const p = await this.rpc().request<any>(M.getThreadProjection, { threadId: id });
     this.requireVisible(id);
     return pastReplies(p);
+  }
+
+  /**
+   * The user's first message. T3 answers `getThreadProjection` with a recent window of a long thread (about 10 user turns,
+   * 75 rows or 1 MB) without saying so, so the read is complete only when it holds every row the shell counts.
+   */
+  async firstAsk(id: string): Promise<FirstAsk | null> {
+    this.requireVisible(id);
+    const p = await this.rpc().request<any>(M.getThreadProjection, { threadId: id });
+    this.requireVisible(id);
+    const first = firstMessage(p), rows = this.threads.get(id)?.visibleItemCount;
+    return first ? firstAsk(first.text, first.createdAt, typeof rows === "number" && (p.visibleTurnItems ?? []).length >= rows) : null;
   }
 
   async markRead(itemId: string, watermark: string, idempotencyKey: string): Promise<Receipt | "unsupported"> {

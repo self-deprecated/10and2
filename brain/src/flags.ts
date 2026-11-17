@@ -51,6 +51,26 @@ export const issueIn = (said: string): string | null => {
   return (rest.match(/[\w'’]+/g) ?? []).length >= 3 ? rest : null;
 };
 
+/** Words of a note that ask to flag, frame it or fill: they say nothing of what went wrong. */
+const ASKING = new Set([
+  "debug", "flag", "flagged", "mark", "note", "log", "report", "review", "moment", "this", "that", "something", "went", "there", "here",
+  "please", "can", "you", "could", "would", "the", "and", "for", "assistant", "user", "driver", "asked", "asks", "wants",
+]);
+const words = (s: string) => s.toLowerCase().replace(/’/g, "'").replace(/'s\b/g, "").match(/[a-z0-9']{3,}/g) ?? [];
+
+/**
+ * The backend's note for a flag is plainly the user's own account of what went wrong: at least three words of it that
+ * say something, most of them the user's. On 16 November a yes and "Debug this" ran together into one sentence,
+ * the backend flagged it with a note of its own making, and Driver took that for the user's account and never asked
+ * them. A note that strays further from their words fails too, and Driver asks: the lesser fault, since the flag keeps
+ * their turn.
+ */
+export const noteIsTheirs = (note: string, said: string): boolean => {
+  const theirs = new Set(words(said));
+  const telling = words(note).filter((w) => !ASKING.has(w));
+  return telling.length >= 3 && telling.filter((w) => theirs.has(w)).length >= telling.length * 0.6;
+};
+
 /**
  * `brainRev`, `phoneBuild`: what was running (unknown for a flag made after the fact: the recording's header says).
  * `issue`: what the user said went wrong, in their next turn, when Driver asked.

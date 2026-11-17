@@ -128,6 +128,21 @@ test("reads the last reply and every finished turn's reply with its prompt, skip
   assert.equal(item.lastRunAt, report.reply!.at); assert.ok(item.wroteAt);
 });
 
+test("a session's start is its time_created, and its first ask the user's first words, not what OpenCode added", async (t) => {
+  const h = harness(t), start = Date.now() - 10_000;
+  const id = h.db.session({ directory: h.cwd, title: "Screenshots", created: start });
+  h.db.user(id, "", { at: start + 1000, synthetic: "(file attached)" });
+  h.db.assistant(id, h.db.user(id, "  Improve the screenshot stuff.\n", { at: start + 2000 }), { text: "Done.", at: start + 3000 });
+  h.db.user(id, "Now the tests.", { at: start + 4000 });
+  const quiet = h.db.session({ directory: h.cwd, title: "Quiet" });
+  await h.adapter.start();
+  const items = new Map((await h.adapter.list()).map((i) => [i.id, i]));
+  assert.equal(items.get(id)?.createdAt, new Date(start).toISOString());
+  assert.deepEqual(await h.adapter.firstAsk(id), { text: "Improve the screenshot stuff.", at: new Date(start + 2000).toISOString(), complete: true });
+  assert.equal(await h.adapter.firstAsk(quiet), null);
+  await assert.rejects(h.adapter.firstAsk("ses_missing"), /isn't visible/);
+});
+
 test("a follow-up to a session open in a terminal goes to that terminal's OpenCode, idle or busy, once per key", async (t) => {
   const h = harness(t);
   const id = h.db.finished(h.cwd);

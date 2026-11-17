@@ -9,6 +9,7 @@ import { DONE, type ClutterGroup } from "./briefing.ts";
 import { dictatedParts, DRAFT_MAX, draftState, newThreadName, newThreadTarget, parseNewThread, type NewThread } from "./drafts.ts";
 import { inGroup, isMark, keyWords, nameKey, norm, pick, resolve, sayKey, saysHead, speechTokens, spokenTitle, withGroup, type Named } from "./handles.ts";
 import { TAP, type KeptReply, type Proposal, type ProposalTarget, type Store } from "./store.ts";
+import type { Titler } from "./titles.ts";
 import { mapLimit } from "./util.ts";
 import { NO_DEFAULTS, otherNames, preferred, spokenPlaces, type NewThreadDefaults } from "./places.ts";
 import type { Track } from "./analytics.ts";
@@ -20,7 +21,7 @@ export type ProposeAction = "follow_up" | "settle" | "snooze" | "archive" | "set
  */
 export type TapAction = "settle" | "unsettle" | "snooze" | "unsnooze" | "follow_up";
 
-/** `project` and `profile` are for start_work: where, and which launch profile. The work system names the thread. */
+/** `project` and `profile` are for start_work: where, and which launch profile. The thread is titled as it starts. */
 export type ProposeInput = {
   action: ProposeAction;
   handles: string[];
@@ -113,6 +114,8 @@ export type ProposalDeps = {
    * away. Gives the name the work system gave it, once it lists it, else null.
    */
   started?: (itemId: string, started: { title: string; group: string }) => Promise<string | null | void>;
+  /** Titles a new thread from its prompt as it starts. Without it, or when it fails, the work system names the thread. */
+  title?: Titler;
   /** Everything the assistant has said aloud in this conversation. */
   spoken: (conversationId: string) => string;
   lastUserTurn: (conversationId: string) => UserTurn;
@@ -622,8 +625,8 @@ export class Proposals {
 
   /**
    * Where a new thread starts and with which profile, from the user's words (`project`) or, for a dictated start, the
-   * place it was dictated for (`placeId`). `head` is the readback up to its message, all heard word for word. The work
-   * system names the thread. `defaults` (Settings → New threads) fill in what the user didn't say: the project when they
+   * place it was dictated for (`placeId`). `head` is the readback up to its message, all heard word for word. The
+   * thread is titled as it starts (`start`), after the yes. `defaults` (Settings → New threads) fill in what the user didn't say: the project when they
    * named none, and the machine and coding app of a project in several (`preferred`).
    */
   newThread(where: { project: string; conversationId?: string; defaults?: NewThreadDefaults } | { placeId: string }, asked: string | null): { place: Place; profile: LaunchProfile; head: string; heard: MustHear[] } | { error: string } {
@@ -1251,14 +1254,16 @@ export class Proposals {
 
   /**
    * Starts the proposal's new thread, once: the key is `<proposal>:start`, so a yes after a lost answer launches with the
-   * same key and gets the same thread back. The place is checked live first. Once started, the thread is named in the
-   * conversation as "your new thread in <project>" (or by its title, from before 8 November), counted as messaged there
-   * (so `wait_for` takes it), and starred, so Driver calls back when it replies.
+   * same key and gets the same thread back. The place is checked live first. The thread is titled from its prompt first
+   * (`title`), and the title kept on the proposal, so a retry sends the same one; without one the work system names it.
+   * Once started, the thread is named in the conversation by its title (or the work system's name for it) and as "your
+   * new thread in <project>", counted as messaged there (so `wait_for` takes it), and starred, so Driver calls back when
+   * it replies. Its first message and when it started are kept for its purpose (purposes.ts).
    */
   private async start(p: Proposal, retry: boolean): Promise<ToolResult> {
     // A tap's outcome is read on the phone, not said by Driver.
     const tapped = p.conversationId === TAP;
-    const f = p.fields;
+    let f = p.fields;
     const key = `${p.id}:start`;
     const place = (spokenPlaces(this.d.places?.() ?? [])).find((x) => x.id === f.placeId);
     const reason = !this.d.adapter.connected(f.placeId!) ? "is on a machine that isn't connected right now" : !place ? "is no longer in T3" :
@@ -1271,10 +1276,24 @@ export class Proposals {
       return { error };
     }
     const prior = this.d.store.operation(key);
+    // Titled once, before anything is sent: a key already used goes again exactly as it went (the connector refuses the
+    // same key with another title), and a title already kept (or one from before 8 November) is used as it is. The
+    // proposal is executing (it was claimed before `start`), so it's written back as executing.
+    if (!prior && !f.title && this.d.title) {
+      const title = await this.d.title(f.message!, place!.name).catch((e) => {
+        this.d.log?.(`proposal ${p.id}: no title (${String(e)})`);
+        return null;
+      });
+      if (title) {
+        f = { ...f, title };
+        p = { ...p, state: "executing", fields: f };
+        this.d.store.putProposal(p);
+      }
+    }
     const fresh = this.d.store.beginOperation(p.id, f.placeId!, "start_work", key);
-    // A start proposed before 8 November keeps its title; any since lets the work system name the thread.
     const action: Action = { kind: "start_work", placeId: f.placeId!, ...(f.title ? { title: f.title } : {}), message: f.message!, profile: f.profile! };
-    const name = f.title ?? newThreadName(f.place);
+    // What the thread is called until it's started: by its title, with its place, once it has one.
+    const name = f.title ? `${f.title} in ${f.place}` : newThreadName(f.place);
     const checked = fresh ? await this.check([action]) : null;
     const r: Receipt = checked ? { ok: false as const, error: checked } : await this.d.adapter.execute(action, key).catch((e) => ({ ok: false as const, error: String(e), unknown: true }));
     if (!r.ok) {
@@ -1292,18 +1311,22 @@ export class Proposals {
     const itemId = r.itemId ?? null;
     let called: string | null = null;
     if (itemId) {
-      // Named in this conversation as Driver called it ("your new thread in driver", "new thread in driver", "the new
-      // thread") as well as by the work system's name for it.
+      // What it was started to do and when, kept now (purposes.ts): the brain sent its first message itself.
+      const now = this.now();
+      this.d.store.saveFirstAsk(itemId, { text: f.message!, at: new Date(now).toISOString(), complete: true }, now);
+      // Named in this conversation by its title, as Driver called it before it had one ("your new thread in driver",
+      // "new thread in driver", "the new thread"), and by the work system's name for it.
       const project = f.place!.replace(/, on [\w-]+$/, "");
-      const names = [name, newThreadName(project)].flatMap((n) => [n, n.replace(/^your /, "")]);
+      const names = [...(f.title ? [f.title] : []), ...[newThreadName(f.place), newThreadName(project)].flatMap((n) => [n, n.replace(/^your /, "")])];
       if (!tapped) for (const n of new Set([...names, "new thread", "your new thread"])) this.d.store.alias(p.conversationId, nameKey(n), itemId);
       this.d.store.star(itemId, true);
       called = (await this.d.started?.(itemId, { title: f.title ?? "Your new thread", group: f.place! }).catch((e) => this.d.log?.(`proposal ${p.id}: couldn't list the new thread (${String(e)})`))) || null;
       if (called && !tapped) this.d.store.alias(p.conversationId, nameKey(called), itemId);
     }
     // 14 November: "Started your new thread in driver" and then "what's it called?" got "it isn't in the list yet",
-    // twice. The work system names it from its first words; once it lists it, the result says that name.
-    const result = f.title ? `Started ${f.title} in ${f.place}${itemId ? ", and starred it" : ""}.`
+    // twice. Titled, the result says the title; untitled, the work system names it from its first words, and once it
+    // lists it, the result says that name.
+    const result = f.title ? `Started ${name}${itemId ? ", and starred it" : ""}.`
       : called ? `Started your new thread in ${f.place}, called “${called}”, and starred it.`
       : `Started ${name}${itemId ? ", and starred it" : ""}.`;
     this.d.store.putProposal({ ...p, state: "executed", result, fields: { ...f, ...(itemId ? { itemId } : {}) } });
@@ -1313,7 +1336,7 @@ export class Proposals {
       result,
       // Not "Driver … calls back with its reply": on 3 November the voice read that out as it stood, or said "I'll call back
       // with its reply", which hangs up as a promise to (endPolicy) when the user was carrying on.
-      instruction: `Tell the user this result in your own short words${called ? ", with its name" : ""}: it has started and is starred, so they'll hear its reply. You stay on the call: don't say you'll hang up or call back. Add no details that are not in it.`,
+      instruction: `Tell the user this result in your own short words${f.title || called ? ", with its name" : ""}: it has started and is starred, so they'll hear its reply. You stay on the call: don't say you'll hang up or call back. Add no details that are not in it.`,
     };
   }
 }

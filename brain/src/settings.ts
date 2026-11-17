@@ -11,7 +11,7 @@ import { FORBIDDEN } from "./user-text.ts";
  * The eval suite a pass was measured with: part of the template hash, so a pass from an older suite doesn't count for
  * this one. Raise it whenever the scenarios in eval/run.ts, or how they're judged, change.
  */
-export const EVAL_SUITE_VERSION = 7;
+export const EVAL_SUITE_VERSION = 9;
 
 /** Free seconds a day (UTC) for each allowance label (Clerk `public_metadata.driver.allowance`): testers, and the stage account. */
 export const ALLOWANCES = { tester: 600, presenter: 3 * 3600 } as const;
@@ -38,9 +38,11 @@ export type Minutes = { -readonly [K in keyof typeof MINUTES]: number };
 
 /**
  * A safety limit, in cents, on what an account's background work (spend.ts `BACKGROUND`: the briefing's classifier,
- * opener and writer, and rewrites) may cost Driver in a UTC day: a fuse against a fault, never reached in normal use
- * (summaries are made only when someone looks, cost-tracking.md). Past it, that work waits for the next day: cards say
- * a thread has a newer reply rather than give an old summary as current, and Ops' Costs shows the day.
+ * opener and writer, rewrites, new threads' titles, and threads' purposes) may cost Driver in a UTC day: a fuse
+ * against a fault, never reached in normal use (summaries and purposes are made only when someone looks,
+ * cost-tracking.md). Past it, that work waits for the next day: cards say a thread has a newer reply rather than give an
+ * old summary as current, a new thread starts untitled for its work system to name, threads go without purposes, and
+ * Ops' Costs shows the day.
  */
 export const BACKGROUND_CENTS_PER_DAY = 200;
 
@@ -182,7 +184,7 @@ const prompts: Check = (v) => {
  * models it makes (§5): a version with any of these needs a pass for its template hash on the code that reads it.
  */
 export const SETTINGS: Record<string, { label: string; check: Check; gated?: boolean }> = {
-  speakFirstNew: { label: "The voice speaks first on a new call", check: bool },
+  speakFirstNew: { label: "The voice speaks first on a call the user starts (new, or started again soon after)", check: bool },
   idleSeconds: { label: "Hang up after this many seconds of silence", check: int(30, 300) },
   maxMinutes: { label: "Minutes before a session rolls over into the next", check: int(5, MAX_MINUTES_CAP) },
   liveNotices: { label: "Tell starred threads' replies during a call", check: bool },
@@ -193,7 +195,7 @@ export const SETTINGS: Record<string, { label: string; check: Check; gated?: boo
     check: fields({ fastPercent: int(100, 400), readingCharsPerSecond: int(10, 200), pickupSeconds: int(0, 60), trialDailySeconds: int(0, 3600), trialDays: int(0, 14) }),
   },
   allowances: { label: "Free seconds each UTC day, by account label", check: fields({ tester: int(0, 3600), presenter: int(0, 14_400) }) },
-  backgroundCentsPerDay: { label: "Safety limit on background work (briefing, rewrites) per account per UTC day (cents)", check: int(0, 500) },
+  backgroundCentsPerDay: { label: "Safety limit on background work (briefing, rewrites, new threads' titles, threads' purposes) per account per UTC day (cents)", check: int(0, 500) },
   banner: { label: "Banner in the app, shown once", check: banner },
   minBuild: { label: "Oldest iOS build that may start a new call", check: fields({ ios: (v) => (v === null || (typeof v === "string" && /^\d{12}$/.test(v)) ? null : "must be a 12-digit build or none") }) },
   liveModel: { label: "Voice model", check: oneOf(LIVE_MODELS), gated: true },

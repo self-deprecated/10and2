@@ -37,13 +37,15 @@ export type View = {
   asking: { partId: string; questions: Asked[] } | null;
   /** The agent the session last ran with. */
   agent: string | null;
+  /** The user's first message with words of their own, and when they sent it. */
+  first: { text: string; at: string } | null;
 };
 
 /** `opencode run` gives its sessions exactly these rules: a script's run, not the user's own session. */
 const RUN_RULES = JSON.stringify([{ permission: "question", pattern: "*", action: "deny" }, { permission: "plan_enter", pattern: "*", action: "deny" }, { permission: "plan_exit", pattern: "*", action: "deny" }]);
 export const isRunSession = (s: Pick<SessionRow, "permission">) => JSON.stringify(s.permission) === RUN_RULES;
 
-const iso = (ms: number | null | undefined) => typeof ms === "number" && Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+export const iso = (ms: number | null | undefined) => typeof ms === "number" && Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 const json = (s: unknown) => { try { return typeof s === "string" ? JSON.parse(s) : null; } catch { return null; } };
 
 /** Opens the database for one read and closes it again; a locked or missing database is an error the caller keeps its last read through. */
@@ -138,7 +140,7 @@ export function view(msgs: Msg[], parts: Part[], sessionAgent: string | null = n
   const progress = outcome === "incomplete" ? turn.map((m) => assistantText(parts, m.id)).filter(Boolean).at(-1) ?? null : null;
   const question = outcome === "incomplete" && last ? parts.find((p) => p.messageId === last.id && p.tool === "question" && (p.status === "running" || p.status === "pending")) : undefined;
   const questions = question ? questionsOf(question.input) : [];
-  const head = replies[0];
+  const head = replies[0], firstAt = iso(users[0]?.created);
   return {
     outcome, replies, progress,
     reply: head ? { runId: head.runId, messageId: head.messageId, at: head.at, text: head.text } : null,
@@ -146,5 +148,6 @@ export function view(msgs: Msg[], parts: Part[], sessionAgent: string | null = n
     wroteAt: iso(users.at(-1)?.created),
     asking: question && questions.length ? { partId: question.id, questions } : null,
     agent: last?.agent ?? [...msgs].reverse().find((m) => m.agent)?.agent ?? sessionAgent,
+    first: users[0] && firstAt ? { text: userText(parts, users[0].id), at: firstAt } : null,
   };
 }

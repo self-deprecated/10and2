@@ -2,7 +2,7 @@
 // conversation, and ends the session on goodbye, silence or a time cap (it bills while open).
 import type { Report } from "../adapter.ts";
 import { briefedMark, headTail, type Briefing, type BriefingView } from "../briefing.ts";
-import { mentionsThread, tellsAbout, UTTERANCE, withGroup } from "../handles.ts";
+import { mentionsThread, nameKey, tellsAbout, UTTERANCE, withGroup } from "../handles.ts";
 import { agrees, KEPT, notAYes, READBACK_ALL, spokenWords, trackChange, type ConfirmLevels, type KeepReplies, type ToolResult, type UserTurn } from "../proposals.ts";
 import type { Proposal, Seen, Store } from "../store.ts";
 import { isNewThread } from "../drafts.ts";
@@ -14,9 +14,9 @@ import { namedItems, runTool, seenOf, TOOLS, type ToolDeps, type Watched } from 
 import { masked, type ReadingStyle } from "../reading.ts";
 import { datedLine, driveBlock, historyLine } from "../drives.ts";
 import { ago, describe, realClock, type Clock, type Timer } from "../util.ts";
-import { asksOnlyToStop, endsWithGoodbye, initialEndState, step, type EndInput, type EndState } from "./endPolicy.ts";
+import { asksOnlyToStop, endsWithGoodbye, initialEndState, onlyGreets, step, type EndInput, type EndState } from "./endPolicy.ts";
 import { deliberate, reasonText, type EndReason } from "./endReason.ts";
-import { asksToFlag, issueIn, type Flags } from "../flags.ts";
+import { asksToFlag, issueIn, noteIsTheirs, type Flags } from "../flags.ts";
 import { fill, type Prompts } from "./sections.ts";
 import { median, type Calls } from "../calls.ts";
 import type { Track } from "../analytics.ts";
@@ -25,7 +25,7 @@ import { asksAbout, asksRecap, CLAIM_OF, claimsIn, claimsOf, isRecap, type Claim
 import { correctArgs, vocabularyOf } from "../vocabulary.ts";
 import { tokensOf, type RecordSpend } from "../spend.ts";
 
-export { asksOnlyToStop, asksToPause, endsWithGoodbye } from "./endPolicy.ts";
+export { asksOnlyToStop, asksToPause, endsWithGoodbye, onlyGreets } from "./endPolicy.ts";
 
 /** What each conversation has said, across the sessions (bursts) it spans. */
 export class Conversations {
@@ -88,8 +88,9 @@ export class Conversations {
    */
   correct(id: string, said: string, note: string) {
     const buf = this.buffers.get(id);
-    if (buf?.role === "assistant") buf.corrected = [...(buf.corrected ?? []), { said, note }];
-    else this.store.correctLastTurn(id, said, note);
+    if (buf?.role !== "assistant") return void this.store.correctLastTurn(id, said, note);
+    // A claim held for the user's yes is judged after their turn, when Driver may be on another: the turn that said it.
+    if (buf.text.includes(said) || !this.store.correctLastTurn(id, said, note, true)) buf.corrected = [...(buf.corrected ?? []), { said, note }];
   }
 }
 
@@ -107,8 +108,8 @@ export type SessionOptions = {
   /** Overrides of the prompts' editable sections (Settings `prompts`); none: as written in sections.ts. */
   prompts?: Prompts;
   /**
-   * Driver speaks first in a new call (default). False (an Ops kill switch): a new call has no opening note and waits
-   * for the user, as before 3 November.
+   * Driver speaks first in a call the user starts, new or rejoined (default). False (an Ops kill switch): a new call has
+   * no opening note and a rejoined one only its note, and both wait for the user, as before 3 November.
    */
   speakFirstNew?: boolean;
   /** How Driver opens a new call it speaks first in (the phone's setting `greeting`); absent: "news". */
@@ -184,6 +185,18 @@ export type Opening =
   | { kind: "draft"; draft: DictatedOut; read: ReadOut[]; news: CallbackReply[] };
 
 /**
+ * Whether Driver opens the call by speaking, before the user says anything (the brain sends `response.create` as the
+ * session starts): a call-back, a return from a reading or a dictation, and a call the user started, new or rejoined,
+ * unless speak-first is switched off in Ops (`speakFirstNew`). A call that waits for the user can seem dead: on
+ * 3 November Apple's reviewer started a new call and neither side spoke for a minute, and on 16 November a rejoined
+ * call did the same. A call carried on (`resume`) or reopened from History (`continue`) waits for the user.
+ */
+export function speaksFirst(kind: Opening["kind"], speakFirstNew = true): boolean {
+  if (kind === "callback" || kind === "reading" || kind === "draft") return true;
+  return (kind === "new" || kind === "rejoin") && speakFirstNew;
+}
+
+/**
  * Untrusted text for a <report> block, at most `max` characters: credentials masked (before it's cut, so a cut can't
  * separate one from its name), and nothing in it can close or open a block.
  */
@@ -215,7 +228,6 @@ function newsOf(replies: CallbackReply[], name: Name): string {
  */
 export type Greeting = "news" | "hello";
 
-/** What a session's opening tells the voice model, from its sections (sections.ts); `prompts` overrides editable ones. */
 /** How long a hold was, as the voice model is told it: "less than a minute", "6 minutes", "1 hour and 5 minutes". */
 export function heldFor(seconds: number): string {
   const minutes = Math.floor(seconds / 60);
@@ -226,7 +238,11 @@ export function heldFor(seconds: number): string {
   return rest ? `${count(Math.floor(minutes / 60), "hour")} and ${count(rest, "minute")}` : count(minutes / 60, "hour");
 }
 
-export function openingNote(opening: Opening, changeList: string[], name: Name = (h) => h, prompts: Prompts = {}): string | null {
+/**
+ * What a session's opening tells the voice model, from its sections (sections.ts); `prompts` overrides editable ones.
+ * `speaks`: whether Driver opens this call by speaking (`speaksFirst`), which a rejoin's note asks for.
+ */
+export function openingNote(opening: Opening, changeList: string[], name: Name = (h) => h, prompts: Prompts = {}, speaks = speaksFirst(opening.kind)): string | null {
   const changes = changeList.length ? fill("opening.changes", { changes: changeList.join(" | ") }) : "";
   const meanwhile = (news: CallbackReply[]) =>
     news.length ? fill("opening.meanwhile", { names: news.map((r) => name(r.handle, true)).join(" and "), news: newsOf(news, name) }) : "";
@@ -238,7 +254,7 @@ export function openingNote(opening: Opening, changeList: string[], name: Name =
     case "continue":
       return fill("opening.continue", { changes }, prompts);
     case "rejoin":
-      return fill("opening.rejoin", { changes }, prompts);
+      return fill("opening.rejoin", { changes, speak: speaks ? fill("opening.rejoin.speak") : "" }, prompts);
     case "callback": {
       const { replies } = opening;
       const names = (mid: boolean) => replies.map((r, i) => name(r.handle, mid || i < replies.length - 1)).join(" and ");
@@ -305,9 +321,10 @@ function readOut(read: ReadOut[], name: Name): string {
 
 /**
  * What the backend must know of an opening: that the user hasn't spoken yet in a call Driver opens, a new call's
- * history, and the dictated reply waiting for the user's yes, which only it can confirm.
+ * history, and the dictated reply waiting for the user's yes, which only it can confirm. `speaks`: as `openingNote`'s.
  */
-export function backendNote(opening: Opening, name: Name = (h) => h): string | null {
+export function backendNote(opening: Opening, name: Name = (h) => h, speaks = speaksFirst(opening.kind)): string | null {
+  if (opening.kind === "rejoin" && speaks) return `${fill("backend-note.new-call")} ${fill("backend-note.spoke-first")}`;
   if (opening.kind === "rejoin" || opening.kind === "continue") return fill("backend-note.new-call");
   if (opening.kind === "reading" && opening.kept?.keptId) {
     return fill("backend-note.reading.kept", { what: fill("opening.draft.reply", { name: name(opening.kept.handle, true) }), kept: opening.kept.keptId, size: wordsOf(opening.kept.words ?? 0) });
@@ -415,13 +432,13 @@ export function buildSessionConfig(opts: SessionOptions, deps: ToolDeps, convers
   const name: Name = (h, mid) => (groups.has(h) ? withGroup(h, groups.get(h)!, mid) : h);
   // A new call that waits for the user (speak-first switched off) has no note for either model, as before 3 November.
   const silentNew = opening.kind === "new" && opts.speakFirstNew === false;
-  const text = silentNew ? null : opening.kind === "new" && opts.greeting === "hello" ? fill("opening.hello", {}, opts.prompts) : openingNote(opening, changes, name, opts.prompts);
-  // The note of a call Driver opens by speaking (a new call, a call-back, back from a reading or a dictation) is the
-  // user's turn, which the voice model answers. As a developer message, GPT-Live often began with a burst of another
-  // language (eval, 4 November: 2 of 8 runs, none of 8 as the user's), and every burst in a recording since was at a
-  // return from a dictation: "一肖中特" on 2 November, Khmer and Burmese on 8 November, Georgian on 10 November.
-  const speaksFirst = opening.kind === "new" || opening.kind === "callback" || opening.kind === "reading" || opening.kind === "draft";
-  const note = text ? [{ type: "message", role: speaksFirst ? "user" : "developer", content: [{ type: "input_text", text }] }] : [];
+  const speaks = speaksFirst(opening.kind, opts.speakFirstNew);
+  const text = silentNew ? null : opening.kind === "new" && opts.greeting === "hello" ? fill("opening.hello", {}, opts.prompts) : openingNote(opening, changes, name, opts.prompts, speaks);
+  // The note of a call Driver opens by speaking (a new or rejoined call, a call-back, back from a reading or a
+  // dictation) is the user's turn, which the voice model answers. As a developer message, GPT-Live often began with a
+  // burst of another language (eval, 4 November: 2 of 8 runs, none of 8 as the user's), and every burst in a recording
+  // since was at a return from a dictation: "一肖中特" on 2 November, Khmer and Burmese on 8 November, Georgian on 10 November.
+  const note = text ? [{ type: "message", role: speaks ? "user" : "developer", content: [{ type: "input_text", text }] }] : [];
   const turns = history.map((t) =>
     t.role === "user"
       ? { type: "message", role: "user", content: [{ type: "input_text", text: t.text.slice(0, 500) }] }
@@ -445,7 +462,7 @@ export function buildSessionConfig(opts: SessionOptions, deps: ToolDeps, convers
       type: "responses",
       responses: {
         model: opts.backendModel,
-        instructions: backendInstructions(block, now, silentNew ? null : backendNote(opening, name), deps.adapter.actions.includes("start_work") ? launchNote(spokenPlaces(deps.adapter.places?.() ?? []), deps.profiles ?? []) : null, preload(deps.briefing, now).block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL, keptFor(deps, now.getTime()), words, opts.newThreadPrompt, opts.newThreadDefaults, opts.threadNames),
+        instructions: backendInstructions(block, now, silentNew ? null : backendNote(opening, name, speaks), deps.adapter.actions.includes("start_work") ? launchNote(spokenPlaces(deps.adapter.places?.() ?? []), deps.profiles ?? []) : null, preload(deps.briefing, now).block, opts.prompts, opts.keepReplies, opts.confirm ?? READBACK_ALL, keptFor(deps, now.getTime()), words, opts.newThreadPrompt, opts.newThreadDefaults, opts.threadNames),
         tools: TOOLS.map((t) => ({ type: "function", strict: true, ...t })),
         // Never "required": it would loop on the answering response.
         tool_choice: "auto",
@@ -505,12 +522,24 @@ export const CAP_WRAP_MS = 15_000;
  * this very reply, or else the start of the reply itself (masked, untrusted). `seen` is what hearing it marks.
  */
 type Arrival = { itemId: string; handle: string; group: string; at: string; summary: string | null; report: string | null; ask: string | null; seen: Seen | null; asked?: Watched };
+/**
+ * Something to mark heard once Driver names its thread (`VoiceSession.expect`), counted from `from` in what's been said.
+ * `summary`: the thread's summary (its project named), which marks only that (`markBriefed`), never its reply heard, and
+ * only once Driver tells something about it (`tellsAbout`), not just names it.
+ */
+type Expected = { handle: string; from: number; said: () => void; itemId?: string; summary?: { group: string } };
 
 /**
  * A user turn that's only a listening sound ("mm-hmm"), often made over Driver: it asks for nothing, so the claim check
  * keeps counting from the turn before. "Yes" and "okay" may answer a readback, so they're turns of their own.
  */
 const BACKCHANNEL = /^(?:(?:m+-?h+m+|uh-?huh|h+m+|m+)\W*){1,3}$/i;
+
+/**
+ * A turn that only acknowledges ("Okay.", "Yeah, thanks"): never the answer to "what went wrong?", which an "Okay." said
+ * while the backend was flagging the moment, before Driver asked, would otherwise be taken for (16 November's review).
+ */
+const ACKNOWLEDGED = /^(?:(?:ok(?:ay)?|yeah|yes|yep|right|alright|all right|sure|thanks|thank you|got it|cool|great|fine|good)\W*){1,4}$/i;
 
 /**
  * How long after the voice model starts answering a request to dictate it has to hand it to the backend before Driver
@@ -525,6 +554,27 @@ const DICTATE_UNHEEDED_MS = 3000;
  * within 3.2 s of the user's last in 99 of 100 turns (PostHog `turn_answered`, 30 days to 10 November).
  */
 const FLAG_UNHEEDED_MS = 4000;
+
+/**
+ * What the voice says of a change waiting for a spoken yes ("Sent.", at "Ask") is judged this long after it's said, and
+ * not while a yes from the user is still coming in: the voice model may be answering a yes whose transcript hasn't
+ * reached the brain yet (the transcript lags speech). On 16 November "Sent." came 0.3 s before the words of "Send it",
+ * was corrected as false, and the yes it answered sent the message 1.2 s later, under "Sorry, I was wrong: nothing was
+ * sent." and the phone's problem tone.
+ */
+const YES_LAG_MS = 2000;
+/**
+ * A yes the voice already answered ("Sent." before its words came) with nothing after it for this long (and no sound
+ * on the microphone, or none of its words for `FLAG_UNHEEDED_MS`) is over, though the voice model hasn't ended the turn
+ * (`yesUnheeded`).
+ */
+const YES_QUIET_MS = 1500;
+
+/**
+ * Words the user began within this long of Driver answering what they told of what went wrong are more of it: GPT-Live
+ * answers speech before its transcript arrives (16 November, 16:03), so the last words may come after.
+ */
+const ACCOUNT_LATE_MS = 1500;
 
 /**
  * The user's turn asks to dictate and says nothing about where (no thread named, not a reply): "let's dictate another
@@ -670,13 +720,21 @@ export class VoiceSession {
   private stopRefresh?: () => void;
   private stopWatching?: () => void;
   /** Things to mark heard once the assistant names their thread, counted from when they were expected. */
-  /**
-   * `summary`: the thread's summary (its project named), which marks only that (`markBriefed`), never its reply heard,
-   * and only once Driver tells something about it (`tellsAbout`), not just names it.
-   */
-  private expected: { handle: string; from: number; said: () => void; itemId?: string; summary?: { group: string } }[] = [];
+  private expected: Expected[] = [];
   /** Named, but heard only once the user speaks after it or the session ends deliberately. */
   private told: { said: () => void; itemId?: string }[] = [];
+  /**
+   * Threads the user asked what they're for (`purpose`), from that tool call until the user's next words after its
+   * answer: what Driver says of them meanwhile is why they were started, not their news, so it marks neither their
+   * summary heard nor their reply seen, and an answer from the prompt isn't taken for their reply. `whyHeld`: what was
+   * waiting to be marked for them before the tool round that asked (their summary, an earlier answer's reply), which
+   * waits; what a tool there or later adds (details' reply, one that arrives) counts as ever. `whyAnswered`: the user
+   * turn under way (`counts.userTurns`) when the voice began saying the answer, null until then: only a turn begun after
+   * it ends the hold, not "Hello?" said while the backend worked.
+   */
+  private askedWhy: { itemId: string; handle: string }[] = [];
+  private readonly whyHeld = new Set<Expected>();
+  private whyAnswered: number | null = null;
   /**
    * Threads to tell the user about as soon as they reply, during the call: the starred ones, and those the user asked to
    * hear back from (`asked`, from `wait_for` staying on). `baseline` is the latest reply already known: the one each had
@@ -699,6 +757,8 @@ export class VoiceSession {
   private onlyFlagged = false;
   /** The user's latest turn was only "stop" (`asksOnlyToStop`): stop talking, so `hold` and `end_session` are refused. */
   private onlyStopped = false;
+  /** The user's latest turn only greeted Driver or asked if it's there (`onlyGreets`): `hold` and `end_session` are refused. */
+  private onlyGreeted = false;
   /**
    * The user's latest turn asked to dictate (`asksToDictate`) and the voice model began answering it, at `at`, with no
    * hand-off to the backend yet. On 9 November it said "Go ahead, I'm listening." and "Okay." and handed nothing over,
@@ -732,11 +792,14 @@ export class VoiceSession {
   private flaggedTurn = -1;
   /** Driver flagged a moment and asked what went wrong: the user's next turn says, and is added to the flag. */
   private issueAsked = false;
+  /** What the user last told of what went wrong, and when Driver began to answer it (`ACCOUNT_LATE_MS`). */
+  private account = { said: "", at: -Infinity };
   /**
    * The claim check: what Driver did in this session (each change, keep, star and flag, by when), the time it judges
    * claims from (the start of the user's latest turn that asked anything: "mm-hmm" over Driver doesn't move it), what
    * Driver has said since then (`voiceSaid`, and how many of its sentences were looked at), claims waiting to be judged
-   * until the backend is idle, and the claims already corrected since that time.
+   * (each with when it was said, the time its turn began, and whether it was held for a yes) until the backend is idle,
+   * and the claims already corrected since that time.
    */
   private readonly did: { claim: Claim; at: number }[] = [];
   private floor = 0;
@@ -744,7 +807,7 @@ export class VoiceSession {
   private userTurnAt = 0;
   private voiceSaid = "";
   private voiceSeen = 0;
-  private claims: { claim: Claim; own: boolean; sentence: string; spoken: boolean }[] = [];
+  private claims: { claim: Claim; own: boolean; sentence: string; spoken: boolean; at: number; floor: number; held?: boolean }[] = [];
   private corrected = new Map<Claim, string>();
 
   constructor(conn: VoiceSession["conn"], ids: VoiceSession["ids"], deps: VoiceSession["deps"]) {
@@ -787,6 +850,35 @@ export class VoiceSession {
    */
   expect(handle: string, said: () => void, itemId?: string, summaryIn?: string) {
     this.expected.push({ handle, from: this.deps.conversations.spoken(this.ids.conversationId).length, said, ...(itemId ? { itemId } : {}), ...(summaryIn !== undefined ? { summary: { group: summaryIn } } : {}) });
+  }
+
+  /** Whether `e` is about a thread the user asked what it's for (`askedWhy`): by its id when it has one, else its name. */
+  private whyAsked(e: { handle: string; itemId?: string }) {
+    return this.askedWhy.some((a) => (e.itemId !== undefined && e.itemId === a.itemId) || nameKey(e.handle) === nameKey(a.handle));
+  }
+
+  /**
+   * `purpose` ran for `threads`: what was waiting to be marked for them before its tool round (`earlier`) waits until the
+   * user speaks after its answer (`askedWhy`).
+   */
+  private holdWhy(threads: About[], earlier: ReadonlySet<Expected>) {
+    if (!threads.length) return;
+    this.askedWhy.push(...threads.map((a) => ({ itemId: a.itemId, handle: a.handle })));
+    for (const e of this.expected) if (earlier.has(e) && this.whyAsked(e)) this.whyHeld.add(e);
+    this.whyAnswered = null;
+  }
+
+  /**
+   * The user spoke after a `purpose` answer: their threads' marking goes on, from what's said from now on (what was said
+   * while it waited was what they're for, never their news).
+   */
+  private resumeHeard() {
+    if (!this.askedWhy.length) return;
+    const from = this.deps.conversations.spoken(this.ids.conversationId).length;
+    for (const e of this.whyHeld) e.from = Math.max(e.from, from);
+    this.askedWhy = [];
+    this.whyHeld.clear();
+    this.whyAnswered = null;
   }
 
   /** The replies this session's opening tells, by thread: when each finished (see the constructor). */
@@ -972,6 +1064,8 @@ export class VoiceSession {
     const names = [...namedItems(this.deps.briefing), ...namedItems(this.deps.briefing, true)].map((n) => n.handle);
     const named = this.preloaded.filter((p) => mentionsThread(text, p.handle, names));
     if (named.length !== 1 || named[0].running || this.expected.some((e) => e.handle === named[0].handle && !e.summary)) return;
+    // An answer about what a thread is for (`purpose`) names it without telling its reply.
+    if (this.whyAsked(named[0])) return;
     const { handle, itemId, seen } = named[0];
     this.expect(handle, () => this.deps.store.markSeen(itemId, seen, this.ids.conversationId));
   }
@@ -989,6 +1083,7 @@ export class VoiceSession {
     // The user was there for what was said; nothing said from now on counts as telling them anything.
     if (deliberate(reason)) this.heard();
     this.expected = [];
+    this.whyHeld.clear();
     this.told = [];
     this.deps.record?.({ type: "close", reason: reasonText(reason) });
     this.log(`closing (${reasonText(reason)})`);
@@ -1086,6 +1181,7 @@ export class VoiceSession {
     this.tellArrivals();
     if (this.dictateAsked && this.clock.now() - this.dictateAsked.at >= DICTATE_UNHEEDED_MS) void this.dictateUnheeded();
     this.flagUnheeded();
+    this.yesUnheeded();
     this.advance({
       type: "tick", busy: this.toolsRunning > 0 || this.pending.size > 0,
       maxMs: this.deps.maxMs, idleMs: this.deps.idleMs, stallMs: this.deps.stallMs,
@@ -1134,6 +1230,10 @@ export class VoiceSession {
           this.turnAt = 0;
         }
         if (delta && !this.firstSpokeAt) this.firstSpokeAt = this.clock.now();
+        // The voice begins saying a purpose answer, the backend done: the user's turn under way now is no answer to it.
+        if (delta && this.askedWhy.length && this.whyAnswered === null && !this.backendBusy && this.toolsRunning === 0 && this.pending.size === 0) {
+          this.whyAnswered = this.counts.userTurns;
+        }
         this.endUserTurn();
         if (this.freshUtterance && delta) {
           this.freshUtterance = false;
@@ -1151,9 +1251,10 @@ export class VoiceSession {
           const done = spoken.slice(0, Math.max(spoken.lastIndexOf("."), spoken.lastIndexOf("?"), spoken.lastIndexOf("!")) + 1);
           const names = [...namedItems(this.deps.briefing), ...namedItems(this.deps.briefing, true)].map((n) => n.handle);
           // Sentence by sentence: "Agent Reel Dashboard passed. Agent Reel failed." names each once.
-          const told = (e: (typeof this.expected)[number]) =>
+          const told = (e: Expected) =>
             done.length > e.from && done.slice(e.from).split(/(?<=[.?!])/).some((sentence) => e.summary ? tellsAbout(sentence, e.handle, e.summary.group, names) : mentionsThread(sentence, e.handle, names));
-          this.expected = this.expected.filter((e) => !(told(e) && (this.told.push({ said: e.said, itemId: e.itemId }), true)));
+          // What was waiting for a thread the user asked what it's for waits: that answer isn't its news (`whyHeld`).
+          this.expected = this.expected.filter((e) => this.whyHeld.has(e) || !(told(e) && (this.told.push({ said: e.said, itemId: e.itemId }), true)));
         }
         break;
       }
@@ -1234,7 +1335,7 @@ export class VoiceSession {
     if (type === "response.output_text.done" && typeof inner.text === "string") {
       this.answeredFromPrompt(inner.text);
       // What the backend says it did, judged once it's done working (`judgeClaims`).
-      for (const { sentence, said } of claimsIn(inner.text, true)) for (const c of said) this.claims.push({ ...c, sentence, spoken: false });
+      for (const { sentence, said } of claimsIn(inner.text, true)) for (const c of said) this.claims.push({ ...c, sentence, spoken: false, at: this.clock.now(), floor: this.floor });
       return;
     }
     if (type === "response.completed" && this.pending.size === 0) {
@@ -1261,6 +1362,8 @@ export class VoiceSession {
     // Every pending call needs an output before the single continuation.
     const calls = [...this.pending.entries()];
     this.pending.clear();
+    // What was waiting to be marked before this round's tools ran (`holdWhy`).
+    const earlier = new Set(this.expected);
     this.rounds++;
     this.toolsRunning++;
     try {
@@ -1289,8 +1392,13 @@ export class VoiceSession {
         );
         this.counts.toolCalls++;
         this.roundTools++;
+        if (call.name === "purpose") this.holdWhy(about, earlier);
         this.toolCalled(call.name, args, result, threw, this.clock.now() - toolStart, before);
-        this.log(`${call.name}(${JSON.stringify(args)}) ${this.since()} → ${JSON.stringify(result).slice(0, 200)}`);
+        // What a thread is for, and the user's words for it, stay out of the log: only what came back (the recording has them).
+        const a = (args ?? {}) as Record<string, unknown>;
+        this.log(call.name === "purpose"
+          ? `purpose(${JSON.stringify({ handle: a.handle, more: a.more, set: typeof a.set === "string" })}) ${this.since()} → ${Object.keys(result).join(", ")}`
+          : `${call.name}(${JSON.stringify(args)}) ${this.since()} → ${JSON.stringify(result).slice(0, 200)}`);
         this.deps.record?.({ type: "tool", callId, name: call.name, args, result });
         try {
           this.deps.view?.tool(call.name, args, result, about);
@@ -1328,8 +1436,10 @@ export class VoiceSession {
       requestEnd: (reason) => this.advance({ type: "tool_requested_end", reason }),
       watch: (threads) => this.watch(threads),
       userSpoke: () => this.endState.userWords.trim() !== "",
+      startedAgain: this.deps.opening === "rejoin",
       onlyFlagged: () => this.onlyFlagged,
       onlyStopped: () => this.onlyStopped,
+      onlyGreeted: () => this.onlyGreeted,
       keepReplies: this.deps.keepReplies,
       confirm: this.deps.confirm,
       awaitingDraft: () => this.deps.opening === "draft" && this.endState.userWords.trim() === "",
@@ -1390,6 +1500,30 @@ export class VoiceSession {
   }
 
   /**
+   * The voice said a change waiting for the user's yes was done ("Sent."), the user's words since are a yes, and they've
+   * been quiet since (`YES_QUIET_MS`), with no word from Driver and nothing handed to the backend: their turn is over.
+   * On 16 November the voice model answered "Send it" with "Sent." before its words reached the brain, so nothing after
+   * them ended the turn, and the yes would have waited for whatever the user said next. Ending it takes the yes
+   * (`yesHeard`), which makes what they heard true. Only then: a yes Driver hasn't answered ("Yes, um…") is left to the
+   * voice model, and so is "debug this" (`flagUnheeded`) and the answer to "what went wrong?".
+   */
+  private yesUnheeded() {
+    const now = this.clock.now();
+    if (!this.userSaid || this.ended || this.endState.closing || this.backendBusy || this.issueAsked) return;
+    const quiet = now - this.endState.lastUserDelta;
+    if (quiet < YES_QUIET_MS || (quiet < FLAG_UNHEEDED_MS && now - this.userSoundAt < SOUND_HOLD_MS)) return;
+    if (!this.claims.some((c) => c.held) || !this.yesComing() || asksToFlag(vocabularyOf(this.deps.store).correct(this.userSaid))) return;
+    this.log(`a yes Driver answered before its words came, ${this.since()}: their turn is over`);
+    this.endUserTurn();
+  }
+
+  /** The user's turn so far is a yes (`agrees`): one may be on its way. */
+  private yesComing(): boolean {
+    const said = vocabularyOf(this.deps.store).correct(this.userSaid);
+    return !!spokenWords(said) && agrees(said);
+  }
+
+  /**
    * The user's turn is over: "debug this" flags the moment for review, with what they said, and the voice model is told
    * quietly, since it may say "Flagged." only then (on 2 November it said so for a turn the brain hadn't flagged). A turn
    * that asks anything (not "mm-hmm" over Driver) is where the claim check counts what Driver did from.
@@ -1400,6 +1534,13 @@ export class VoiceSession {
     // Only a turn with words in it changes what the user last asked; "debug this" alone (no goodbye) never ends the call.
     if (spokenWords(said)) this.onlyFlagged = asksToFlag(spokenWords(said)) && !endsWithGoodbye(said);
     if (spokenWords(said)) this.onlyStopped = asksOnlyToStop(spokenWords(said), this.deps.wakeWord);
+    if (spokenWords(said)) this.onlyGreeted = onlyGreets(spokenWords(said), this.deps.wakeWord);
+    // What the user says next, in a turn begun once the voice was saying the answer (not a listening sound over it), ends a
+    // purpose answer's hold.
+    if (
+      spokenWords(said) && !BACKCHANNEL.test(spokenWords(said)) && this.whyAnswered !== null && this.counts.userTurns > this.whyAnswered &&
+      !this.backendBusy && this.toolsRunning === 0 && this.pending.size === 0
+    ) this.resumeHeard();
     if (spokenWords(said) && !BACKCHANNEL.test(spokenWords(said))) {
       this.floor = this.userTurnAt;
       this.floorSaid = spokenWords(said);
@@ -1416,8 +1557,17 @@ export class VoiceSession {
       const names = namedItems(this.deps.briefing).map((n) => n.handle);
       this.dictateAsked = this.deps.promptsBack && asksToDictate(said, names) ? { turn: this.counts.userTurns, at: this.clock.now() } : null;
     }
-    // The answer to "what went wrong?" (not a listening sound, nor another flag): it goes in the flag.
-    if (this.issueAsked && spokenWords(said) && !BACKCHANNEL.test(spokenWords(said)) && !asksToFlag(said)) {
+    // The answer to "what went wrong?" (not a listening sound, an "Okay." nor another flag): it goes in the flag.
+    const answer = this.issueAsked && !!spokenWords(said) && !BACKCHANNEL.test(spokenWords(said)) && !ACKNOWLEDGED.test(spokenWords(said)) && !asksToFlag(said);
+    // That answer, "debug this" said with what went wrong, or the words of either still coming in as Driver answers
+    // (speech-to-text lags the voice) tell what happened: none ends the call itself, whatever it quotes (16 November: an
+    // answer ending "…it just suddenly said goodbye" hung up).
+    const late = !!spokenWords(said) && this.userTurnAt - this.account.at <= ACCOUNT_LATE_MS;
+    if (answer || late || (!!spokenWords(said) && asksToFlag(said) && !!issueIn(said))) {
+      this.account = { said: late ? `${this.account.said} ${spokenWords(said)}` : spokenWords(said), at: this.clock.now() };
+      this.advance({ type: "issue_told", said: this.account.said });
+    }
+    if (answer) {
       this.issueAsked = false;
       void this.explainFlag(spokenWords(said));
     }
@@ -1467,7 +1617,9 @@ export class VoiceSession {
 
   /**
    * The backend's `flag`: the user asked, in words the matcher didn't take. A turn the brain flagged already isn't
-   * flagged twice; the voice model has been told of that one.
+   * flagged twice; the voice model has been told of that one. Driver asks what went wrong unless the user's turn says
+   * it (`issueIn`) or the backend's note is plainly their words (`noteIsTheirs`): a note may be the backend's guess from
+   * the call. Asking again what they said is the lesser fault: the flag keeps their turn either way.
    */
   private async flagFromTool(note: string | null): Promise<ToolResult> {
     if (!this.deps.flags) return { error: "The app can't flag moments here. Say so in a few words." };
@@ -1475,8 +1627,10 @@ export class VoiceSession {
       return { flagged: true, already: true, result: "The app already flagged this moment.", instruction: "The app already flagged it and has told the voice model to say so: don't say \"Flagged.\" or call flag again. Answer anything else they said, or reply with nothing." };
     }
     const user = spokenWords(this.deps.conversations.lastUserTurn(this.ids.conversationId).text);
-    const said = [user, note?.trim() ? `(Noted: ${note.trim().slice(0, 500)})` : ""].filter(Boolean).join(" ") || "Flagged in the call.";
-    const ask = !note?.trim() && !issueIn(user);
+    const noted = note?.trim().slice(0, 500) ?? "";
+    const theirs = !!noted && noteIsTheirs(noted, user);
+    const said = [user, noted ? (theirs ? `(Noted: ${noted})` : `(The backend's note, not the user's words: ${noted})`) : ""].filter(Boolean).join(" ") || "Flagged in the call.";
+    const ask = !theirs && !issueIn(user);
     const path = await this.flagMoment(said, false, ask);
     return path
       ? {
@@ -1580,7 +1734,7 @@ export class VoiceSession {
     if (!result || "error" in result) return;
     if (result.kept === true) return this.didNow("kept");
     if (name === "star" && result.done === true) return this.didNow(args?.starred === false ? "done" : "starred");
-    if (name === "remember" && result.saved === true) return this.didNow("done");
+    if ((name === "remember" && result.saved === true) || (name === "purpose" && result.noted === true)) return this.didNow("done");
     const id = name === "confirm" ? args?.proposal_id : result.proposal_id;
     const p = typeof id === "string" ? this.deps.store.proposal(id) : null;
     if (p) this.didChange(p);
@@ -1589,7 +1743,7 @@ export class VoiceSession {
   /** Driver's sentences that are over since the last look: their claims, to judge once the backend is idle. */
   private heardClaims() {
     const sentences = claimsIn(this.voiceSaid);
-    for (const { sentence, said } of sentences.slice(this.voiceSeen)) for (const c of said) this.claims.push({ ...c, sentence, spoken: true });
+    for (const { sentence, said } of sentences.slice(this.voiceSeen)) for (const c of said) this.claims.push({ ...c, sentence, spoken: true, at: this.clock.now(), floor: this.floor });
     this.voiceSeen = Math.max(this.voiceSeen, sentences.length);
     this.judgeClaims();
   }
@@ -1600,23 +1754,32 @@ export class VoiceSession {
    * did since then. One that didn't happen is corrected at once: the voice model is told what really happened, the
    * call gets a receipt, and the turn is marked so later sessions' history doesn't carry it as fact. Not a claim of
    * history ("already", a recap the user asked for), nor a thread's news put briefly, nor one of something done
-   * earlier in this call, unless a change of that kind is still waiting for its yes.
+   * earlier in this call, unless a change of that kind is still waiting for its yes, or is kept unsent (`keptAs`) and
+   * the user asked about nothing. What the voice says of a change waiting for a spoken yes waits for that yes first
+   * (`YES_LAG_MS`), and if false then, it's corrected as such.
    */
   private judgeClaims() {
     if (!this.claims.length || this.ended || this.endState.closing || this.backendBusy || this.toolsRunning > 0 || this.pending.size > 0) return;
     const claims = this.claims;
     this.claims = [];
+    const now = this.clock.now();
+    // "Hello?" asks about nothing that was done.
+    const asked = asksAbout(this.floorSaid) && !onlyGreets(this.floorSaid, this.deps.wakeWord);
     for (const c of claims) {
-      const done = this.did.some((d) => d.at >= this.floor && (d.claim === c.claim || c.claim === "done"));
-      if (done) continue;
+      if (this.doneSince(c)) continue;
       const waiting = this.waitingFor(c.claim);
-      if (!waiting) {
+      if (c.spoken && waiting && waiting.fields.confirm !== "tap" && (now - c.at < YES_LAG_MS || this.yesComing())) {
+        this.claims.push({ ...c, held: true });
+        continue;
+      }
+      // Held for a yes that didn't come: false when said, though the change may have been called off since ("Thanks.").
+      if (!waiting && !c.held) {
         // "Done." said loosely (after a watch, a note) is only surely false of a change waiting for its yes. Nor is
         // what the opening tells, before the user has said a word here (a reply kept as the call opened).
         if (c.claim === "done" || this.counts.userTurns === 0) continue;
         if (isRecap(c.sentence) || asksRecap(this.floorSaid)) continue;
         if (!c.own && asksAbout(this.floorSaid)) continue;
-        if (this.didBefore(c.claim)) continue;
+        if (this.didBefore(c.claim) && (asked || !this.keptAs(c.claim))) continue;
       }
       const note = this.corrected.get(c.claim);
       if (note) {
@@ -1625,6 +1788,11 @@ export class VoiceSession {
       }
       this.correct(c, waiting);
     }
+  }
+
+  /** Driver did what claim `c` says since the turn it was said in began (a yes taken after it, too). */
+  private doneSince(c: { claim: Claim; floor: number }): boolean {
+    return this.did.some((d) => d.at >= c.floor && (d.claim === c.claim || c.claim === "done"));
   }
 
   /** A change of this kind ("done": of any) proposed in this conversation and still waiting for its yes. */
@@ -1651,8 +1819,28 @@ export class VoiceSession {
     }
   }
 
-  /** Corrects a claim that didn't happen (`judgeClaims`): the voice model says so, and it's in the call and its log. */
-  private correct(c: { claim: Claim; sentence: string; spoken: boolean }, waiting: Proposal | null) {
+  /**
+   * A reply or a new thread's prompt is kept in this conversation, not yet sent or started (in Drafts), of the kind
+   * `claim` says was done, and kept since the last change of that kind was carried out here: then "I've started it" is
+   * about that one, not a start told again. On 16 November, back from a third dictated prompt, the voice said "I've
+   * started it" with the prompt still kept, and the two threads started earlier in the call kept the claim check quiet.
+   * One kept before the last such change says nothing: that change may be what's told again.
+   */
+  private keptAs(claim: Claim): boolean {
+    try {
+      const last = this.deps.store.proposalsFor(this.ids.conversationId).reduce((at, p) => (claimsOf(p).includes(claim) ? Math.max(at, p.createdAt) : at), 0);
+      return this.deps.store.keptReplies().some((k) =>
+        k.conversationId === this.ids.conversationId && k.keptAt >= last && (isNewThread(k.threadId) ? "started" : "sent") === claim);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Corrects a claim that didn't happen (`judgeClaims`): the voice model says so (`speak`; not once the call is over),
+   * and it's in the call's receipts, its record and log, and the history.
+   */
+  private correct(c: { claim: Claim; sentence: string; spoken: boolean }, waiting: Proposal | null, speak = true) {
     const [as, truth] = CORRECTIONS[c.claim];
     const level = waiting?.fields.confirm ?? "readback";
     const next = waiting
@@ -1663,7 +1851,7 @@ export class VoiceSession {
       : "";
     const note = `That was wrong: ${truth}`;
     this.corrected.set(c.claim, note);
-    this.conn.send({ type: "session.commentary.append", content: fill("call.correction", { claim: as, truth, next }), delegation_id: null });
+    if (speak) this.conn.send({ type: "session.commentary.append", content: fill("call.correction", { claim: as, truth, next }), delegation_id: null });
     if (c.spoken) this.deps.conversations.correct(this.ids.conversationId, c.sentence, note);
     this.log(`corrected a claim: the voice said "${c.sentence.slice(0, 120)}", but ${truth}`);
     this.deps.record?.({ type: "correction", claim: c.claim, said: c.sentence, truth });
@@ -1788,6 +1976,8 @@ export class VoiceSession {
     if (this.liveTimer) this.clock.clear(this.liveTimer);
     if (this.closeTimer) this.clock.clear(this.closeTimer);
     try {
+      // Held for a yes the call ended before: the next session's history mustn't carry it as done.
+      for (const c of this.claims) if (c.held && !this.doneSince(c)) this.correct(c, this.waitingFor(c.claim), false);
       this.endUserTurn();
       this.deps.conversations.flush(this.ids.conversationId);
       this.deps.store.endSession(this.ids.sessionId, billedSeconds, reason);

@@ -123,6 +123,37 @@ test("a report is the last finished reply, with progress while a turn runs; repl
   assert.equal((await adapter.report(id)).text, "Second answer", "a running turn's notes are progress, not the reply");
 });
 
+test("a thread's start is Codex's createdAt (seconds), and its first ask is read from its oldest turn", async (t) => {
+  let id = "", empty = "";
+  const { fake, adapter } = await setup(t, { before: (fake, cwd) => {
+    const first = fake.turnOf("  Improve the screenshot stuff.\n", "Done.", 1_800_000_000 - 100);
+    first.items.unshift({ type: "hookPrompt", id: "hook-1" });
+    id = fake.thread(cwd, { status: { type: "idle" }, createdAt: 1_800_000_000 - 200, turns: [first, ...Array.from({ length: 12 }, (_, n) => fake.turnOf(`Ask ${n}`, `Answer ${n}`, 1_800_000_000 + n))] }).id;
+    empty = fake.thread(cwd, { reply: null, prompt: "" }).id;
+  } });
+  const items = new Map((await adapter.list()).map((i) => [i.id, i]));
+  assert.equal(items.get(id)?.createdAt, new Date((1_800_000_000 - 200) * 1000).toISOString());
+  assert.deepEqual(await adapter.firstAsk(id), { text: "Improve the screenshot stuff.", at: new Date((1_800_000_000 - 100) * 1000).toISOString(), complete: true });
+  assert.equal(fake.last("thread/turns/list").sortDirection, "asc");
+  assert.equal(await adapter.firstAsk(empty), null, "a thread with no turn yet has no ask");
+  await assert.rejects(adapter.firstAsk("not-a-thread"), /isn't visible/);
+});
+
+test("a first message with no time of its own (older Codex) is still the first: at the thread's start, else not complete", async (t) => {
+  const untimed = (fake: FakeCodex, words: string) => {
+    const turn = fake.turnOf(words, "Done.", 1_800_000_000 - 100);
+    turn.startedAt = null; turn.completedAt = null; delete turn.items[0]!.startedAtMs;
+    return turn;
+  };
+  let started = "", unknown = "";
+  const { adapter } = await setup(t, { before: (fake, cwd) => {
+    started = fake.thread(cwd, { status: { type: "idle" }, createdAt: 1_800_000_000 - 200, turns: [untimed(fake, "Improve the screenshot stuff."), fake.turnOf("Now the tests.", "Tested.", 1_800_000_000)] }).id;
+    unknown = fake.thread(cwd, { status: { type: "idle" }, createdAt: 0, updatedAt: 1_800_000_000, turns: [untimed(fake, "Fix the build."), fake.turnOf("And the docs.", "Fixed.", 1_800_000_000)] }).id;
+  } });
+  assert.deepEqual(await adapter.firstAsk(started), { text: "Improve the screenshot stuff.", at: new Date((1_800_000_000 - 200) * 1000).toISOString(), complete: true });
+  assert.deepEqual(await adapter.firstAsk(unknown), { text: "Fix the build.", at: new Date(1_800_000_000 * 1000).toISOString(), complete: false }, "the latest the thread was worked on, or earlier");
+});
+
 test("a follow-up to a running session steers its turn, by its id, once", async (t) => {
   let id = "", turnId = "";
   const { fake, adapter } = await setup(t, { before: (fake, cwd) => { id = fake.thread(cwd, { status: { type: "idle" } }).id; } });

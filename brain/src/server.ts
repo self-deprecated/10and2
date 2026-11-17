@@ -27,7 +27,7 @@ import { ROLL_LATE } from "./voice/endPolicy.ts";
 import type { Hangups } from "./voice/hangups.ts";
 import type { Recordings } from "./voice/recording.ts";
 import type { Flags } from "./flags.ts";
-import { buildSessionConfig, VoiceSession, type Conversations, type Greeting, type KeptDraft, type Opening, type ReadOut } from "./voice/session.ts";
+import { buildSessionConfig, speaksFirst, VoiceSession, type Conversations, type Greeting, type KeptDraft, type Opening, type ReadOut } from "./voice/session.ts";
 import { CallView, type CallRecord } from "./voice/callview.ts";
 import { describe, spokenHost } from "./util.ts";
 import { newThreadDefaultsOf, placeParts, spokenPlaces, type NewThreadDefaults } from "./places.ts";
@@ -677,10 +677,9 @@ function api(cfg: Config, deps: ServerDeps): Api {
       deps.log(`voice ${sessionId}: started (conversation ${conversationId}${open.kind === "new" ? "" : `, ${open.kind}`}; brain ${brainRev}, phone ${phoneBuild ?? "unknown"})`);
       if (stops !== accepted) session.close({ kind: "stopped_before_start" });
       // A call-back speaks first: the user is waiting to hear what the thread said. So does coming back from a reading,
-      // or with a dictated reply to send, and a new call: one that waits for the user can seem dead (Apple's reviewer
-      // started one on 3 November and neither side spoke for a minute).
-      // Unless speak-first is switched off for new calls (Ops), which then wait for the user as before 3 November.
-      else if ((open.kind === "new" && snapshot.speakFirstNew) || open.kind === "callback" || open.kind === "reading" || open.kind === "draft") session.speakFirst();
+      // or with a dictated reply to send, and a call the user started, new or rejoined: one that waits for the user can
+      // seem dead (`speaksFirst`). Unless speak-first is switched off (Ops): those then wait, as before 3 November.
+      else if (speaksFirst(open.kind, snapshot.speakFirstNew)) session.speakFirst();
       return { sdp: answerSdp, sessionId, conversationId };
     } finally {
       if (starting === view) starting = null;
@@ -832,11 +831,14 @@ function api(cfg: Config, deps: ServerDeps): Api {
   function threadRows() {
     const stars = deps.store.stars();
     const cards = new Map(deps.briefing.view().cards.map((c) => [c.itemId, c]));
+    const purposes = deps.store.purposeLines();
     return namedItems(deps.briefing)
       .map(({ id, handle, group, item }) => ({
         // `project` is the group without its computer, so the phone's filter has one entry per project.
         id, name: handle, group, project: item.project ?? group, machine: item.machine ?? null, status: item.status, updatedAt: item.updatedAt, starred: stars.has(id), snoozedUntil: item.snoozedUntil,
         state: cards.get(id)?.state ?? null, summary: cards.get(id)?.summary ?? null,
+        // What it was started for (purposes.ts), the line under its name on its page; null until one is written.
+        purpose: purposes.get(id) ?? null,
       }))
       .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
   }

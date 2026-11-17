@@ -79,6 +79,52 @@ export function ago(at: string | number, now: number): string {
   return h < 36 ? `${h} ${h === 1 ? "hour" : "hours"} ago` : `${Math.round(h / 24)} days ago`;
 }
 
+/** `zone` when it's a time zone this runtime knows (an IANA name, "Europe/Copenhagen"); else null. */
+export function validZone(zone: unknown): string | null {
+  if (typeof zone !== "string" || !zone || zone.length > 64) return null;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: zone });
+    return zone;
+  } catch {
+    return null;
+  }
+}
+
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+const MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+/** A moment's calendar day, weekday and time of day in `zone`. */
+function local(at: number, zone: string) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone: zone, year: "numeric", month: "numeric", day: "numeric", hour: "numeric", minute: "numeric", hourCycle: "h23" })
+    .formatToParts(at).map((p) => [p.type, p.value]));
+  const [year, month, day, hour, minute] = [parts.year, parts.month, parts.day, parts.hour, parts.minute].map(Number);
+  // The day as a count of days, so two moments' days are told apart by subtraction, across a DST change too.
+  const days = Date.UTC(year, month - 1, day) / 86_400_000;
+  return { year, month, day, hour: hour % 24, minute, days, weekday: new Date(days * 86_400_000).getUTCDay() };
+}
+
+/**
+ * When something happened, for the ear, in the time zone of the computer it happened on: "just now", "12 minutes ago",
+ * "today at 4 PM", "yesterday at 8:05 AM", "on Monday at 4 PM" (within the last 6 days), "on 3 November" (and the year,
+ * when it isn't this one). Without a zone, how long ago (`ago`): "20 hours ago".
+ */
+export function spokenWhen(at: string | number, now: number, zone: string | null | undefined): string {
+  const t = typeof at === "number" ? at : Date.parse(at);
+  const z = validZone(zone);
+  if (!z) return ago(t, now);
+  const m = Math.round((now - t) / 60_000);
+  if (m < 2) return "just now";
+  if (now - t < 3600_000) return `${Math.min(m, 59)} minutes ago`;
+  const then = local(t, z);
+  const today = local(now, z);
+  const clock = `${then.hour % 12 || 12}${then.minute ? `:${String(then.minute).padStart(2, "0")}` : ""} ${then.hour < 12 ? "AM" : "PM"}`;
+  const back = today.days - then.days;
+  if (back <= 0) return `today at ${clock}`;
+  if (back === 1) return `yesterday at ${clock}`;
+  if (back <= 6) return `on ${WEEKDAYS[then.weekday]} at ${clock}`;
+  return `on ${then.day} ${MONTHS[then.month - 1]}${then.year === today.year ? "" : ` ${then.year}`}`;
+}
+
 /**
  * An error for the log. Socket failures often have no message of their own: Node's `AggregateError` keeps the reasons in
  * `errors` (one per address tried), and the OpenAI SDK copies the empty message and keeps the original in `cause`.

@@ -4,7 +4,7 @@
 // only outside call is `write`, given by whoever builds it, for replies the script doesn't have.
 //
 // Runtime-neutral (no Node imports, time and timers through a `Clock`), so it runs on Lattice and in a Durable Object.
-import { titleFrom, type Action, type Adapter, type PastReply, type Place, type Receipt, type Report, type WorkItem } from "../adapter.ts";
+import { titleFrom, type Action, type Adapter, type FirstAsk, type PastReply, type Place, type Receipt, type Report, type WorkItem } from "../adapter.ts";
 import type { Clock, Timer } from "../util.ts";
 import { DEMO_MACHINE, FOLLOW_UP_SECONDS, NEW_WORK_SECONDS, THREADS, type DemoCard, type DemoThread, type Scripted } from "./workspace.ts";
 
@@ -24,6 +24,8 @@ type Thread = {
   /** Follow-ups sent while it was working, run after it in turn (a follow-up never interrupts). */
   queue: string[];
   archived: boolean;
+  /** What the user first asked it, and when: its oldest reply's prompt, or a new thread's first message. */
+  first: FirstAsk;
 };
 
 const MIN = 60_000;
@@ -81,8 +83,10 @@ export class DemoAdapter implements Adapter {
         questionId: t.question?.id ?? null,
         visitedAt: t.visited ? at(updated) : null,
         wroteAt: at(t.wroteAgoMin ?? t.running?.startedAgoMin ?? t.replies[0].agoMin),
+        createdAt: at(t.createdAgoMin),
       };
-      const thread: Thread = { item, replies, question: t.question ?? null, next: t.next ?? [], run: null, queue: [], archived: false };
+      const first = { text: t.replies.at(-1)!.prompt, at: at(t.createdAgoMin), complete: true };
+      const thread: Thread = { item, replies, question: t.question ?? null, next: t.next ?? [], run: null, queue: [], archived: false, first };
       this.threads.set(t.id, thread);
       const r = t.running;
       if (r) this.begin(thread, r.prompt, { progress: r.progress, summary: r.summary, ms: r.finishesInSec * 1000, reply: async () => ({ text: r.text, card: r.card }) });
@@ -122,6 +126,15 @@ export class DemoAdapter implements Adapter {
     return this.thread(id).replies.map(({ card: _, ...r }) => ({ ...r }));
   }
 
+  async firstAsk(id: string): Promise<FirstAsk> {
+    return { ...this.thread(id).first };
+  }
+
+  /** Demo threads are on no real computer: their times are said as how long ago. */
+  timeZone(): null {
+    return null;
+  }
+
   /** What the briefing says of a thread as it is now: demo mode's classifier (see world.ts). */
   cardFor(id: string): DemoCard | null {
     const t = this.threads.get(id);
@@ -145,9 +158,9 @@ export class DemoAdapter implements Adapter {
       const id = `demo-new-${++this.seq}`;
       const item: WorkItem = {
         id, title: action.title ?? titleFrom(action.message), group: place?.name ?? action.placeId.replace(/^demo-place-/, ""), status: "running", updatedAt: now, settled: false, snoozedUntil: null,
-        parentId: null, pendingQuestion: false, lastRunAt: null, questionId: null, visitedAt: null, wroteAt: now,
+        parentId: null, pendingQuestion: false, lastRunAt: null, questionId: null, visitedAt: null, wroteAt: now, createdAt: now,
       };
-      const thread: Thread = { item, replies: [], question: null, next: [], run: null, queue: [], archived: false };
+      const thread: Thread = { item, replies: [], question: null, next: [], run: null, queue: [], archived: false, first: { text: action.message, at: now, complete: true } };
       this.threads.set(id, thread);
       this.begin(thread, action.message, this.planned(thread, action.message, true));
       this.log(`demo: started ${item.title} in ${item.group}`);

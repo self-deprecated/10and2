@@ -43,6 +43,24 @@ class RpcError extends Error {
 }
 const invalid = (m: string) => new RpcError(ERR.invalidParams, m);
 
+/**
+ * This machine's time zone as `serverInfo.timeZone`, what the brain says times in ("yesterday at 8 AM"): an IANA name
+ * ("Europe/Copenhagen", "UTC"), or null when the system's isn't one (unset, "Etc/Unknown", an offset).
+ */
+export function ianaZone(zone: unknown): string | null {
+  if (typeof zone !== "string" || !/^[A-Za-z][\w+-]*(?:\/[\w+-]+)*$/.test(zone) || zone === "Etc/Unknown") return null;
+  try { new Intl.DateTimeFormat("en-US", { timeZone: zone }); return zone; } catch { return null; }
+}
+/**
+ * The zone this machine is in now. Node reads the computer's zone once and keeps it, so a connector left running while
+ * its computer moves zone (travel) would say the old one; unsetting TZ, which isn't set, makes it read the zone again.
+ * A TZ that is set is the user's choice, and kept.
+ */
+function hostZone(): string {
+  if (process.env.TZ === undefined) delete process.env.TZ;
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
+}
+
 export class Link {
   private readonly opts: Options;
   private ws: WebSocket | null = null;
@@ -126,7 +144,8 @@ export class Link {
         listed = JSON.stringify(this.opts.adapter.actions);
         this.unwatch = this.opts.adapter.watch((ids) => { sent.touch(ids); void check(); });
         this.timers.push(setInterval(() => void check(), this.opts.stateMs ?? 5000));
-        return { protocolVersion: MCP_VERSION, capabilities: { tools: { listChanged: true }, resources: { subscribe: true } }, serverInfo: { name: "10and2", version: VERSION } };
+        const timeZone = ianaZone(hostZone());
+        return { protocolVersion: MCP_VERSION, capabilities: { tools: { listChanged: true }, resources: { subscribe: true } }, serverInfo: { name: "10and2", version: VERSION, ...(timeZone ? { timeZone } : {}) } };
       }
       if (!initialized) throw new RpcError(ERR.invalidRequest, "The session isn't initialized.");
       switch (m.method) {
@@ -220,6 +239,10 @@ export class Link {
       case "past_replies": {
         if (!text(args.id)) throw invalid("A thread is required.");
         return result({ replies: await a.replies(args.id) }, "");
+      }
+      case "first_ask": {
+        if (!text(args.id)) throw invalid("A thread is required.");
+        return result({ first: await a.firstAsk(args.id) }, "");
       }
       case "mark_read": {
         if (!text(args.id) || !text(args.watermark) || !Number.isFinite(Date.parse(args.watermark))) throw invalid("A thread and a read watermark are required.");

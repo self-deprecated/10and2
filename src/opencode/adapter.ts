@@ -7,13 +7,13 @@ import { watch, existsSync, mkdirSync } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { createHash } from "node:crypto";
-import type { Action, Adapter, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import type { Action, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, ceilingFor, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy, RuntimeMode } from "../policy.ts";
 import { Store } from "../claude/store.ts";
 import { t3Cwd } from "../claude/transcript.ts";
-import { addWorktree, folderOf, gitRoot, group } from "../work.ts";
-import { dbPathFor, isRunSession, messages, newUserMessages, projectRoots, questionsOf, sessions, userMessageIds, view, withDb } from "./db.ts";
+import { addWorktree, firstAsk, folderOf, gitRoot, group } from "../work.ts";
+import { dbPathFor, iso, isRunSession, messages, newUserMessages, projectRoots, questionsOf, sessions, userMessageIds, view, withDb } from "./db.ts";
 import type { Asked, SessionRow, View } from "./db.ts";
 import { alive, call, CallError, defaultLiveDir, endpointKey, events, healthy, pluginEndpoints, processes } from "./live.ts";
 import type { Endpoint, Proc } from "./live.ts";
@@ -276,6 +276,7 @@ export class OpenCodeAdapter implements Adapter {
         settled: !!overlay.settledAt && !newer(overlay.settledAt),
         snoozedUntil: overlay.snoozedUntil && Date.parse(overlay.snoozedUntil) > this.now() && !waiting && !newer(overlay.snoozedAt) ? overlay.snoozedUntil : null,
         parentId: null, pendingQuestion: waiting, questionId: pending?.id ?? (waiting ? v.asking?.partId ?? null : null), lastRunAt: v.lastRunAt, wroteAt: v.wroteAt,
+        createdAt: iso(s.createdAt),
       };
       next.set(s.id, { s, v, item, holder, runner, pending, unreachable });
     }
@@ -358,6 +359,8 @@ export class OpenCodeAdapter implements Adapter {
       reply: r.v.reply ? { runId: r.v.reply.runId, messageId: r.v.reply.messageId, at: r.v.reply.at } : null };
   }
   async replies(id: string): Promise<PastReply[]> { await this.fresh(); return this.row(id).v.replies.map((r) => ({ ...r })); }
+  /** Every message is read, so it's complete. */
+  async firstAsk(id: string): Promise<FirstAsk | null> { await this.fresh(); const f = this.row(id).v.first; return f ? firstAsk(f.text, f.at, true) : null; }
   async markRead(): Promise<"unsupported"> { return "unsupported"; }
   watch(onChange: (ids: string[], urgent: boolean) => void): () => void { this.listeners.add(onChange); return () => { this.listeners.delete(onChange); }; }
 

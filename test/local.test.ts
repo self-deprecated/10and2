@@ -32,6 +32,16 @@ test("local adapters route every operation by prefix, preserving T3 ids and rece
   assert.deepEqual(r, { ok: true, itemId: "claude:new-1" });
 });
 
+test("a first ask is routed by prefix; a work system that can't say has none", async () => {
+  const t3 = Object.assign(new FakeAdapter([item("a")]), { firstAsk: undefined });
+  const other = new FakeAdapter([item("a")]);
+  other.asks.set("a", { text: "Fix the login.", at: "2026-11-16T15:00:00.000Z", complete: true });
+  const local = new Local([{ prefix: "", adapter: t3 }, { prefix: "pi", adapter: other }], policy);
+  assert.deepEqual(await local.firstAsk("pi:a"), { text: "Fix the login.", at: "2026-11-16T15:00:00.000Z", complete: true });
+  assert.equal(await local.firstAsk("a"), null);
+  await assert.rejects(local.firstAsk("pi:gone"), /isn't visible/);
+});
+
 test("policy intersects capabilities and refuses disallowed verbs and profiles through check and execute", async () => {
   const fake = new FakeAdapter([item("a")]);
   const local = new Local([{ prefix: "", adapter: fake }], policy);

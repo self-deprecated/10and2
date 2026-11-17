@@ -1,5 +1,5 @@
 // Test doubles shared by the unit tests.
-import type { Action, Adapter, PastReply, Place, Receipt, Report, WorkItem } from "../src/contract.ts";
+import type { Action, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../src/contract.ts";
 const targetOf = (a: Action) => a.kind === "start_work" ? a.placeId : a.itemId;
 
 export function item(id: string, over: Partial<WorkItem> = {}): WorkItem {
@@ -50,6 +50,12 @@ export class FakeAdapter implements Adapter {
   async replies(id: string): Promise<PastReply[]> {
     const rep = await this.report(id);
     return this.past.get(id) ?? (rep.reply ? [{ ...rep.reply, text: rep.text, prompt: null }] : []);
+  }
+  /** Each item's first ask (none by default). An id it doesn't list isn't visible, as the work systems say. */
+  asks = new Map<string, FirstAsk>();
+  async firstAsk(id: string): Promise<FirstAsk | null> {
+    if (!this.items.some((i) => i.id === id)) throw new Error("That session isn't visible to 10 & 2.");
+    return this.asks.get(id) ?? null;
   }
   async execute(action: Action, key: string): Promise<Receipt> {
     if (this.delayMs) await new Promise((r) => setTimeout(r, this.delayMs));

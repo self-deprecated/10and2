@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import type { ItemStatus, PastReply } from "../contract.ts";
 import { iso, knownVersion } from "./registry.ts";
+import { limited } from "../work.ts";
 
 export function t3Cwd(cwd: string): boolean {
   const p = resolve(cwd);
@@ -12,6 +13,26 @@ export function t3Cwd(cwd: string): boolean {
 export function typedUser(r: any): string | null {
   return r?.type === "user" && !r.isSidechain && !r.isMeta && !r.isCompactSummary && typeof r.message?.content === "string" ? r.message.content : null;
 }
+/**
+ * A top-level user record's words, as a first ask reads them: typed (`typedUser`), or the text blocks of one whose
+ * content is a list (a message with a pasted image), never one carrying a tool's result.
+ */
+function userWords(r: any): string | null {
+  const typed = typedUser(r), content = r?.message?.content;
+  const words = typed ?? (r?.type === "user" && !r.isSidechain && !r.isMeta && !r.isCompactSummary && Array.isArray(content)
+    && !content.some((b: any) => b?.type === "tool_result") ? textOf(r) : null);
+  // The IDE's context (the file open in VS Code, a selection) that Claude Code adds beside the user's words, and drops
+  // itself when it reads a prompt back.
+  return words === null ? null : words.replace(IDE_CONTEXT, "").trim();
+}
+const IDE_CONTEXT = /<(ide_opened_file|ide_selection)(?:\s[^>]*)?>[\s\S]*?<\/\1>\n?/g;
+/**
+ * Whether a user record's words are the user's own ask: not a note Claude Code wrote itself (a background task's
+ * notification: `origin` other than "human", `promptSource` "system"; its "[Request interrupted by user…]" marker), nor
+ * a slash or shell command or its output.
+ */
+const ownAsk = (r: any, words: string) => (r.origin?.kind ?? "human") === "human" && r.promptSource !== "system"
+  && !/^\s*(?:<(?:command-name|command-message|local-command-[a-z]+|bash-[a-z]+)>|\[Request interrupted by user)/.test(words);
 const textOf = (r: any): string => Array.isArray(r.message?.content) ? r.message.content.filter((b: any) => b?.type === "text" && typeof b.text === "string").map((b: any) => b.text).join("\n") : "";
 const later = (a: string | null, b: string | null) => !a ? b : !b ? a : a > b ? a : b;
 
@@ -37,6 +58,10 @@ export class Transcript {
   title: string | null = null;
   named = false;
   t3 = false;
+  /** When the session started: its first record's time. */
+  createdAt: string | null = null;
+  /** The user's first own message (`ownAsk`), cut to its start and end (`limited`), and its time. */
+  first: { text: string; at: string } | null = null;
   /** How the session was started, from its first record that says. */
   entrypoint: string | null = null;
   sidechain = false;
@@ -99,6 +124,7 @@ export class Transcript {
 
   apply(r: any): void {
     if (!r || typeof r !== "object") return;
+    this.createdAt ??= iso(r.timestamp);
     if (r.isSidechain) { if (!this.topLevel) this.sidechain = true; return; }
     if (["user", "assistant"].includes(r.type)) { this.topLevel = true; this.sidechain = false; }
     if (typeof r.cwd === "string") { this.cwd = r.cwd; this.t3 ||= t3Cwd(r.cwd); }
@@ -117,6 +143,10 @@ export class Transcript {
     if (r.type === "custom-title" && typeof r.customTitle === "string") { this.title = r.customTitle; this.named = true; }
     if (r.type === "ai-title" && !this.named && typeof r.aiTitle === "string") this.title = r.aiTitle;
     const at = iso(r.timestamp);
+    if (!this.first) {
+      const words = userWords(r), when = at ?? this.createdAt;
+      if (words?.trim() && when && ownAsk(r, words)) this.first = { text: limited(words.trim()), at: when };
+    }
     const prompt = typedUser(r);
     if (prompt !== null) {
       this.updatedAt = later(this.updatedAt, at); this.wroteAt = at;

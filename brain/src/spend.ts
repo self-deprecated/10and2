@@ -37,14 +37,16 @@ export const SPEECH_PRICES: Record<string, number> = { "gpt-4o-mini-tts": 0.015 
 export const SPEECH_CHARS_PER_MINUTE = 900;
 
 /** Every operation that pays the provider (cloud/src/costs.ts names the same, with how each is metered). */
-export const OPS = ["call", "backend", "speech", "voice_sample", "rewriter", "briefing_writer", "classifier", "opener", "demo_writer"] as const;
+export const OPS = ["call", "backend", "speech", "voice_sample", "rewriter", "briefing_writer", "classifier", "opener", "titler", "purposer", "demo_writer"] as const;
 export type Op = (typeof OPS)[number];
 
 /**
- * The background work an account's daily budget bounds (settings `backgroundCentsPerDay`): nobody waits on it, the
- * user isn't charged for it, and out of budget it's skipped or put together without a model (costs.ts).
+ * The model work an account's daily budget bounds (settings `backgroundCentsPerDay`): the user isn't charged for it,
+ * and out of budget it's skipped or put together without a model (costs.ts). Most of it nobody waits on; a reading
+ * rewritten for listening, a new thread's title and a purpose asked for in a call are waited on, and go without the
+ * model past the budget.
  */
-export const BACKGROUND: readonly Op[] = ["classifier", "opener", "briefing_writer", "rewriter"];
+export const BACKGROUND: readonly Op[] = ["classifier", "opener", "briefing_writer", "rewriter", "titler", "purposer"];
 
 /** A model call's usage, as the provider reports it. */
 export type Spent = {

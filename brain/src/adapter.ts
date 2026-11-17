@@ -31,7 +31,16 @@ export type WorkItem = {
   visitedAt?: string | null;
   /** When the user last wrote in it, if the system says. */
   wroteAt?: string | null;
+  /** When the item was started, if the system says (connectors 0.10.0 on). */
+  createdAt?: string | null;
 };
+
+/**
+ * The first thing the user asked an item, and when (the message's own time). `complete`: the system read the item from
+ * its start, so this is truly the first; false when only a recent window was read (a long T3 thread), so this is the
+ * oldest ask that window holds.
+ */
+export type FirstAsk = { text: string; at: string; complete: boolean };
 
 /**
  * Which reply a report's text is: the run it ended, the message, and when that run finished. A later run that ends
@@ -90,13 +99,13 @@ export type Action =
   | { kind: "unsnooze"; itemId: string }
   | { kind: "unsettle"; itemId: string }
   | { kind: "archive"; itemId: string }
-  /** No `title`: the work system names the thread from its prompt (T3 Code's `generateTitle`; Claude Code by itself). */
+  /** `title`: the brain's, made from the prompt (titles.ts). None: the work system names the thread (T3 Code's `generateTitle`; Claude Code by itself). */
   | { kind: "start_work"; placeId: string; title?: string; message: string; profile: LaunchProfile };
 
 export type ActionKind = Action["kind"];
 
 /**
- * A short name for a new thread from its first prompt, for whatever needs one before the work system has named it (a
+ * A short name for a new thread from its first prompt, for whatever needs one when the brain has made no title (a
  * connector before 0.6.0, demo mode): its first line of the user's own words (not the line saying it was dictated, nor a
  * quoted one), cut at a word to about 50 characters. connector/src/t3/adapter.ts has the same, for T3's seed title.
  */
@@ -131,6 +140,13 @@ export interface Adapter {
   report(id: string): Promise<Report>;
   /** Every finished run's reply, newest first, when the system keeps them. */
   replies?(id: string): Promise<PastReply[]>;
+  /** The user's first message to the item (not a note the agent wrote itself), or null when it has none yet. */
+  firstAsk?(id: string): Promise<FirstAsk | null>;
+  /**
+   * The time zone (IANA, "Europe/Copenhagen") of the computer holding `itemId`, as it reports it (connectors 0.10.0 on),
+   * or null when unknown: what "yesterday at 8 AM" is said in.
+   */
+  timeZone?(itemId: string): string | null;
   /**
    * Performs one action. The same key must never perform it twice, so a retry after a dropped
    * connection is safe.

@@ -182,7 +182,7 @@ export class FakeCodex {
       case "thread/turns/list": {
         const t = this.get(p.threadId);
         if (!t.turns.length) this.fail(`thread ${t.id} is not materialized yet`);
-        return { data: [...t.turns].reverse().slice(0, p.limit ?? 25), nextCursor: null };
+        return { data: (p.sortDirection === "asc" ? [...t.turns] : [...t.turns].reverse()).slice(0, p.limit ?? 25), nextCursor: null };
       }
       case "thread/resume": {
         const t = this.get(p.threadId);

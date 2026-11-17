@@ -6,7 +6,8 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { nodeSql, type SqlDb } from "./sql.ts";
-import type { LaunchProfile, ReplyRef } from "./adapter.ts";
+import type { FirstAsk, LaunchProfile, ReplyRef } from "./adapter.ts";
+import { askText, cleanPurpose } from "./purposes.ts";
 import type { Segment } from "./reading.ts";
 import type { Wait } from "./waits.ts";
 import { reasonText, type EndReason } from "./voice/endReason.ts";
@@ -145,7 +146,27 @@ CREATE TABLE IF NOT EXISTS costs (
   requests INTEGER NOT NULL, input INTEGER NOT NULL, cached INTEGER NOT NULL, cache_write INTEGER NOT NULL, output INTEGER NOT NULL,
   reasoning INTEGER NOT NULL, seconds REAL NOT NULL, chars INTEGER NOT NULL, retries INTEGER NOT NULL, usd REAL NOT NULL, at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS costs_by_day ON costs (day);
+CREATE TABLE IF NOT EXISTS purposes (
+  item_id TEXT PRIMARY KEY, first_ask TEXT, first_ask_at INTEGER, complete INTEGER NOT NULL DEFAULT 0, started_at INTEGER,
+  purpose TEXT, about TEXT, made_by TEXT, made_at INTEGER, tried_at INTEGER, tried_run TEXT, missing_at INTEGER);
 `;
+
+/** How long what's kept for a thread's purpose outlasts the thread on the list (`Store.forgetPurposes`). */
+export const PURPOSE_KEPT_MS = 7 * 24 * 3600_000;
+
+/**
+ * Why a thread was started (purposes.ts), as the brain keeps it. `firstAsk`: the user's first message, masked, without
+ * the line saying it was dictated, at most about 8000 characters (its start and end); `firstAskAt` when it was sent
+ * (ms); `complete` false when the work system read only a recent window, so it's the oldest message that window had.
+ * `startedAt`: when the brain started the thread itself (ms). `purpose`: one short line ("Getting the App Store
+ * screenshots to show the new look"); `about`: a few sentences more, none when the user set the purpose; `by` who wrote
+ * them: the model, or the user, whose words are never written over by the model. A thread with none yet may have a row
+ * with only when a background pass last tried it (`purposeTries`).
+ */
+export type ThreadPurpose = {
+  itemId: string; firstAsk: string | null; firstAskAt: number | null; complete: boolean; startedAt: number | null;
+  purpose: string | null; about: string | null; by: "model" | "user" | null; madeAt: number | null;
+};
 
 /** One day's spend on one operation, on Driver's key or the account's own (`own`). */
 export type CostDay = { day: string; op: string; own: boolean; usd: number; requests: number; seconds: number };
@@ -271,12 +292,17 @@ export class Store {
     this.db.prepare("INSERT INTO turns (conversation_id, role, text, at, corrected) VALUES (?, ?, ?, ?, ?)")
       .run(conversationId, role, text.trim(), now, corrected?.length ? JSON.stringify(corrected) : null);
   }
-  /** Driver's latest turn said `said`, which didn't happen: kept with its correction, as `addTurn`'s `corrected`. */
-  correctLastTurn(conversationId: string, said: string, note: string) {
-    const r = this.db.prepare("SELECT id, corrected FROM turns WHERE conversation_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1").get(conversationId) as any;
-    if (!r) return;
+  /**
+   * Driver said `said`, which didn't happen: kept with its correction, as `addTurn`'s `corrected`, on the latest of its
+   * last few turns that said it, else (unless `onlySaying`) its latest. Whether a turn was corrected.
+   */
+  correctLastTurn(conversationId: string, said: string, note: string, onlySaying = false): boolean {
+    const recent = this.db.prepare("SELECT id, text, corrected FROM turns WHERE conversation_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 5").all(conversationId) as any[];
+    const r = recent.find((t) => said && String(t.text).includes(said)) ?? (onlySaying ? undefined : recent[0]);
+    if (!r) return false;
     const corrected = [...(r.corrected ? JSON.parse(r.corrected) : []), { said, note }];
     this.db.prepare("UPDATE turns SET corrected = ? WHERE id = ?").run(JSON.stringify(corrected), r.id);
+    return true;
   }
   /**
    * The conversation's latest turns, oldest first, as history for a new session: what Driver said that didn't happen
@@ -779,7 +805,88 @@ export class Store {
   untold<T>(): Map<string, { at: number; replies: T[] }> {
     return new Map((this.db.prepare("SELECT * FROM untold").all() as any[]).map((r) => [r.conversation_id, { at: r.at, replies: JSON.parse(r.replies) }]));
   }
+
+  // --- purposes: why each thread was started (purposes.ts) ---
+  /** What's kept of why `itemId` was started, or null for nothing yet. */
+  purposeOf(itemId: string): ThreadPurpose | null {
+    const r = this.db.prepare("SELECT * FROM purposes WHERE item_id = ?").get(itemId) as any;
+    return r ? rowToPurpose(r) : null;
+  }
+  /** Each thread's purpose line, for those that have one. */
+  purposeLines(): Map<string, string> {
+    return new Map((this.db.prepare("SELECT item_id, purpose FROM purposes WHERE purpose IS NOT NULL").all() as any[]).map((r) => [r.item_id, r.purpose]));
+  }
+  /**
+   * Threads with no purpose that a background pass tried (purposes.ts): `at`, when reading it or the model failed (it's
+   * tried again an hour on); `run`, its latest run (null for none) when there was nothing to write it from, or the model
+   * gave nothing usable (it's tried again once that changes). Kept, so a brain woken again (the cloud's, each time it
+   * wakes) doesn't read and ask again for the same threads.
+   */
+  purposeTries(): Map<string, { at: number } | { run: string | null }> {
+    const rows = this.db.prepare("SELECT item_id, tried_at, tried_run FROM purposes WHERE purpose IS NULL AND (tried_at IS NOT NULL OR tried_run IS NOT NULL)").all() as any[];
+    return new Map(rows.map((r) => [r.item_id, r.tried_at !== null ? { at: Number(r.tried_at) } : { run: r.tried_run || null }]));
+  }
+  /** A background pass tried `itemId` (`purposeTries`): this replaces what it last noted. */
+  triedPurpose(itemId: string, tried: { at: number } | { run: string | null }) {
+    // A run of none is kept as "", as NULL is no note.
+    const [at, run] = "at" in tried ? [tried.at, null] : [null, tried.run ?? ""];
+    this.db.prepare(
+      "INSERT INTO purposes (item_id, tried_at, tried_run) VALUES (?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET tried_at = excluded.tried_at, tried_run = excluded.tried_run",
+    ).run(itemId, at, run);
+  }
+  /**
+   * Forgets what's kept for a thread (its first message, purpose and tries) once it has been off the list (`listed`) for
+   * `PURPOSE_KEPT_MS`, not at once as a card is: a work system that isn't open yet lists none of its threads, and the
+   * user's own words for one can't be written again. Back on the list, it's kept again. One the brain started at
+   * `startedSince` or later stays: a list read just before it started doesn't have it yet.
+   */
+  forgetPurposes(listed: ReadonlySet<string>, startedSince: number, now: number) {
+    for (const r of this.db.prepare("SELECT item_id, missing_at FROM purposes WHERE started_at IS NULL OR started_at < ?").all(startedSince) as any[]) {
+      if (listed.has(r.item_id)) {
+        if (r.missing_at != null) this.db.prepare("UPDATE purposes SET missing_at = NULL WHERE item_id = ?").run(r.item_id);
+      } else if (r.missing_at == null) this.db.prepare("UPDATE purposes SET missing_at = ? WHERE item_id = ?").run(now, r.item_id);
+      else if (now - r.missing_at >= PURPOSE_KEPT_MS) this.db.prepare("DELETE FROM purposes WHERE item_id = ?").run(r.item_id);
+    }
+  }
+  /**
+   * The user's first message to `itemId` (`Adapter.firstAsk`), kept masked, without its dictation line and cut to its
+   * start and end (`askText`); `startedAt`: the brain started the thread itself, then (kept once set). Returns the record.
+   */
+  saveFirstAsk(itemId: string, ask: FirstAsk, startedAt?: number): ThreadPurpose {
+    const at = Date.parse(ask.at);
+    this.db.prepare(
+      `INSERT INTO purposes (item_id, first_ask, first_ask_at, complete, started_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET
+       first_ask = excluded.first_ask, first_ask_at = excluded.first_ask_at, complete = excluded.complete, started_at = COALESCE(purposes.started_at, excluded.started_at)`,
+    ).run(itemId, askText(ask.text), Number.isFinite(at) ? at : null, ask.complete ? 1 : 0, startedAt ?? null);
+    return this.purposeOf(itemId)!;
+  }
+  /** A purpose the model wrote: kept, unless the user has set one (false then). */
+  savePurpose(itemId: string, purpose: string, about: string, now = Date.now()): boolean {
+    const r = this.db.prepare(
+      `INSERT INTO purposes (item_id, purpose, about, made_by, made_at) VALUES (?, ?, ?, 'model', ?) ON CONFLICT(item_id) DO UPDATE SET
+       purpose = excluded.purpose, about = excluded.about, made_by = 'model', made_at = excluded.made_at WHERE purposes.made_by IS NOT 'user'`,
+    ).run(itemId, purpose, about, now);
+    return Number(r.changes) === 1;
+  }
+  /**
+   * The user said what `itemId` is for ("the screenshots thread is for X"): their words, as one line, replace the
+   * purpose and its longer `about` (gone), and the model never writes over them. Null when `words` say nothing.
+   */
+  setUserPurpose(itemId: string, words: string, now = Date.now()): ThreadPurpose | null {
+    const purpose = cleanPurpose(words);
+    if (!purpose) return null;
+    this.db.prepare(
+      `INSERT INTO purposes (item_id, purpose, about, made_by, made_at) VALUES (?, ?, NULL, 'user', ?) ON CONFLICT(item_id) DO UPDATE SET
+       purpose = excluded.purpose, about = NULL, made_by = 'user', made_at = excluded.made_at`,
+    ).run(itemId, purpose, now);
+    return this.purposeOf(itemId);
+  }
 }
+
+const rowToPurpose = (r: any): ThreadPurpose => ({
+  itemId: r.item_id, firstAsk: r.first_ask ?? null, firstAskAt: r.first_ask_at ?? null, complete: Number(r.complete) === 1, startedAt: r.started_at ?? null,
+  purpose: r.purpose ?? null, about: r.about ?? null, by: r.made_by === "user" || r.made_by === "model" ? r.made_by : null, madeAt: r.made_at ?? null,
+});
 
 /** A turn with each claim that didn't happen replaced by its correction (appended when the words can't be found). */
 function withCorrections(text: string, corrected: { said: string; note: string }[]): string {

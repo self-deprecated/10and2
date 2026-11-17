@@ -1,7 +1,7 @@
 // Threads on several machines as one work system. The brain's own machine keeps its ids; another machine's are
 // "<machine>|<id>", and their group says where they are ("expo, on Quartz"), so names and commands go to the right
 // machine. A machine that hasn't answered yet (asleep, offline) contributes nothing rather than holding everyone up.
-import type { Action, Adapter, PastReply, Place, Receipt, Report, WorkItem } from "./adapter.ts";
+import type { Action, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "./adapter.ts";
 import { describe } from "./util.ts";
 
 export type Machine = {
@@ -97,6 +97,21 @@ export class Machines implements Adapter {
   async replies(id: string): Promise<PastReply[]> {
     const r = this.route(id);
     return r.m.adapter.replies?.(r.id) ?? Promise.resolve([]);
+  }
+
+  async firstAsk(id: string): Promise<FirstAsk | null> {
+    const r = this.route(id);
+    return r.m.adapter.firstAsk?.(r.id) ?? null;
+  }
+
+  /** The time zone of the machine holding `itemId`, as its connector said it; null when it didn't, or no machine has it. */
+  timeZone(itemId: string): string | null {
+    try {
+      const r = this.route(itemId);
+      return r.m.adapter.timeZone?.(r.id) ?? null;
+    } catch {
+      return null;
+    }
   }
 
   /**

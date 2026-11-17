@@ -1,6 +1,6 @@
 // Several work systems on this machine. T3 keeps its old ids; the others own a prefix, so adding an adapter never
 // changes existing stars or operation keys. Policy is checked here even when a caller skips the voice-side check.
-import type { Action, ActionKind, Adapter, PastReply, Place, Receipt, Report, WorkItem } from "./contract.ts";
+import type { Action, ActionKind, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "./contract.ts";
 import { allows, withinCeiling, type Policy } from "./policy.ts";
 import type { Refusals } from "./view.ts";
 
@@ -80,6 +80,7 @@ export class Local implements Adapter {
   places(): Place[] { return this.entries.filter((e) => e.adapter.isLoaded !== false).flatMap((e) => (e.adapter.places?.() ?? []).map((p) => ({ ...p, id: this.id(e, p.id) }))); }
   report(id: string): Promise<Report> { const r = this.route(id); return r.e.adapter.report(r.id); }
   replies(id: string): Promise<PastReply[]> { const r = this.route(id); return r.e.adapter.replies?.(r.id) ?? Promise.resolve([]); }
+  firstAsk(id: string): Promise<FirstAsk | null> { const r = this.route(id); return r.e.adapter.firstAsk?.(r.id) ?? Promise.resolve(null); }
   async check(a: Action): Promise<string | null> {
     if (!allows(this.policy, a.kind)) return `10 & 2 isn't allowed to ${a.kind.replaceAll("_", " ")} on this machine.`;
     if (a.kind === "start_work" && !withinCeiling(this.policy, a.profile)) return `The ${a.profile.name} profile asks for more access than this machine allows.`;

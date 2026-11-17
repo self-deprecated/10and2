@@ -4,11 +4,20 @@
 // puts its leaf when it opens the session. Messages: `{type:"message",message:{role,content,stopReason?}}`.
 import { openSync, closeSync, readSync, fstatSync } from "node:fs";
 import type { ItemStatus, PastReply } from "../contract.ts";
+import { limited } from "../work.ts";
 
 /** A message's text: a string, or its text blocks joined. */
 export function textOf(content: unknown): string {
   if (typeof content === "string") return content;
   return Array.isArray(content) ? content.filter((b: any) => b?.type === "text" && typeof b.text === "string").map((b: any) => b.text).join("") : "";
+}
+
+/** Pi's `parseSkillBlock`: a message sent with `/skill:<name>`, the skill's whole file, then the user's words if any. */
+const SKILL_BLOCK = /^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/;
+/** What the user asked in a message: with a skill, only their words after it, or `/skill:<name>` when there are none. */
+function asked(text: string): string {
+  const skill = SKILL_BLOCK.exec(text);
+  return skill ? skill[4]?.trim() || `/skill:${skill[1]}` : text;
 }
 
 const iso = (v: unknown): string | null => {
@@ -45,7 +54,11 @@ export class PiSession {
   createdAt: string | null = null;
   version: number | null = null;
   name: string | null = null;
-  firstPrompt: string | null = null;
+  /**
+   * The first user message in the file (`asked`: a skill's own words), cut to its start and end (`limited`), and its time
+   * (the header's, if the entry has none).
+   */
+  first: { text: string; at: string | null } | null = null;
   mtime = new Date(0).toISOString();
   /** The header was read and isn't a Pi session's. */
   invalid = false;
@@ -112,7 +125,7 @@ export class PiSession {
       if (m.role === "user") {
         const text = textOf(m.content);
         node = { id, p: parent, at, k: "u", text: text.slice(0, PROMPT_CHARS) };
-        if (this.firstPrompt === null && text.trim()) this.firstPrompt = text.slice(0, 500);
+        if (this.first === null && text.trim()) this.first = { text: limited(asked(text.trim())), at: at ?? this.createdAt };
       } else if (m.role === "assistant") {
         const stop = typeof m.stopReason === "string" ? m.stopReason : null, text = textOf(m.content);
         node = { id, p: parent, at, k: "a", stop, text: stop === "stop" || stop === "length" ? text : text.slice(0, NOTE_CHARS) };

@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import type { Adapter, ReplyRef, Report, WorkItem } from "./adapter.ts";
 import { spokenTitle, uniqueHandles } from "./handles.ts";
 import type { Briefed, Card, CardReply, Store } from "./store.ts";
+import type { Purposes } from "./purposes.ts";
 import { mapLimit, describe } from "./util.ts";
 
 export type ClassifyInput = {
@@ -214,6 +215,8 @@ export class Briefing {
     concurrency?: number;
     /** Summarize changes only while someone looks (production); otherwise as they come (the demo, tests). */
     onDemand?: boolean;
+    /** Writes threads' purposes, in a pass whenever changes are summarized; without it (demo worlds, tests), none are. */
+    purposes?: Purposes;
   };
 
   constructor(deps: Briefing["deps"]) {
@@ -292,7 +295,25 @@ export class Briefing {
   look(now = Date.now()): Promise<void> {
     this.looking(now);
     const due = this.due();
-    return due.length || this.openerStale ? this.refresh(due, true) : Promise.resolve();
+    if (due.length || this.openerStale) return this.refresh(due, true);
+    this.purpose();
+    return Promise.resolve();
+  }
+
+  /** What writes threads' purposes (purposes.ts), for a call to ask for one now; null where there's none (demo worlds). */
+  get purposes(): Purposes | null {
+    return this.deps.purposes ?? null;
+  }
+
+  /**
+   * Threads with no purpose get one in a pass of their own, after the summaries and never holding up the briefing: only
+   * while someone looks, as summaries are, so threads nobody looks at cost nothing.
+   */
+  private purpose() {
+    if (!this.deps.purposes) return;
+    // A stand-in for a thread just started isn't one yet: its purpose is written once the work system lists it.
+    const items = this.items.filter((i) => !this.provisional.has(i.id));
+    void this.deps.purposes.pass(items).catch((e) => this.deps.log(`purposes: pass failed: ${describe(e)}`));
   }
 
   /** A call is on until the returned function is called: changes are summarized as they come, and what's due now. */
@@ -361,6 +382,9 @@ export class Briefing {
         changed = true;
       }
     }
+    // Why each thread was started (purposes.ts) goes a week after it leaves the list (store.ts `forgetPurposes`): any
+    // thread listed, briefed or not, keeps its own, and so does one Driver started that the list may not have yet.
+    store.forgetPurposes(new Set(this.items.map((i) => i.id)), now.getTime() - PROVISIONAL_MS, now.getTime());
     const summarize = force || this.summarizing();
     const wanted = new Set(ids ?? visible.map((i) => i.id));
     // Also read: an item never read, and, when summarizing, every card behind what was read of its item.
@@ -436,6 +460,7 @@ export class Briefing {
       store.set("briefedAt", this.updatedAt);
     }
     log(`briefing: ${visible.length} items, ${toCheck.length} read, ${inputs.length} changed, ${summarized} summarized${inputs.length > summarized && !summarizeNow ? " (the rest once someone looks)" : ""}`);
+    if (summarizeNow) this.purpose();
     for (const listener of this.refreshed) {
       try {
         listener();

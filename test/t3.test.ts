@@ -235,6 +235,49 @@ test("T3Adapter: lists from the shell, ignores thread-less snapshots, reports ch
   assert.deepEqual(revoked, ["s1"], "closing revokes the brain's session");
 });
 
+test("T3Adapter: when a thread started, and its first ask: the user's own, complete only when the read held every row", async () => {
+  const rows = (n: number) => Array.from({ length: n }, (_, position) => ({ position }));
+  const note = { id: "w", role: "user", text: 'Background command "tests" completed (exit code 0)', createdBy: "agent", createdAt: "2026-11-16T14:59:00.000Z" };
+  const projections: Record<string, unknown> = {
+    // Out of order, after a note the agent wrote itself.
+    short: { messages: [note,
+      { id: "m2", role: "user", text: "And add tests.", createdBy: "user", createdAt: "2026-11-16T15:10:00.000Z" },
+      { id: "m1", role: "user", text: "  Make the screenshots sharper.\n", createdBy: "user", createdAt: "2026-11-16T15:00:05.000Z" },
+      { id: "r1", role: "assistant", text: "Done.", createdAt: "2026-11-16T15:05:00.000Z" }], visibleTurnItems: rows(4) },
+    // A long thread's recent window: the oldest ask it holds isn't the first.
+    long: { messages: [{ id: "m9", role: "user", text: "x".repeat(9000), createdBy: "user", createdAt: "2026-11-17T08:00:00.000Z" }], visibleTurnItems: rows(75) },
+    // A server whose shell doesn't count rows: it can't be told, so it isn't complete.
+    uncounted: { messages: [{ id: "m1", role: "user", text: "Fix the login.", createdBy: "user", createdAt: "2026-11-15T10:00:00.000Z" }], visibleTurnItems: rows(2) },
+    agent: { messages: [note], visibleTurnItems: rows(2) },
+  };
+  const t3 = await fakeT3({
+    onRequest: (f, ws) => {
+      if (f.tag === "orchestration.subscribeShell") {
+        ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [{ kind: "snapshot", snapshot: { projects: [{ id: "p1", title: "nix" }], threads: [
+          thread("short", { createdAt: "2026-11-16T15:00:00.000Z", visibleItemCount: 4 }),
+          thread("long", { createdAt: "2026-11-01T09:00:00.000Z", visibleItemCount: 900 }),
+          thread("uncounted"),
+          thread("agent", { createdAt: "2026-11-16T14:58:00.000Z", visibleItemCount: 2 }),
+        ] } }] }));
+      } else if (f.tag === "orchestration.getThreadProjection") exit(ws, f.id, projections[f.payload.threadId]);
+    },
+  });
+  const auth = { issue: async () => ({ token: "good", sessionId: "s1", expiresAt: new Date(Date.now() + 86_400_000).toISOString() }), revoke: async () => {} };
+  const adapter = new T3Adapter({ baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {}, auth });
+  try {
+    await adapter.start();
+    assert.deepEqual((await adapter.list()).map((i) => [i.id, i.createdAt]), [["short", "2026-11-16T15:00:00.000Z"], ["long", "2026-11-01T09:00:00.000Z"], ["uncounted", null], ["agent", "2026-11-16T14:58:00.000Z"]]);
+    assert.deepEqual(await adapter.firstAsk("short"), { text: "Make the screenshots sharper.", at: "2026-11-16T15:00:05.000Z", complete: true });
+    const long = await adapter.firstAsk("long");
+    assert.deepEqual([long?.text.length, long?.complete], [8000, false], "cut to 8000 characters; a window of 75 of 900 rows isn't the whole thread");
+    assert.equal((await adapter.firstAsk("uncounted"))?.complete, false);
+    assert.equal(await adapter.firstAsk("agent"), null, "a note the agent wrote itself isn't the user's ask");
+  } finally {
+    await adapter.close();
+    t3.close();
+  }
+});
+
 test("a request T3 never answers times out as a ConnectionError (outcome unknown)", async () => {
   const t3 = await fakeT3({ onRequest: () => {} });
   try {
@@ -495,6 +538,7 @@ test("local project visibility filters threads, places and changes, and guards e
     assert.deepEqual(changes, []);
     await assert.rejects(adapter.report("hidden"), /outside/);
     await assert.rejects(adapter.replies("hidden"), /outside/);
+    await assert.rejects(adapter.firstAsk("hidden"), /outside/);
     assert.equal((await adapter.execute({ kind: "archive", itemId: "hidden" }, "hidden")).ok, false);
     assert.equal((await adapter.markRead("hidden", "2026-10-30T12:00:00Z", "read-hidden") as any).ok, false);
     assert.equal((await adapter.execute({ kind: "start_work", placeId: "p2", title: "Hidden", message: "Go", profile: { name: "Build", workspace: "worktree", runtimeMode: "full-access", interactionMode: "default" } }, "launch-hidden")).ok, false);

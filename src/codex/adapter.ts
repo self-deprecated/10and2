@@ -12,14 +12,14 @@ import { execFile } from "node:child_process";
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
-import type { Action, Adapter, ItemStatus, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import type { Action, Adapter, FirstAsk, ItemStatus, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, ceilingFor, RUNTIME_MODES, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy, RuntimeMode } from "../policy.ts";
 import { Store } from "../claude/store.ts";
 import { t3Cwd } from "../claude/transcript.ts";
 import { goAhead } from "../claude/adapter.ts";
 import { titleFrom } from "../t3/adapter.ts";
-import { addWorktree, folderOf, gitRoot, group } from "../work.ts";
+import { addWorktree, firstAsk, folderOf, gitRoot, group } from "../work.ts";
 import { VERSION } from "../protocol.ts";
 import { CodexRpc, ConnectionError } from "./rpc.ts";
 import type { ServerRequest } from "./rpc.ts";
@@ -47,7 +47,7 @@ export type Options = {
 
 /** A thread as `thread/list` and `thread/read` give it: only the fields used here. */
 type Thread = {
-  id: string; name: string | null; preview: string; cwd: string; updatedAt: number; ephemeral?: boolean;
+  id: string; name: string | null; preview: string; cwd: string; createdAt?: number; updatedAt: number; ephemeral?: boolean;
   status: { type: "notLoaded" | "idle" | "systemError" | "active"; activeFlags?: string[] };
   originator?: string | null; source?: unknown; threadSource?: string | null; parentThreadId?: string | null;
 };
@@ -401,7 +401,7 @@ export class CodexAdapter implements Adapter {
         status, updatedAt: iso(t.updatedAt) ?? new Date(this.now()).toISOString(),
         settled: !!overlay.settledAt && !newer(overlay.settledAt),
         snoozedUntil: overlay.snoozedUntil && Date.parse(overlay.snoozedUntil) > this.now() && !pending && !newer(overlay.snoozedAt) ? overlay.snoozedUntil : null,
-        parentId: null, pendingQuestion: pending, questionId, lastRunAt, wroteAt: wrote ? new Date(wrote).toISOString() : null,
+        parentId: null, pendingQuestion: pending, questionId, lastRunAt, wroteAt: wrote ? new Date(wrote).toISOString() : null, createdAt: iso(t.createdAt),
       };
       next.set(t.id, { thread: t, item, turns });
     }
@@ -494,6 +494,29 @@ export class CodexAdapter implements Adapter {
       out.push({ runId: turn.id, messageId: one.item.id, at: iso(turn.completedAt ?? turn.startedAt) ?? "", text: one.item.text ?? "", prompt });
     }
     return out;
+  }
+  /**
+   * The user's first message, from the thread's oldest turns: read from its start, so complete. Its time is the message's,
+   * else its turn's (older Codex keeps neither), else the thread's start; with none of those it's the latest the thread
+   * was worked on, and not complete, so the brain says it started then or earlier.
+   */
+  async firstAsk(id: string): Promise<FirstAsk | null> {
+    const row = this.row(id);
+    const rpc = this.rpc;
+    if (!rpc) throw new Error(NOT_CONNECTED);
+    const r: any = await rpc.request("thread/turns/list", { threadId: id, limit: 10, sortDirection: "asc", itemsView: "summary" }).catch((e) => {
+      if (e instanceof ConnectionError) throw new Error(NOT_CONNECTED);
+      return { data: [] }; // "not materialized yet": nothing said in it so far
+    });
+    for (const turn of (r?.data ?? []) as Turn[]) {
+      for (const i of turn.items.filter((i) => i.type === "userMessage")) {
+        const words = i.content?.filter((c) => c.type === "text").map((c) => c.text ?? "").join("\n") ?? "";
+        const at = (i.startedAtMs ? new Date(i.startedAtMs).toISOString() : null) ?? iso(turn.startedAt) ?? iso(row.thread.createdAt);
+        const first = firstAsk(words, at ?? row.item.updatedAt, !!at);
+        if (first) return first;
+      }
+    }
+    return null;
   }
   async markRead(): Promise<"unsupported"> { return "unsupported"; }
   watch(onChange: (ids: string[], urgent: boolean) => void): () => void { this.listeners.add(onChange); return () => { this.listeners.delete(onChange); }; }

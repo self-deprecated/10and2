@@ -7,10 +7,10 @@ import { basename, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import type { Action, Adapter, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import type { Action, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy } from "../policy.ts";
-import { addWorktree, folderOf, gitRoot, group } from "../work.ts";
+import { addWorktree, firstAsk, folderOf, gitRoot, group } from "../work.ts";
 import { Store } from "../claude/store.ts";
 import { pidState, procStart } from "../claude/registry.ts";
 import { answersFor } from "../claude/adapter.ts";
@@ -227,13 +227,13 @@ export class PiAdapter implements Adapter {
       const questionId = !pending ? null : l!.questions[0]?.questionId ?? hash(id + (l!.prompt?.since ?? l!.updatedAt ?? "waiting")).slice(0, 16);
       const lastRunAt = p?.lastRunAt ?? null;
       const newer = (at: string | null) => !!at && !!lastRunAt && lastRunAt > at;
-      const title = session?.name ?? l?.name ?? (session?.firstPrompt ? shortTitle(session.firstPrompt) : null) ?? `a Pi session in ${group(cwd)}`;
+      const title = session?.name ?? l?.name ?? (session?.first ? shortTitle(session.first.text) : null) ?? `a Pi session in ${group(cwd)}`;
       const item: WorkItem = {
         id, title: title || `a Pi session in ${group(cwd)}`, group: group(cwd),
         status: pending ? "waiting" : busy ? "running" : p?.status ?? "idle",
         updatedAt, settled: !!overlay.settledAt && !newer(overlay.settledAt),
         snoozedUntil: overlay.snoozedUntil && Date.parse(overlay.snoozedUntil) > this.now() && !pending && !newer(overlay.snoozedAt) ? overlay.snoozedUntil : null,
-        parentId: null, pendingQuestion: pending, questionId, lastRunAt, wroteAt: p?.wroteAt ?? null,
+        parentId: null, pendingQuestion: pending, questionId, lastRunAt, wroteAt: p?.wroteAt ?? null, createdAt: session?.createdAt ?? null,
       };
       next.set(id, { session, cwd, live: l, item });
     }
@@ -295,6 +295,8 @@ export class PiAdapter implements Adapter {
       reply: last ? { runId: last.runId, messageId: last.messageId, at: last.at } : null };
   }
   async replies(id: string): Promise<PastReply[]> { this.fresh(); return (this.row(id).session?.projection.replies ?? []).map((r) => ({ ...r })); }
+  /** Read from the file's start, so it's complete. */
+  async firstAsk(id: string): Promise<FirstAsk | null> { this.fresh(); const f = this.row(id).session?.first; return f?.at ? firstAsk(f.text, f.at, true) : null; }
   async markRead(): Promise<"unsupported"> { return "unsupported"; }
   watch(onChange: (ids: string[], urgent: boolean) => void): () => void { this.listeners.add(onChange); return () => { this.listeners.delete(onChange); }; }
 

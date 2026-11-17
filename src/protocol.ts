@@ -7,7 +7,7 @@ export const SUBPROTOCOL = "10and2.mcp.1";
 /** The MCP revision whose message shapes both ends speak. */
 export const MCP_VERSION = "2025-06-18";
 /** This connector's version, as `serverInfo.version` (kept equal to package.json's). */
-export const VERSION = "0.9.0";
+export const VERSION = "0.10.0";
 export const MAX_FRAME = 8 << 20;
 /** The keep-alive frames, outside JSON-RPC, so the brain's auto-response answers them without waking. */
 export const PING = '{"type":"ping"}';
@@ -70,6 +70,7 @@ type Tool = { name: string; description: string; inputSchema: object };
 const READING: Tool[] = [
   { name: "read_report", description: "The latest reply of a thread or session, its progress while running, and any open question.", inputSchema: obj({ id: str }) },
   { name: "past_replies", description: "Every finished run's reply in a thread or session, newest first.", inputSchema: obj({ id: str }) },
+  { name: "first_ask", description: "The user's first message to a thread or session and when they wrote it; null when it has none yet.", inputSchema: obj({ id: str }) },
   { name: "mark_read", description: "Marks a thread as seen up to a watermark, where the work system tracks that. Key in _meta.", inputSchema: obj({ id: str, watermark: str }) },
 ];
 const ACTING: Record<ActionKind, Tool> = {

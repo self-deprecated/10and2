@@ -9,7 +9,7 @@ import { Store } from "../store.ts";
 import { realClock, type Clock } from "../util.ts";
 import { wire } from "../world.ts";
 import { DemoAdapter, type Writer } from "./adapter.ts";
-import { DEMO_MACHINE, OPENER, type DemoCard } from "./workspace.ts";
+import { DEMO_MACHINE, OPENER, THREADS, type DemoCard } from "./workspace.ts";
 
 /** What every demo world shares with the brain it runs in. */
 export type DemoShared = Omit<ServerDeps, "adapter" | "briefing" | "proposals" | "store" | "waits" | "conversations" | "refresh" | "flags"> & {
@@ -54,6 +54,8 @@ export async function demoWorld(shared: DemoShared): Promise<ServerDeps & { clos
   const log = (m: string) => shared.log(`demo: ${m.replace(/^demo: /, "")}`);
   const adapter = new DemoAdapter({ clock: shared.clock ?? realClock, write: shared.write, log });
   const store = shared.newStore?.() ?? new Store(":memory:");
+  // Each thread's purpose as the workspace wrote it: demo worlds use no model for them.
+  for (const t of THREADS) store.savePurpose(t.id, t.purpose, t.about);
   const { briefing, conversations, proposals, waits } = wire({ adapter, store, classify: demoClassifier(adapter), writeOpener: demoOpener(), profiles: shared.profiles ?? [], log, track: shared.analytics?.track });
   adapter.watch((ids, urgent) => briefing.onChange(ids, urgent));
   await briefing.refresh();

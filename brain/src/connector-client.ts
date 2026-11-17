@@ -4,7 +4,8 @@
 //
 // What the brain knows of the machine (its view, rev and tools) is plain data a host can save and restore, so a
 // Durable Object that hibernates between frames picks up where it left off without asking again.
-import { titleFrom, type Action, type ActionKind, type Adapter, type LaunchProfile, type PastReply, type Place, type Receipt, type Report, type WorkItem } from "./adapter.ts";
+import { titleFrom, type Action, type ActionKind, type Adapter, type FirstAsk, type LaunchProfile, type PastReply, type Place, type Receipt, type Report, type WorkItem } from "./adapter.ts";
+import { validZone } from "./util.ts";
 
 export const SUBPROTOCOL = "10and2.mcp.1";
 export const MCP_VERSION = "2025-06-18";
@@ -27,9 +28,11 @@ type Mode = LaunchProfile["runtimeMode"];
 const MODES: Mode[] = ["approval-required", "auto-accept-edits", "auto", "full-access"];
 /**
  * `names`: the connector lets the work system name a new thread itself (its start_work doesn't require a title; 0.6.0
- * on). Absent or false, a start is sent a title made from its prompt (`titleFrom`), as connectors before it need one.
+ * on). Absent or false, a start the brain made no title for (titles.ts) is sent one made from its prompt (`titleFrom`),
+ * as connectors before it need one. `firstAsks`: it lists `first_ask` (0.10.0 on). `timeZone`: the machine's, as its
+ * `serverInfo` said it (0.10.0 on), when that's a zone this runtime knows.
  */
-export type Saved = { rev: string | null; items: WorkItem[]; places: Place[]; connections: Connection[]; refusals: Refusals; ceiling: Mode; actions: ActionKind[]; names?: boolean };
+export type Saved = { rev: string | null; items: WorkItem[]; places: Place[]; connections: Connection[]; refusals: Refusals; ceiling: Mode; actions: ActionKind[]; names?: boolean; firstAsks?: boolean; timeZone?: string | null };
 /** The socket, as the host carries it. `lastSeen`: when the connector was last heard from (a frame or a ping). */
 export type Wire = { send(text: string): void; close(code: number, reason: string): void; lastSeen(): number };
 
@@ -52,6 +55,7 @@ function validRead(f: any): boolean {
     f.refusals && typeof f.refusals === "object" && Object.values(f.refusals).every((r: any) => r && typeof r === "object" && Object.values(r).every(str)) &&
     MODES.includes(f.ceiling);
 }
+const validFirstAsk = (f: any): f is FirstAsk | null => f === null || (f && str(f.text) && str(f.at) && typeof f.complete === "boolean");
 const validReceipt = (r: any): r is Receipt => r && (r.ok === true ? r.itemId === undefined || str(r.itemId) : r.ok === false && str(r.error));
 /** The fields the briefing diffs on; an updatedAt-only change means nothing to it. */
 const briefed = (i: WorkItem) => JSON.stringify([i.status, i.title, i.settled, i.snoozedUntil, i.pendingQuestion, i.questionId ?? null, i.lastRunAt ?? null, i.group, i.parentId, i.visitedAt ?? null]);
@@ -110,6 +114,8 @@ export class RemoteAdapter implements Adapter {
     try {
       const init = await this.request("initialize", { protocolVersion: MCP_VERSION, capabilities: {}, clientInfo: { name: "10and2-brain", version: "1" } }, wire);
       if (init?.protocolVersion !== MCP_VERSION) throw new RpcFailure(-32600, `the connector speaks MCP ${init?.protocolVersion}, not ${MCP_VERSION}`);
+      // Saved with the tool list, next.
+      this.state.timeZone = validZone(init?.serverInfo?.timeZone);
       this.notify("notifications/initialized", wire);
       await this.listTools(wire);
       await this.request("resources/subscribe", { uri: WORK_URI }, wire);
@@ -169,6 +175,7 @@ export class RemoteAdapter implements Adapter {
     this.state.actions = ACTIONS.filter((a) => names.includes(a));
     const required = tools.find((t) => t?.name === "start_work")?.inputSchema?.required;
     this.state.names = Array.isArray(required) && !required.includes("title");
+    this.state.firstAsks = names.includes("first_ask");
     this.opts.onSaved?.(this.saved);
   }
 
@@ -248,6 +255,15 @@ export class RemoteAdapter implements Adapter {
   places(): Place[] { return this.state.places.map((p) => ({ ...p })); }
   async report(id: string): Promise<Report> { return (await this.tool("read_report", { id })) as Report; }
   async replies(id: string): Promise<PastReply[]> { return ((await this.tool("past_replies", { id })) as { replies: PastReply[] }).replies; }
+  /** Null from a connector before 0.10.0, which has no `first_ask`. */
+  async firstAsk(id: string): Promise<FirstAsk | null> {
+    if (!this.state.firstAsks) return null;
+    const first = ((await this.tool("first_ask", { id })) as { first?: unknown } | undefined)?.first ?? null;
+    if (!validFirstAsk(first)) throw new Error(`${spoken(this.name)} answered with a first message the app doesn't understand.`);
+    return first;
+  }
+  /** Every item here is on this one machine. */
+  timeZone(): string | null { return this.state.timeZone ?? null; }
 
   /** From what the machine last said: no round trip, so a proposal never waits on the link. Execute checks again. */
   async check(action: Action): Promise<string | null> {

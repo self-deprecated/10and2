@@ -6,10 +6,11 @@ import { tokensOf, type Spent } from "./spend.ts";
 export type Used = Pick<Spent, "model" | "tier" | "input" | "cached" | "cacheWrite" | "output" | "reasoning" | "retries">;
 
 /**
- * `fast`: someone is waiting on it, so it goes through Fast mode (the priority tier), at a higher price. `spent`: given
- * what the call used once it's answered (spend.ts records it); a failed call reports nothing.
+ * `fast`: someone is waiting on it, so it goes through Fast mode (the priority tier), at a higher price. `timeoutMs`:
+ * fail after this long, with no retry, instead of the client's two minutes and one retry. `spent`: given what the call
+ * used once it's answered (spend.ts records it); a failed call reports nothing.
  */
-export type LlmCall = { model: string; effort: "none" | "low" | "medium" | "high"; instructions: string; input: string; fast?: boolean; spent?: (u: Used) => void };
+export type LlmCall = { model: string; effort: "none" | "low" | "medium" | "high"; instructions: string; input: string; fast?: boolean; timeoutMs?: number; spent?: (u: Used) => void };
 
 /** A header the SDK's requests carry only as far as `fetch` below, which strips it: which call a retry belongs to. */
 const TAG = "x-driver-request";
@@ -53,7 +54,7 @@ export function makeLlm(apiKey: string) {
         ...(text ? { text } : {}),
         ...(call.fast ? { service_tier: "priority" as const } : {}),
         store: false,
-      }, { headers: tag.headers });
+      }, { headers: tag.headers, ...(call.timeoutMs ? { timeout: call.timeoutMs, maxRetries: 0 } : {}) });
       try {
         call.spent?.({ model: call.model, tier: res.service_tier ?? (call.fast ? "fast" : "standard"), ...tokensOf(res.usage), retries: tag.retries() });
       } catch {

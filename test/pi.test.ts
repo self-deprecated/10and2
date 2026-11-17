@@ -61,6 +61,39 @@ test("the reply is the active branch's: the parent chain up from the file's last
   assert.equal(report.reply?.messageId, replies[0]!.messageId);
 });
 
+test("a session's start is its header's time, and its first ask the file's first words from the user", async (t) => {
+  const h = harness(t), s = h.session();
+  s.add({ type: "model_change", provider: "mock", modelId: "mock" });
+  const first = s.user("  Improve the screenshot stuff.\n");
+  s.assistant("Done.");
+  s.user("Now the tests."); s.assistant("Tested.");
+  const quiet = h.session(); quiet.add({ type: "session_info", name: "Quiet" });
+  await h.adapter.start();
+  const lines = readFileSync(s.path, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const items = new Map((await h.adapter.list()).map((i) => [i.id, i]));
+  assert.equal(items.get(s.id)?.createdAt, lines[0].timestamp);
+  assert.deepEqual(await h.adapter.firstAsk(s.id), { text: "Improve the screenshot stuff.", at: lines.find((l) => l.id === first).timestamp, complete: true });
+  assert.equal(await h.adapter.firstAsk(quiet.id), null);
+  await assert.rejects(h.adapter.firstAsk(randomUUID()), /isn't visible/);
+});
+
+test("a first ask started with /skill: is the user's words after the skill, or the command; a long one keeps its end", async (t) => {
+  const h = harness(t);
+  // As Pi sends `/skill:review Look at the login flow.`: the skill's whole file, then the user's words.
+  const block = '<skill name="review" location="/home/u/.pi/agent/skills/review/SKILL.md">\nReferences are relative to /home/u/.pi/agent/skills/review.\n\n# Review\n\nRead every changed file.\n</skill>';
+  const withWords = h.session(); withWords.user(`${block}\n\nLook at the login flow.`); withWords.assistant("Looked.");
+  const bare = h.session(); bare.user(block); bare.assistant("Reviewed.");
+  const long = h.session(); long.user(`${"x".repeat(9000)}\nWhy does it fail?`); long.assistant("Because.");
+  await h.adapter.start();
+  const items = new Map((await h.adapter.list()).map((i) => [i.id, i]));
+  assert.equal((await h.adapter.firstAsk(withWords.id))?.text, "Look at the login flow.");
+  assert.equal(items.get(withWords.id)?.title, "Look at the login flow.");
+  assert.equal((await h.adapter.firstAsk(bare.id))?.text, "/skill:review");
+  const cut = (await h.adapter.firstAsk(long.id))!.text;
+  assert.equal(cut.length, 8000);
+  assert.ok(cut.startsWith("xxx") && cut.endsWith("\nWhy does it fail?"));
+});
+
 test("a big session is read incrementally, and a new entry updates it", async (t) => {
   const h = harness(t), s = h.completed();
   s.add({ type: "custom", customType: "blob", data: { pad: "x".repeat(200_000) } });
