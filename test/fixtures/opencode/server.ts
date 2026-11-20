@@ -1,7 +1,8 @@
 // A fake OpenCode server: the v1 routes the adapter uses, writing to a synthetic database (db.ts) as OpenCode would.
 // Scriptable through `state`: what's busy, open questions and permission requests, whether a prompt is taken (and
 // recorded) at all, and the agents' rules. Serves on a unix socket (a TUI as the plugin announces it) or on TCP (a
-// TUI started with --port, or Driver's own `opencode serve`, via fake-opencode.ts).
+// TUI as the plugin announces it on Windows, a TUI started with --port, or Driver's own `opencode serve`, via
+// fake-opencode.ts).
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { FakeDb } from "./db.ts";
@@ -16,7 +17,7 @@ export type State = {
   /** The assistant's reply to a prompt: "ACK <words>" by default; null for none (a busy session that queued it). */
   reply: ((text: string) => string | null) | null;
   agents: { name: string; mode: string; permission: unknown[] }[];
-  /** Required Basic auth, when set. */
+  /** The Authorization header it requires, when set (OpenCode's Basic password, or the plugin's token on Windows). */
   auth: string | null;
 };
 

@@ -2,22 +2,25 @@
 // process, so the turn carries on if the connector stops. It runs `pi --mode rpc` (10 & 2's Pi extension registers it
 // like any open Pi, so Driver can steer it meanwhile), sends the user's words, and stops Pi once it settles: nothing
 // keeps the session open afterwards, and a Pi the user opens later doesn't collide with it.
-import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { ChildProcessByStdio } from "node:child_process";
 import type { Readable, Writable } from "node:stream";
+import { spawnCommand, which } from "../command.ts";
 
 /**
- * What to run, read as one JSON line on stdin (so the words never show in a process list). `session`: the file of a
- * session to continue (a path works from any folder). `sessionId` (and `name`): new work under that id.
+ * What to run, read as one JSON line on stdin (so the words never show in a process list). `pi`: the command that runs
+ * Pi, as its program and any arguments before Pi's own. `session`: the file of a session to continue (a path works from
+ * any folder). `sessionId` (and `name`): new work under that id.
  */
-export type Turn = { pi: string; cwd: string; message: string; session?: string; sessionId?: string; name?: string };
+export type Turn = { pi: string[]; cwd: string; message: string; session?: string; sessionId?: string; name?: string };
 
 /** The exit code when Pi couldn't be started at all: nothing was sent. */
 export const NOT_STARTED = 127;
 
+/** Pi's own arguments. The title isn't among them: it's sent with the words, so nothing the user said is on a command line. */
 export function turnArgs(turn: Turn): string[] {
   if (turn.session) return ["--mode", "rpc", "--session", turn.session];
   if (!turn.sessionId) throw new Error("pi-turn needs a session or a session id");
-  return ["--mode", "rpc", "--session-id", turn.sessionId, ...(turn.name ? ["--name", turn.name] : [])];
+  return ["--mode", "rpc", "--session-id", turn.sessionId];
 }
 
 /**
@@ -26,6 +29,16 @@ export function turnArgs(turn: Turn): string[] {
  */
 export const promptText = (message: string) => message.startsWith("/") ? ` ${message}` : message;
 
+/**
+ * Whether `command` can be run without looking in the project's folder for it. Windows looks for a bare name in the
+ * current folder before PATH, and Pi runs in the project's, so there a name that isn't on PATH isn't run at all.
+ */
+export const startable = (command: string, env: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform) =>
+  platform !== "win32" || which(command, env, platform) !== null;
+
+const isTurn = (t: any): t is Turn => !!t && Array.isArray(t.pi) && t.pi.length > 0 && t.pi.every((a: unknown) => typeof a === "string")
+  && typeof t.cwd === "string" && typeof t.message === "string";
+
 /** Reads the turn from `input`, runs it, and resolves with the exit code: Pi's own, or NOT_STARTED. */
 export async function runPiTurn(input: NodeJS.ReadableStream = process.stdin): Promise<number> {
   let text = "";
@@ -33,13 +46,20 @@ export async function runPiTurn(input: NodeJS.ReadableStream = process.stdin): P
   let turn: Turn;
   try {
     turn = JSON.parse(text);
-    if (typeof turn.pi !== "string" || typeof turn.cwd !== "string" || typeof turn.message !== "string") throw new Error("bad turn");
+    // The previous release named Pi as one string. A connector of that release still running after an update runs this
+    // newer runner, so its turns are taken as they are.
+    if (typeof (turn as any)?.pi === "string") turn.pi = [(turn as any).pi];
+    if (!isTurn(turn)) throw new Error("bad turn");
   } catch { return 64; }
+  // Driver's headless run: nobody sits at a picker the extension would show (extensions/pi/10and2.ts).
+  const env = { ...process.env, TENANDTWO_PI_HEADLESS: "1" };
+  const [command, ...prefix] = turn.pi as [string, ...string[]];
+  if (!startable(command, env)) return NOT_STARTED;
   return new Promise<number>((resolve) => {
     let child: ChildProcessByStdio<Writable, Readable, null>;
     try {
-      // Driver's headless run: nobody sits at a picker the extension would show (extensions/pi/10and2.ts).
-      child = spawn(turn.pi, turnArgs(turn), { cwd: turn.cwd, stdio: ["pipe", "pipe", "ignore"], env: { ...process.env, TENANDTWO_PI_HEADLESS: "1" } });
+      // No console window on Windows (spawnCommand), which this detached runner would otherwise open for Pi.
+      child = spawnCommand(command, [...prefix, ...turnArgs(turn)], { cwd: turn.cwd, stdio: ["pipe", "pipe", "ignore"], env }) as ChildProcessByStdio<Writable, Readable, null>;
     } catch { resolve(NOT_STARTED); return; }
     let started = false, done = false;
     const end = () => { if (!done) { done = true; child.stdin.end(); } };
@@ -65,6 +85,9 @@ export async function runPiTurn(input: NodeJS.ReadableStream = process.stdin): P
       }
       if (buf.length > 64 * 1024 * 1024) buf = Buffer.alloc(0);
     });
+    // New work's title, before its first words, as `--name` would have set it (Pi takes commands in the order sent; in
+    // its RPC since 0.50.4). A title it refuses (blank) leaves the session unnamed, and the words go ahead regardless.
+    if (turn.sessionId && !turn.session && turn.name) send({ id: "name", type: "set_session_name", name: turn.name });
     send({ id: "turn", type: "prompt", message: promptText(turn.message) });
   });
 }

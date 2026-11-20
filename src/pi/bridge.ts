@@ -12,37 +12,67 @@ export type Live = {
   prompt: { kind: string; title: string | null; since: string | null } | null;
   /** Questions the extension asked that Driver can answer. */
   questions: Question[];
-  socket: string; updatedAt: string | null;
+  /** Where it listens, or null for a Pi 10 & 2 mustn't talk to (on Windows, one whose pid refuses the check). */
+  socket: string | null; updatedAt: string | null;
 };
 
 /** Pi's session ids: letters, digits, `.`, `_` and `-` (`--session-id`); UUIDs by default. */
 export const piSessionId = (id: unknown): id is string => typeof id === "string" && /^[A-Za-z0-9_-][A-Za-z0-9._-]{0,199}$/.test(id);
 const str = (v: unknown, max = 2000) => typeof v === "string" ? v.slice(0, max) : null;
 
-function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+/**
+ * The pipe the extension listens on in a Windows Pi, a fresh name each time. Nothing else is taken: a registry entry
+ * naming `\\server\pipe\…` would send the user's words, and their Windows sign-in, to another machine.
+ */
+export const PI_PIPE = /^\\\\\.\\pipe\\10and2-pi-[0-9a-f-]{36}$/i;
+
+/**
+ * Where an open Pi listens, from its registry entry in `dir`, or null when there's nothing to reach. On Windows it's the
+ * pipe the entry names, if it's of the extension's own form (checking that a pipe exists connects to it, so the live pid
+ * is the check). Elsewhere it's always the socket file beside the entry, whatever the entry says.
+ */
+function piSocket(dir: string, id: string, recorded: unknown, platform: NodeJS.Platform): string | null {
+  if (platform === "win32") return typeof recorded === "string" && PI_PIPE.test(recorded) ? recorded : null;
+  const socket = join(dir, `${id}.sock`);
+  return existsSync(socket) ? socket : null;
 }
 
-/** The open Pis, by session: entries whose process is alive and whose socket is there. Anything malformed is left out. */
-export function readRegistry(agentDir: string): Map<string, Live> {
+/**
+ * Whether an entry's Pi is running. On Windows a pid that refuses the check (EPERM) is "unreachable": a Pi run as
+ * administrator, or another account's process that got a closed Pi's pid (Windows hands pids out again quickly). Its
+ * pipe may be the other account's, so nothing is sent there; but its session may be open, and a headless turn on it
+ * would split it into branches, so it isn't taken for closed either.
+ */
+function running(pid: number, platform: NodeJS.Platform): "yes" | "no" | "unreachable" {
+  try { process.kill(pid, 0); return "yes"; }
+  catch (e) { return (e as NodeJS.ErrnoException).code !== "EPERM" ? "no" : platform === "win32" ? "unreachable" : "yes"; }
+}
+
+/**
+ * The open Pis, by session: entries whose process is alive and whose socket is there, and on Windows those that can't
+ * be reached, with no socket and nothing they ask (what they say can't be checked). Anything malformed is left out.
+ */
+export function readRegistry(agentDir: string, platform: NodeJS.Platform = process.platform): Map<string, Live> {
   const dir = join(agentDir, "10and2"), out = new Map<string, Live>();
   let files: string[];
   try { files = readdirSync(dir); } catch { return out; }
   for (const file of files) {
     if (!file.endsWith(".json")) continue;
-    const id = file.slice(0, -5), socket = join(dir, `${id}.sock`);
+    const id = file.slice(0, -5);
     try {
       const r = JSON.parse(readFileSync(join(dir, file), "utf8"));
       if (!piSessionId(id) || r.sessionId !== id || !Number.isInteger(r.pid) || r.pid <= 0 || typeof r.cwd !== "string" || !isAbsolute(r.cwd)) continue;
-      if (!alive(r.pid) || !existsSync(socket)) continue;
-      const questions: Question[] = Array.isArray(r.questions) ? r.questions.flatMap((q: any) => typeof q?.questionId === "string" && typeof q.title === "string"
+      const state = running(r.pid, platform);
+      if (state === "no") continue;
+      const socket = state === "yes" ? piSocket(dir, id, r.socket, platform) : null;
+      if (state === "yes" && !socket) continue;
+      const questions: Question[] = socket && Array.isArray(r.questions) ? r.questions.flatMap((q: any) => typeof q?.questionId === "string" && typeof q.title === "string"
         ? [{ questionId: q.questionId, title: q.title.slice(0, 2000), options: Array.isArray(q.options) ? q.options.filter((o: unknown) => typeof o === "string").map((o: string) => o.slice(0, 500)) : [] }] : []) : [];
       out.set(id, {
         sessionId: id, sessionFile: typeof r.sessionFile === "string" && isAbsolute(r.sessionFile) ? r.sessionFile : null, cwd: r.cwd,
         name: str(r.name, 500), pid: r.pid, mode: str(r.mode, 20),
-        status: ["idle", "busy", "waiting"].includes(r.status) ? r.status : "idle",
-        prompt: r.prompt && typeof r.prompt === "object" ? { kind: str(r.prompt.kind, 50) ?? "dialog", title: str(r.prompt.title), since: str(r.prompt.since, 50) } : null,
+        status: socket && ["idle", "busy", "waiting"].includes(r.status) ? r.status : "idle",
+        prompt: socket && r.prompt && typeof r.prompt === "object" ? { kind: str(r.prompt.kind, 50) ?? "dialog", title: str(r.prompt.title), since: str(r.prompt.since, 50) } : null,
         questions, socket, updatedAt: str(r.updatedAt, 50),
       });
     } catch { /* Being rewritten, or not one of ours: the next scan reads it again. */ }

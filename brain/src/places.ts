@@ -72,17 +72,25 @@ export function placeParts(p: Place): { project: string; machine: string | null;
 
 /**
  * What a new thread uses when the user doesn't say (Settings → New threads on the phone, sent with each call): a project
- * as `placeParts` gives it, a machine, a coding app. Null: not set, so Driver asks, as before.
+ * as `placeParts` gives it, a machine, a coding app, and a coding model as `GET /api/places` lists it, its name and its
+ * provider (used wherever the place offers one of that name: thread-models.ts `defaultModel`). The model a new thread's
+ * coding agent runs on, never 10 & 2's own (models.ts), so named `coding…` throughout. Null: not set, so Driver asks, as
+ * before (the model: the coding app's own). The coding model may be missing where one is written out by hand
+ * (eval/run.ts): not set.
  */
-export type NewThreadDefaults = { project: string | null; machine: string | null; app: App | null };
-export const NO_DEFAULTS: NewThreadDefaults = { project: null, machine: null, app: null };
-export const hasDefaults = (d: NewThreadDefaults) => d.project !== null || d.machine !== null || d.app !== null;
+export type NewThreadDefaults = { project: string | null; machine: string | null; app: App | null; codingModel?: string | null; codingProvider?: string | null };
+export const NO_DEFAULTS: NewThreadDefaults = { project: null, machine: null, app: null, codingModel: null, codingProvider: null };
+export const hasDefaults = (d: NewThreadDefaults) => d.project !== null || d.machine !== null || d.app !== null || (d.codingModel ?? null) !== null;
 
-/** The phone's `newThreadDefaults`, each part a short string (an app one of `APPS`) or not set. An older phone sends none. */
+/**
+ * The phone's `newThreadDefaults`, each part a short string (an app one of `APPS`) or not set; a provider only with the
+ * model it serves. An older phone sends none.
+ */
 export function newThreadDefaultsOf(v: unknown): NewThreadDefaults {
   const o = v && typeof v === "object" ? (v as Record<string, unknown>) : {};
   const text = (s: unknown) => (typeof s === "string" && s.trim() && s.trim().length <= 100 ? s.trim() : null);
-  return { project: text(o.project), machine: text(o.machine), app: Object.hasOwn(APPS, String(o.app)) ? (o.app as App) : null };
+  const codingModel = text(o.codingModel);
+  return { project: text(o.project), machine: text(o.machine), app: Object.hasOwn(APPS, String(o.app)) ? (o.app as App) : null, codingModel, codingProvider: codingModel && text(o.codingProvider) };
 }
 
 /** Whether `said` names one of `names`, as whole words. */

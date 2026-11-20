@@ -1,13 +1,15 @@
 // Which coding agents are on this computer, for setup and `10and2 agents`: installed or not, their version, how many
 // sessions they have from the last two weeks, and how many are open now. Read cheaply from their own files, without
 // starting anything; a number that can't be told is left out rather than guessed.
-import { execFile } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { execFileCommand, which } from "./command.ts";
 import type { Agent } from "./policy.ts";
 import { openCodeCounts } from "./opencode/index.ts";
 import { countSessions } from "./codex/adapter.ts";
+import { piAgentDir } from "./pi/extension.ts";
+import { t3Home } from "./t3/adapter.ts";
 
 export type Found = { agent: Agent; name: string; installed: boolean; version: string | null; sessions: number | null; open: number | null };
 
@@ -16,13 +18,23 @@ export const NAMES: Record<Agent, string> = { claude: "Claude Code", codex: "Cod
 export const ORDER: readonly Agent[] = ["claude", "codex", "pi", "opencode", "t3"];
 const RECENT_MS = 14 * 86_400_000;
 
-function onPath(bin: string): Promise<string | null> {
+/**
+ * The version a command on PATH says it is: "" when it answers without one, null when it isn't there. Found first, so a
+ * program of that name in the current folder is never run (Windows would look there before PATH). Windows starts a
+ * Node-based command (`codex.cmd`) several times slower, and scans it, so it has longer to answer there.
+ */
+function onPath(bin: string, env: NodeJS.ProcessEnv): Promise<string | null> {
+  if (!which(bin, env)) return Promise.resolve(null);
   return new Promise((resolve) => {
-    execFile(bin, ["--version"], { timeout: 4000, maxBuffer: 256 * 1024 }, (err, stdout) => {
-      if (err && (err as NodeJS.ErrnoException).code === "ENOENT") return resolve(null);
-      const v = /\d+\.\d+(?:\.\d+)?(?:[-+.][\w.]+)?/.exec(String(stdout ?? ""))?.[0];
-      resolve(v ?? (err ? null : ""));
-    });
+    // Windows refuses some programs at once, with a throw rather than an error (an .exe whose install step didn't run,
+    // left as a stub, is EFTYPE): one that won't start is as good as none.
+    try {
+      execFileCommand(bin, ["--version"], { timeout: process.platform === "win32" ? 10_000 : 4000, maxBuffer: 256 * 1024, env }, (err, stdout) => {
+        if (err && (err as NodeJS.ErrnoException).code === "ENOENT") return resolve(null);
+        const v = /\d+\.\d+(?:\.\d+)?(?:[-+.][\w.]+)?/.exec(String(stdout ?? ""))?.[0];
+        resolve(v ?? (err ? null : ""));
+      });
+    } catch { resolve(null); }
   });
 }
 
@@ -54,10 +66,11 @@ export async function detect(env: NodeJS.ProcessEnv = process.env): Promise<Foun
   const home = homedir();
   const claudeDir = env.CLAUDE_CONFIG_DIR || join(home, ".claude");
   const codexHome = env.CODEX_HOME || join(home, ".codex");
-  const piDir = env.PI_CODING_AGENT_DIR || join(home, ".pi", "agent");
+  const piDir = piAgentDir(env);
   const opencodeData = join(env.XDG_DATA_HOME || join(home, ".local", "share"), "opencode");
   const oc = (() => { try { return openCodeCounts(opencodeData); } catch { return null; } })();
-  const [claude, codex, pi, opencode, t3] = await Promise.all(["claude", "codex", "pi", "opencode", env.T3_CLI ?? "t3"].map(onPath));
+  const t3Cli = env.T3_CLI ?? "t3";
+  const [claude, codex, pi, opencode, t3] = await Promise.all(["claude", "codex", "pi", "opencode", t3Cli].map((bin) => onPath(bin, env)));
   const found: Found[] = [
     { agent: "claude", name: NAMES.claude, installed: claude !== null || existsSync(join(claudeDir, "projects")), version: claude || null,
       sessions: recentFiles(join(claudeDir, "projects"), /\.jsonl$/, 1), open: liveRegistries(join(claudeDir, "sessions")) },
@@ -66,7 +79,9 @@ export async function detect(env: NodeJS.ProcessEnv = process.env): Promise<Foun
     { agent: "pi", name: NAMES.pi, installed: pi !== null || existsSync(join(piDir, "sessions")), version: pi || null,
       sessions: recentFiles(join(piDir, "sessions"), /\.jsonl$/, 1), open: liveRegistries(join(piDir, "10and2")) },
     { agent: "opencode", name: NAMES.opencode, installed: opencode !== null || existsSync(opencodeData), version: opencode || null, sessions: oc?.sessions ?? null, open: oc?.open ?? null },
-    { agent: "t3", name: NAMES.t3, installed: t3 !== null, version: t3 || null, sessions: null, open: null },
+    // A `t3` that didn't answer in time (T3's desktop app starts its own as Node, slowly on Windows) still counts where
+    // T3 has run. Never without one: the connector reaches T3 through it, and stops when it can't.
+    { agent: "t3", name: NAMES.t3, installed: t3 !== null || (existsSync(join(t3Home(env), "userdata")) && which(t3Cli, env) !== null), version: t3 || null, sessions: null, open: null },
   ];
   return ORDER.map((a) => found.find((f) => f.agent === a)!);
 }

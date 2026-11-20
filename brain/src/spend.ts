@@ -25,15 +25,16 @@ export const TOKEN_PRICES: Record<string, ModelPrice> = {
 };
 
 /** The voice model: dollars per minute, billed per second (at least 15 s a session, which its own count includes). */
-export const VOICE_PRICES: Record<string, number> = { "gpt-live-1": 0.05 };
+export const VOICE_PRICES: Record<string, number> = { "gpt-live-1.1": 0.05, "gpt-live-1": 0.05 };
 
 /**
  * Speech: dollars per minute of audio made. The provider prices it by tokens ($0.60 per million text tokens in, $12 per
  * million audio tokens out) and puts that at about $0.015 a minute; its audio tokens aren't returned, so the minute is
  * measured from the audio itself (`aacSeconds`). Without that, by characters: about 900 a minute (billing.md: 60
- * characters are about 4 s of speech).
+ * characters are about 4 s of speech). The Realtime engine's audio out is $20 per million tokens, 1,200 a minute, with
+ * a little text and reasoning: $0.025 a minute in spike S0 (reading-engine.md), measured from its PCM.
  */
-export const SPEECH_PRICES: Record<string, number> = { "gpt-4o-mini-tts": 0.015 };
+export const SPEECH_PRICES: Record<string, number> = { "gpt-4o-mini-tts": 0.015, "gpt-realtime-2.1-mini": 0.025 };
 export const SPEECH_CHARS_PER_MINUTE = 900;
 
 /** Every operation that pays the provider (cloud/src/costs.ts names the same, with how each is metered). */

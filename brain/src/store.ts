@@ -47,18 +47,21 @@ export type Proposal = {
   targets: ProposalTarget[];
   /**
    * `draftId`: a reply the user dictated on the phone (drafts.ts), sent as `message`. A `start_work` has no targets: it
-   * starts `title` in place `placeId` (said `place`) with `profile`, and once started, `itemId` is its new thread.
-   * `keptId`: a reply kept for later, sent by this. `confirm`: how the user must agree to it (proposals.ts `Level`);
-   * none (a proposal made before levels): the readback heard, then a yes.
+   * starts `title` in place `placeId` (said `place`) with `profile`, on `model` when one was chosen (its id, sent as is
+   * on every try, and its name, with the provider the readback says with it, if any; `said`: the user named it, rather
+   * than Settings), and once started, `itemId` is its new thread. `keptId`: a reply kept for later, sent by this.
+   * `confirm`: how the user must agree to it (proposals.ts `Level`); none (a proposal made before levels): the readback
+   * heard, then a yes.
    */
-  fields: { message?: string; until?: string; draftId?: string; placeId?: string; place?: string; title?: string; profile?: LaunchProfile; itemId?: string; target?: string; keptId?: string; confirm?: "none" | "yes" | "readback" | "tap"; /** Carried out by the brain on the user's spoken yes (`VoiceSession.yesHeard`). */ heardYes?: boolean; /** The user's first answer to its readback was a yes or a keep (`VoiceSession.answered`). */ answered?: boolean };
+  fields: { message?: string; until?: string; draftId?: string; placeId?: string; place?: string; title?: string; profile?: LaunchProfile; model?: { id: string; name: string; said: boolean; provider?: string; /** The user named its provider. */ named?: boolean }; itemId?: string; target?: string; keptId?: string; confirm?: "none" | "yes" | "readback" | "tap"; /** Carried out by the brain on the user's spoken yes (`VoiceSession.yesHeard`). */ heardYes?: boolean; /** The user's first answer to its readback was a yes or a keep (`VoiceSession.answered`). */ answered?: boolean };
   readback: string;
   /**
    * What the user must have heard: for each group, at least `need` of its words, spoken after `from`; or, with `head`,
-   * the readback's action and names word for word, then perhaps `where` (the project), followed by `next` (or a clause
-   * break when null), with "the thread called" allowed before the name where `named` says it starts. See `saysHead`.
+   * the readback's action and names word for word, then perhaps `where` (the project), then each of `clauses` (a new
+   * thread's profile and model) unless it's optional, followed by `next` (or a clause break when null), with "the thread
+   * called" allowed before the name where `named` says it starts. See `saysHead`.
    */
-  mustHear: { words: string[]; need: number; from: number; head?: string[]; named?: number; where?: string[]; next?: string | string[] | null; message?: string; sequence?: string[] }[];
+  mustHear: { words: string[]; need: number; from: number; head?: string[]; named?: number; where?: string[]; clauses?: { words: string[]; optional: boolean }[]; next?: string | string[] | null; message?: string; sequence?: string[] }[];
   /** Offset into the conversation's assistant transcript when this proposal was made. */
   createdFrom: number;
   expiresAt: number;

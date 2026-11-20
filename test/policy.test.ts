@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, symlinkSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { allows, answers, ceilingFor, parsePolicy, steers, visible, withinCeiling } from "../src/policy.ts";
+import { allows, answers, ceilingFor, loadPolicy, parsePolicy, steers, visible, withinCeiling } from "../src/policy.ts";
 
 const base = { brain: "wss://brain.example/connector" };
 
@@ -26,6 +26,18 @@ test("a folder makes itself and what's inside it visible, and nothing beside it"
   assert.equal(visible(p, join(root, "workshop")), false);
   assert.equal(visible(p, root), false);
   assert.equal(visible(p, null), false);
+});
+
+test("on Windows a folder's case doesn't matter, and a folder beside it is still not inside it", () => {
+  const root = mkdtempSync(join(tmpdir(), "policy-"));
+  mkdirSync(join(root, "Work", "a"), { recursive: true });
+  mkdirSync(join(root, "Workshop"), { recursive: true });
+  const p = parsePolicy(JSON.stringify({ ...base, projects: [join(root, "work")] }));
+  assert.equal(visible(p, join(root, "Work", "a"), "win32"), true);
+  assert.equal(visible(p, join(root, "WORK"), "win32"), true);
+  assert.equal(visible(p, join(root, "Workshop"), "win32"), false);
+  // Linux's folders are told apart by case.
+  if (process.platform === "linux") assert.equal(visible(p, join(root, "Work", "a"), "linux"), false);
 });
 
 test("a symlink inside a visible folder that points outside it isn't visible", () => {
@@ -129,4 +141,12 @@ test("agents: each on or off, or narrowed; the older top-level booleans still re
   assert.throws(() => parsePolicy(JSON.stringify({ brain, agents: { cursor: true } })), /no agent called "cursor"/);
   assert.throws(() => parsePolicy(JSON.stringify({ brain, agents: { claude: { steer: "no" } } })), /agents.claude.steer must be true or false/);
   assert.throws(() => parsePolicy(JSON.stringify({ brain, agents: { t3: false, claude: false } })), /every coding agent is off/);
+});
+
+test("a policy saved by Windows PowerShell (a byte-order mark, or UTF-16) is read as the JSON it is", () => {
+  const dir = mkdtempSync(join(tmpdir(), "policy-"));
+  const json = JSON.stringify({ ...base, actions: ["settle"] });
+  writeFileSync(join(dir, "bom.json"), "\uFEFF" + json);
+  writeFileSync(join(dir, "utf16.json"), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(json, "utf16le")]));
+  for (const f of ["bom.json", "utf16.json"]) assert.deepEqual(loadPolicy(join(dir, f)).actions, ["settle"], f);
 });

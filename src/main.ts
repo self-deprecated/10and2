@@ -2,32 +2,34 @@
 // 10and2: the connector. Credentials and backend code live here, on the machine doing the work; the brain holds only
 // a hash of this machine's credential.
 import { createHash, randomBytes } from "node:crypto";
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { Credentials, installed, parseCredential, run as runCommand, type Store } from "./credential.ts";
+import { Credentials, parseCredential, run as runCommand, type Store } from "./credential.ts";
+import { spawnCommand, which } from "./command.ts";
 import { Ledger } from "./ledger.ts";
 import { Link } from "./link.ts";
 import { Local } from "./local.ts";
 import { Expired, linkUrl, originOf, pair } from "./pair.ts";
 import { configDirectory, hookSocket, stateDirectory } from "./paths.ts";
 import { addMachine, brainDb, brainEnvPath, brainOrigin, brainPort, DEFAULT_PORT, machines, readBrainEnv, removeMachine, validName, writeBrainEnv } from "./brain.ts";
-import { AGENTS, type Agent, defaultPolicyPath, loadPolicy, parsePolicy, validBase, visible } from "./policy.ts";
+import { AGENTS, type Agent, defaultPolicyPath, loadPolicy, parsePolicy, readSettings, validBase, visible } from "./policy.ts";
 import { describeFound, detect, NAMES, ORDER, type Found } from "./agents.ts";
 import { versionWarning } from "./versions.ts";
 import { applyChoice, applyFlags, capsFor, CAP_SHORT, CEILING_LABEL, chooseInteractively, choiceOf, startingChoice, summary, type Choice } from "./choose.ts";
 import { VERSION } from "./protocol.ts";
-import { BRAIN, Service } from "./service.ts";
+import { BRAIN, CONNECTOR, connectorRunning, launchFor, Service, type ServiceState } from "./service.ts";
+import { pidState } from "./claude/registry.ts";
+import { loginService, stopLikeSigterm } from "./supervisor.ts";
 import { T3Adapter } from "./t3/adapter.ts";
-import { ClaudeAdapter, hooksStatus, installHooks, relayHook, uninstallHooks } from "./claude/index.ts";
+import { ClaudeAdapter, hooksStatus, hooksUnavailable, installHooks, relayHook, uninstallHooks } from "./claude/index.ts";
 import { CodexAdapter, defaultCodexHome } from "./codex/adapter.ts";
 import { PiAdapter } from "./pi/adapter.ts";
 import { installPiExtension, piAgentDir, piExtensionStatus, uninstallPiExtension } from "./pi/extension.ts";
 import { runPiTurn } from "./pi/turn.ts";
 import { installOpenCodePlugin, OpenCodeAdapter, openCodePluginStatus, uninstallOpenCodePlugin } from "./opencode/index.ts";
-import { describe } from "./util.ts";
+import { describe, replaceFile } from "./util.ts";
 import { accent, ago, ask, bad, bold, Cancelled, cmd, confirm, dim, keys, note, ok, say, secret, spinner, warn } from "./ui.ts";
 
 const DEFAULT_ORIGIN = "https://10and2.selfdep.com";
@@ -92,6 +94,7 @@ const TAKES: Record<string, { words: number; flags: string[] }> = {
   pi: { words: 1, flags: [] },
   opencode: { words: 1, flags: [] },
   "pi-turn": { words: 0, flags: [] },
+  "login-service": { words: 1, flags: [] },
   brain: { words: 3, flags: ["port", "code", "name", "yes", "no-autostart", ...CHOOSING] },
   token: { words: 0, flags: [] },
 };
@@ -127,6 +130,12 @@ try {
     case "pi": piCommand(); break;
     case "opencode": await openCodeCommand(); break;
     case "pi-turn": process.exitCode = await runPiTurn(); break; // the connector runs this; it must stay silent
+    // Windows runs this at login (service.ts runEntry); it must stay silent.
+    case "login-service": {
+      const job = [CONNECTOR, BRAIN].find((j) => j.name === sub);
+      if (job) await loginService(job); else process.exitCode = 64;
+      break;
+    }
     case "brain": await brain(); break;
     case "token": {
       const token = randomBytes(32).toString("base64url");
@@ -149,19 +158,33 @@ try {
 function readPolicyFile(): any | null {
   const path = defaultPolicyPath();
   if (!existsSync(path)) return null;
-  try { return JSON.parse(readFileSync(path, "utf8")); } catch { throw new Error(`${path} isn't JSON; fix or remove it, then run setup again.`); }
+  try { return JSON.parse(readSettings(path)); } catch { throw new Error(`${path} isn't JSON; fix or remove it, then run setup again.`); }
 }
 function writePrivate(path: string, text: string) {
   mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, text, { mode: 0o600 });
-  renameSync(tmp, path);
+  replaceFile(tmp, path);
 }
-function where(s: Store) { return s === "keychain" ? "your login Keychain" : s === "libsecret" ? "your keyring (libsecret)" : `${join(configDirectory(), "credentials.json")} (only you can read it)`; }
+function where(s: Store) {
+  const file = join(configDirectory(), "credentials.json");
+  return s === "keychain" ? "your login Keychain" : s === "libsecret" ? "your keyring (libsecret)" : s === "dpapi" ? `${file} (encrypted for your Windows account)` : `${file} (only you can read it)`;
+}
 function openBrowser(url: string) {
-  const opener = process.platform === "darwin" ? "open" : process.platform === "linux" ? "xdg-open" : null;
-  if (!opener) return;
-  try { spawn(opener, [url], { stdio: "ignore", detached: true }).on("error", () => {}).unref(); } catch { /* the URL is printed anyway */ }
+  // On Windows its own handler for a link (rundll32), run without a shell, so the `&` in a URL is never read as a
+  // command. Each is found on PATH first, so one of that name in the current folder never runs.
+  const [opener, ...args] = process.platform === "darwin" ? ["open", url] : process.platform === "linux" ? ["xdg-open", url]
+    : process.platform === "win32" ? ["rundll32", "url.dll,FileProtocolHandler", url] : [];
+  if (!opener || !which(opener)) return;
+  // Not hidden: rundll32 passes its window's state on to a browser it starts, which would then open with no window.
+  try { spawnCommand(opener, args, { stdio: "ignore", detached: true, windowsHide: false }).on("error", () => {}).unref(); } catch { /* the URL is printed anyway */ }
+}
+/**
+ * Said when a job set to start at login wasn't started now, from a terminal run as administrator; `again` starts it.
+ * Signing in again is said first: with the built-in Administrator account, or UAC off, every terminal runs as one.
+ */
+function startsAtSignIn(...again: string[]) {
+  warn(`Starts at your next sign-in, not now: this terminal runs as administrator. To start it sooner, sign out and back in, or run ${words(again.map(cmd))} in a terminal that isn't run as administrator.`);
 }
 
 async function setup() {
@@ -196,7 +219,7 @@ async function setup() {
   } else ok(`Approved ${dim(`· its key is in ${store === "file" ? "a file only you can read" : where(store)}`)}`);
   await offerHelpers(choice);
 
-  const started = await startAtLogin(new Service(), "Keep it connected, starting at login?");
+  const started = (await startAtLogin(new Service(), "Keep it connected, starting at login?", "10and2 autostart on"))?.running === true;
   // A brain of your own accepts this computer only once it's been added there.
   if (started && !byToken) await connected(origin, credential);
   else if (!started) note(`To connect: ${cmd("10and2 run")} in a terminal you keep open, or ${cmd("10and2 autostart on")}.`);
@@ -217,7 +240,11 @@ async function chooseAgents(again: string, existing: any | null): Promise<{ foun
   }
   let choice = applyFlags(startingChoice(existing, found), flags);
   if (!flags.has("yes") && process.stdin.isTTY && process.stdout.isTTY) choice = await chooseInteractively(found, choice);
-  else for (const f of found) (f.installed && choice.on[f.agent] ? ok : note)(f.installed && choice.on[f.agent] ? `${f.name} ${dim(`· ${describeFound(f)}`)}` : dim(`${f.name} ${f.installed ? "· off" : "not found"}`));
+  else {
+    // Git Bash's own window (mintty) gives a program pipes, not a terminal, so nothing can be asked there.
+    if (!flags.has("yes") && process.platform === "win32" && process.env.MSYSTEM) warn(`Git Bash can't show the choices here, so the defaults apply. To choose, run ${cmd(again)} in PowerShell or Windows Terminal.`);
+    for (const f of found) (f.installed && choice.on[f.agent] ? ok : note)(f.installed && choice.on[f.agent] ? `${f.name} ${dim(`· ${describeFound(f)}`)}` : dim(`${f.name} ${f.installed ? "· off" : "not found"}`));
+  }
   if (!AGENTS.some((a) => choice.on[a])) throw new Error(`Every coding agent is switched off, so there's nothing to connect. Run ${cmd(again)} again and switch one on.`);
   warnOld(found.filter((f) => choice.on[f.agent]));
   return { found, choice };
@@ -262,13 +289,22 @@ async function machineName() {
   return name;
 }
 
-/** Offers to start a job at login (unless --no-autostart); whether it's running now. */
-async function startAtLogin(service: Service, question: string) {
-  if (flags.has("no-autostart") || !service.supported || !await confirm(question, true)) return false;
-  const s = await service.install(launch());
-  if (s.running) ok("Starts at login");
+/**
+ * Offers to start a job at login (unless --no-autostart): what installing it gave, or null when it wasn't installed.
+ * `again` are the commands that start it now (and whatever is installed after it) when a terminal run as administrator didn't.
+ */
+async function startAtLogin(service: Service, question: string, ...again: string[]): Promise<ServiceState | null> {
+  if (flags.has("no-autostart") || !service.supported) return null;
+  // Run through npx on Windows, there's no 10and2 for Windows to start at login: not asked, and said why.
+  const l = launch();
+  const why = service.unavailable(l);
+  if (why) { note(why); return null; }
+  if (!await confirm(question, true)) return null;
+  const s = await service.install(l);
+  if (s.elevated) startsAtSignIn(...again);
+  else if (s.running) ok("Starts at login");
   else warn(`Installed at ${s.where}, but it isn't running: see ${s.logs}`);
-  return s.running;
+  return s;
 }
 
 function canDo(policy: any, choice: Choice, found: Found[]) {
@@ -310,7 +346,9 @@ async function offerHelpers(choice: Choice) {
   const wants = (a: Agent) => choice.on[a] && choice.caps.follow_up && !(choice.off[a] ?? []).includes("follow_up");
   const helpers: { name: string; add: () => Promise<void>; undo: string }[] = [];
   if (wants("claude") && !(await hooksStatus(claudeDir()).catch(() => null))?.installed) {
-    helpers.push({ name: "Claude Code hooks", undo: "10and2 hooks uninstall", add: () => installHooks(claudeDir(), process.env.TENANDTWO_COMMAND || "10and2") });
+    const unavailable = hooksUnavailable(claudeDir());
+    if (unavailable) note(dim(unavailable));
+    else helpers.push({ name: "Claude Code hooks", undo: "10and2 hooks uninstall", add: () => installHooks(claudeDir(), process.env.TENANDTWO_COMMAND || "10and2") });
   }
   if (wants("pi") && piExtensionStatus(piAgentDir()).state !== "installed") {
     helpers.push({ name: "Pi extension", undo: "10and2 pi uninstall", add: async () => { installPiExtension(piAgentDir()); } });
@@ -397,12 +435,31 @@ function seesText(p: any) {
   return `${what} in ${where}`;
 }
 
+/**
+ * What the login service runs, and this PATH (service.ts launchFor). Windows' startup entry names neither (it runs
+ * `10and2` from the PATH): there they start its supervisor this once, and the PATH is kept for it.
+ */
 function launch() {
-  return { node: process.execPath, script: realpathSync(process.argv[1]), path: process.env.PATH ?? "/usr/bin:/bin" };
+  return launchFor(process.argv[1], process.execPath, process.env.PATH ?? "/usr/bin:/bin");
+}
+
+/**
+ * A login service whose program is gone can never start: its install was removed or upgraded away (nvm's uninstall, a
+ * Nix garbage collection). Written again for this install, when it's an installed one (on PATH), never a checkout.
+ */
+async function repairService(service: Service) {
+  const gone = service.supported ? service.missing() : null;
+  if (!gone) return;
+  const l = launch();
+  if (l.program.length !== 1) return;
+  const s = await service.install(l);
+  (s.running ? ok : warn)(`Starts at login again: it ran ${gone}, which is gone, and now runs ${l.program[0]}${s.running ? "" : `, but isn't running: see ${s.logs}`}`);
 }
 
 async function runConnector() {
   const log = (s: string) => console.log(`${new Date().toISOString()} ${s}`);
+  // Windows' supervisor asks it to stop over IPC, where SIGTERM never arrives: shutdown() below runs for both.
+  stopLikeSigterm();
   const fatalExit = Number(flags.get("fatal-exit") ?? 78);
   let state = { pid: process.pid, version: VERSION, startedAt: new Date().toISOString(), brain: "", linked: false, since: null as string | null, error: null as string | null, fatal: false, threads: undefined as number | undefined, projects: undefined as number | undefined };
   const record = (s: Partial<typeof state>) => { state = { ...state, ...s }; try { writePrivate(statusFile(), JSON.stringify(state) + "\n"); } catch { /* status is a convenience */ } };
@@ -435,13 +492,16 @@ async function runConnector() {
   const stop = (code: number) => { record({ linked: false }); link?.close(); process.exit(code); };
   const t3 = policy.t3
     ? new T3Adapter({
-      baseUrl: process.env.T3_URL ?? "http://127.0.0.1:3773", cli: [process.env.T3_CLI ?? "t3"], label: "10and2-connector", log,
+      // Without T3_URL, where T3 says it is, at each connect (it moves off 3773 when that's taken).
+      ...(process.env.T3_URL ? { baseUrl: process.env.T3_URL } : {}), cli: [process.env.T3_CLI ?? "t3"], label: "10and2-connector", log,
       visible: (root) => visible(policy, root), worktreeBase: policy.worktreeBase, onRevoked: () => { record({ error: "T3 revoked the connector's session" }); stop(fatalExit); },
     })
     : null;
   // Claude Code has no command ids, so a lost outcome is never sent again (the ledger reports it unknown).
   const claude = policy.claude
-    ? new ClaudeAdapter({ policy, configDir: claudeDir(), db: join(stateDirectory(), "claude.db"), stateDir: join(stateDirectory(), "claude"), hookSocketPath: hookSocket(), log })
+    ? new ClaudeAdapter({ policy, configDir: claudeDir(), db: join(stateDirectory(), "claude.db"), stateDir: join(stateDirectory(), "claude"),
+      // On Windows the adapter makes a new pipe at each start and names it where hookSocket() reads it.
+      hookSocketPath: process.platform === "win32" ? undefined : hookSocket()?.path, log })
     : null;
   // A copy of 10and2's Pi extension from an older 10and2 is brought up to this one's: Pi loads it in each Pi started after.
   if (policy.pi) { try { if (piExtensionStatus(piAgentDir()).state === "outdated") { installPiExtension(piAgentDir()); log("pi: updated 10and2's Pi extension"); } } catch (e) { log(`pi: ${describe(e)}`); } }
@@ -495,9 +555,10 @@ async function status() {
   const token = !cred && process.env.TENANDTWO_TOKEN;
   const key = cred?.secret ?? (token || undefined);
   const service = new Service();
+  await repairService(service);
   const s = await service.state();
   const st = readStatus();
-  const alive = st?.pid ? (() => { try { process.kill(st.pid, 0); return true; } catch { return false; } })() : false;
+  const alive = st?.pid ? connectorRunning(st.pid, st.startedAt) : false;
 
   if (!cred && !token) bad(`Not connected to ${account(origin, key)}: ${cmd("10and2 setup")} connects it.`);
   else if (!alive) bad(`Not running. ${s.installed ? `It should start at login; see ${s.logs}` : `${cmd("10and2 autostart on")} keeps it running.`}`);
@@ -523,13 +584,14 @@ async function status() {
   }
   if (policy.claude) {
     const h = await hooksStatus(claudeDir()).catch(() => null);
-    if (!h?.installed) note(dim(`${cmd("10and2 hooks install")} lets 10 & 2 answer Claude Code's questions, and makes updates instant`));
+    if (!h?.installed) note(dim(hooksUnavailable(claudeDir()) ?? `${cmd("10and2 hooks install")} lets 10 & 2 answer Claude Code's questions, and makes updates instant`));
     const db = join(stateDirectory(), "claude.db");
     if (existsSync(db)) {
       const conn = new DatabaseSync(db, { readOnly: true });
       try {
-        const runs = conn.prepare("SELECT sessionId, pid FROM claude_runs WHERE pid IS NOT NULL").all() as { sessionId: string; pid: number }[];
-        const live = runs.filter((r) => { try { process.kill(r.pid, 0); return true; } catch { return false; } });
+        const runs = conn.prepare("SELECT sessionId, pid, procStart FROM claude_runs WHERE pid IS NOT NULL").all() as { sessionId: string; pid: number; procStart: string | null }[];
+        // As the adapter tells a run from a later process given its pid (on Windows, perhaps another account's).
+        const live = runs.filter((r) => pidState(r.pid, r.procStart) !== "dead");
         if (live.length) note(`Claude Code runs 10 & 2 started, still going: ${live.map((r) => `${r.sessionId} (pid ${r.pid})`).join(", ")}`);
       } catch { /* an older or empty database */ } finally { conn.close(); }
     }
@@ -568,6 +630,7 @@ async function autostart() {
   const service = new Service();
   if (sub === "on") {
     const s = await service.install(launch());
+    if (s.elevated) { startsAtSignIn("10and2 autostart on"); return; }
     if (!s.running) { warn(`Installed at ${s.where}, but not running: see ${s.logs}`); return; }
     ok("Starts at login, and (re)started now");
     const policy = readPolicyFile();
@@ -650,7 +713,8 @@ async function brain() {
       if (on === "on") {
         settings();
         const s = await service.install(launch());
-        if (s.running) ok("Your brain starts at login, and (re)started now"); else warn(`Installed at ${s.where}, but not running: see ${s.logs}`);
+        if (s.elevated) startsAtSignIn("10and2 brain autostart on");
+        else if (s.running) ok("Your brain starts at login, and (re)started now"); else warn(`Installed at ${s.where}, but not running: see ${s.logs}`);
       } else if (on === "off") { await service.uninstall(); ok("Your brain stopped, and no longer starts at login"); }
       else if (on === "status" || on === undefined) { const s = await service.state(); say(s.installed ? `${s.running ? "Running" : "Not running"}; starts at login ${dim(`(${s.where})`)}.` : "Doesn't start at login."); }
       else throw new Error(`${cmd("10and2 brain autostart")} takes on, off or status.`);
@@ -697,10 +761,13 @@ async function brainSetup(service: Service, path: string) {
   ok(`Set up ${dim(`· your key and its settings are in ${path}, which only you can read`)}`);
   if (store !== "file") ok(`This computer's key to it is in ${where(store)}`);
 
-  const started = await startAtLogin(service, "Run your brain, and keep this computer connected to it, starting at login?");
-  if (started) {
+  const brain = await startAtLogin(service, "Run your brain, and keep this computer connected to it, starting at login?", "10and2 brain autostart on", "10and2 autostart on");
+  // From a terminal run as administrator the brain starts at the next sign-in, and this computer's connection with it,
+  // so neither is waited for now.
+  if (brain?.running || brain?.elevated) {
     const s = await new Service().install(launch());
-    if (s.running) await connected(origin, token);
+    if (s.elevated) { if (!brain.elevated) startsAtSignIn("10and2 autostart on"); }
+    else if (s.running) await connected(origin, token);
     else warn(`This computer's connection is installed at ${s.where}, but isn't running: see ${s.logs}`);
   } else note(`To run it: ${cmd("10and2 brain run")} and ${cmd("10and2 run")}, each in a terminal you keep open; or ${cmd("10and2 brain autostart on")} and ${cmd("10and2 autostart on")}.`);
   canDo(policy, choice, found);
@@ -729,6 +796,7 @@ async function tailnetName(): Promise<string | null> {
 async function brainStatus(service: Service, path: string) {
   const vars = readBrainEnv(path);
   if (!vars) { say(`No brain of your own on this computer. ${cmd("10and2 brain setup")} sets one up.`); return; }
+  await repairService(service);
   const origin = brainOrigin(vars);
   const up = await fetch(`${origin}/`, { signal: AbortSignal.timeout(2000) }).then((r) => r.ok, () => false);
   const s = await service.state();
@@ -760,5 +828,7 @@ async function brainRun(path: string) {
   // Next to this file both in the package (dist/10and2.js) and in a checkout (src/main.ts, after `npm run build`).
   const bundle = new URL("../dist/brain/main.js", import.meta.url);
   if (!existsSync(bundle)) throw new Error("This copy of 10and2 was built without the brain: `npm run build` builds it.");
+  // The brain shuts down on SIGTERM; on Windows its supervisor asks over IPC instead, and the console has its own signals.
+  stopLikeSigterm();
   await import(bundle.href);
 }

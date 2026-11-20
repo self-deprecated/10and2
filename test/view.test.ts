@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Sent, type View } from "../src/view.ts";
 import { item } from "./fakes.ts";
+import { createHash } from "node:crypto";
 
 const view = (items = [item("a"), item("b")], over: Partial<View> = {}): View => ({ items, places: [], connections: [{ prefix: "", name: "t3", connected: true }], refusals: {}, ceiling: "auto", ...over });
 
@@ -41,4 +42,36 @@ test("ids a work system announced are in the next delta even when no listed fiel
   sent.touch(["b"]);
   assert.equal(sent.changed(view()).any, true);
   assert.deepEqual(sent.read(view(), first.rev).items.map((i) => i.id), ["b"]);
+});
+
+test("places go with their models packed: each list once, in `catalogs`, under a key that changes only with it", async () => {
+  const { pack } = await import("../src/view.ts");
+  const claude = [{ id: "opus", name: "Claude Opus 5.5" }, { id: "sonnet", name: "Claude Sonnet 5.5" }];
+  const places = [
+    { id: "claude:a", name: "a", activeAt: null, models: claude },
+    { id: "claude:b", name: "b", activeAt: null, folder: "x/b", models: [...claude] },
+    { id: "pi:c", name: "c", activeAt: null, models: [] },
+    { id: "d", name: "d", activeAt: null },
+  ];
+  const wire = pack(places);
+  const key = createHash("sha256").update(JSON.stringify(claude)).digest("hex").slice(0, 12);
+  assert.deepEqual(wire, {
+    places: [{ id: "claude:a", name: "a", activeAt: null, catalog: key }, { id: "claude:b", name: "b", activeAt: null, folder: "x/b", catalog: key },
+      { id: "pi:c", name: "c", activeAt: null }, { id: "d", name: "d", activeAt: null }],
+    catalogs: { [key]: claude },
+  });
+  assert.notEqual(pack([{ ...places[0]!, models: claude.slice(1) }]).places[0]!.catalog, key, "another list, another key");
+  // T3's models carry their provider, as given, and a list that differs only in a provider (renamed in T3) is another.
+  const t3 = (provider: string) => pack([{ id: "p", name: "p", activeAt: null, models: [{ id: "claude-proxy:opus", name: "Claude Opus 5.5", provider }] }]);
+  assert.deepEqual(Object.values(t3("Claude Proxy").catalogs), [[{ id: "claude-proxy:opus", name: "Claude Opus 5.5", provider: "Claude Proxy" }]]);
+  assert.notEqual(t3("Work Proxy").places[0]!.catalog, t3("Claude Proxy").places[0]!.catalog);
+  assert.deepEqual(pack([]), { places: [], catalogs: {} });
+
+  // As the link reads it: no models on a place, the catalogs beside them, and a change in any list is a change.
+  const sent = new Sent();
+  const read = sent.read(view(undefined, { places }), null);
+  assert.deepEqual([read.places, read.catalogs], [wire.places, wire.catalogs]);
+  assert.equal(sent.changed(view(undefined, { places })).any, false);
+  assert.equal(sent.changed(view(undefined, { places: [places[0]!, { ...places[1]!, models: claude.slice(0, 1) }, places[2]!, places[3]!] })).any, true);
+  assert.deepEqual(new Sent().read(view(), null).catalogs, {}, "always there, empty when nothing offers a model");
 });

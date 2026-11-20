@@ -2,7 +2,7 @@
 // unix socket speaking the part of its JSON-RPC the adapter uses, with threads, turns and server requests (questions,
 // approvals) a test sets up and drives. Every request is recorded; any method can be overridden per test.
 import { createServer, type Server } from "node:http";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -34,6 +34,13 @@ export class FakeCodex {
   /** Answers clients sent to server requests: the request's method, and the result. */
   readonly answers: { method: string; result: any }[] = [];
   readonly handlers: Record<string, (params: any) => any> = {};
+  /** `model/list`'s catalog (Codex's picker's), and how many it gives a page. */
+  models: { id: string; model: string; displayName: string; hidden: boolean; isDefault: boolean }[] = [
+    { id: "astra-6", model: "astra-6", displayName: "Astra-6", hidden: false, isDefault: true },
+    { id: "astra-6-mini", model: "astra-6-mini", displayName: "Astra-6 Mini", hidden: false, isDefault: false },
+    { id: "astra-5-codex", model: "astra-5-codex", displayName: "Astra-5 Codex", hidden: true, isDefault: false },
+  ];
+  modelPage = 100;
   private readonly asked: Asked[] = [];
   private readonly conns = new Set<Conn>();
   private http!: Server;
@@ -44,7 +51,9 @@ export class FakeCodex {
     this.socketPath = join(home, "app-server-control", "app-server-control.sock");
   }
 
-  static async start(home = mkdtempSync(join(tmpdir(), "fake-codex-"))): Promise<FakeCodex> {
+  // On macOS under /tmp: its $TMPDIR (/var/folders/…/T/) makes the socket's path longer than a Unix socket's can be
+  // (104 bytes). Codex's own, under ~/.codex, is well within it.
+  static async start(home = mkdtempSync(join(process.platform === "darwin" ? "/tmp" : tmpdir(), "fake-codex-"))): Promise<FakeCodex> {
     const f = new FakeCodex(home);
     await f.listen();
     return f;
@@ -60,7 +69,13 @@ export class FakeCodex {
       ws.on("close", () => this.conns.delete(conn));
       ws.on("message", (data) => void this.onMessage(conn, JSON.parse(String(data))));
     });
-    await new Promise<void>((resolve) => this.http.listen(this.socketPath, resolve));
+    // Windows: Node makes pipes, not socket files. The file Codex's socket would be names the pipe, for the fake proxy
+    // (proxy.mjs), which is how the adapter reaches Codex there.
+    if (process.platform === "win32") {
+      const pipe = `\\\\.\\pipe\\fake-codex-${randomUUID()}`;
+      await new Promise<void>((resolve) => this.http.listen(pipe, resolve));
+      writeFileSync(this.socketPath, pipe);
+    } else await new Promise<void>((resolve) => this.http.listen(this.socketPath, resolve));
   }
   /** Stops listening and drops every connection, as a daemon that exits. */
   async stop() {
@@ -177,6 +192,10 @@ export class FakeCodex {
         const data = [...this.threads.values()].filter((t) => !t.ephemeral).sort((a, b) => b.updatedAt - a.updatedAt).map((t) => this.view(t));
         return { data, nextCursor: null };
       }
+      case "model/list": {
+        const from = p.cursor ? Number(p.cursor) : 0, to = from + Math.min(p.limit ?? 100, this.modelPage);
+        return { data: this.models.slice(from, to), nextCursor: to < this.models.length ? String(to) : null };
+      }
       case "thread/loaded/list": return { data: [...this.threads.values()].filter((t) => t.status.type !== "notLoaded").map((t) => t.id), nextCursor: null };
       case "thread/read": return { thread: this.view(this.get(p.threadId)) };
       case "thread/turns/list": {
@@ -220,7 +239,7 @@ export class FakeCodex {
           settings: { approvalPolicy: p.approvalPolicy, sandbox: p.sandbox, approvalsReviewer: p.approvalsReviewer ?? "user" } });
         c.subs.add(t.id);
         this.notify("thread/started", { thread: this.view(t) });
-        return { thread: this.view(t), model: "mock-model", modelProvider: "mock", approvalPolicy: p.approvalPolicy, sandbox: p.sandbox };
+        return { thread: this.view(t), model: p.model ?? "mock-model", modelProvider: "mock", approvalPolicy: p.approvalPolicy, sandbox: p.sandbox };
       }
       case "thread/name/set": {
         const t = this.get(p.threadId);

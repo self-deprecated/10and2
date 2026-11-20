@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { Local } from "../src/local.ts";
 import { parsePolicy } from "../src/policy.ts";
 import { FakeAdapter, item } from "./fakes.ts";
-import type { Action, LaunchProfile } from "../src/contract.ts";
+import type { Action, CodingModel, LaunchProfile } from "../src/contract.ts";
 
 const policy = parsePolicy(JSON.stringify({ brain: "ws://127.0.0.1:8790/connector", projects: "*", actions: ["settle", "start_work", "follow_up"] }));
 const profile: LaunchProfile = { name: "Build", runtimeMode: "full-access", workspace: "worktree", interactionMode: "default" };
@@ -82,4 +82,35 @@ test("an unloaded backend cannot block a snapshot; loading it emits all its ids"
   assert.deepEqual((await local.list()).map((i) => i.id), ["late", "claude:ready"]);
   assert.deepEqual(changes, [["late"]]);
   await local.list(); assert.equal(changes.length, 1);
+});
+
+test("a start on a model its place doesn't list now is refused before it reaches the work system, in that app's words", async () => {
+  const models: CodingModel[] = [{ id: "opus", name: "Claude Opus 5.5" }];
+  const app = (name: string, placeModels?: typeof models) => {
+    const a = Object.assign(new FakeAdapter([item("a")]), { name });
+    a.placeList = [{ id: "p-proj", name: "proj", activeAt: null, ...(placeModels ? { models: placeModels } : {}) }];
+    return a;
+  };
+  const t3 = app("t3", [{ id: "claudeAgent:claude-opus-5-5", name: "Claude Opus 5.5" }]), claude = app("claude", models), codex = app("codex", []), pi = app("pi", []), other = app("fake");
+  const local = new Local([{ prefix: "", adapter: t3 }, { prefix: "claude", adapter: claude }, { prefix: "codex", adapter: codex }, { prefix: "pi", adapter: pi }, { prefix: "other", adapter: other }], policy);
+  assert.deepEqual(local.places().find((p) => p.id === "claude:p-proj")!.models, models, "places keep their models");
+  const start = (placeId: string, model?: string): Action => ({ kind: "start_work", placeId, message: "Go", profile: { ...profile, runtimeMode: "approval-required" }, ...(model ? { model } : {}) });
+  assert.equal(await local.check(start("claude:p-proj", "opus")), null);
+  assert.equal(await local.check(start("p-proj", "claudeAgent:claude-opus-5-5")), null);
+  assert.equal(await local.check(start("p-proj", "opus")), "T3 Code doesn't offer that model for this project now.");
+  assert.equal(await local.check(start("claude:p-proj", "sonnet")), "Claude Code doesn't offer that model now.");
+  assert.equal(await local.check(start("codex:p-proj", "opus")), "Codex doesn't offer that model now.");
+  assert.equal(await local.check(start("pi:p-proj", "opus")), "Pi can't start on a chosen model through 10 & 2 yet.");
+  assert.equal(await local.check(start("other:p-proj", "opus")), "That coding app doesn't offer that model now.", "a place with no models said");
+  assert.equal(await local.check(start("other:p-proj")), null, "no model, as before");
+  assert.deepEqual(await local.execute(start("claude:p-proj", "sonnet"), "k"), { ok: false, error: "Claude Code doesn't offer that model now." });
+  assert.equal(claude.executed.length, 0);
+  assert.deepEqual(await local.execute(start("claude:p-proj", "opus"), "k2"), { ok: true, itemId: "claude:new-1" });
+  assert.equal((claude.executed[0]!.action as Extract<Action, { kind: "start_work" }>).model, "opus", "passed on as given");
+  // One model on two of T3's providers is listed on each, and either is taken; what neither lists isn't.
+  const both = app("t3", [{ id: "claudeAgent:claude-opus-5-5", name: "Claude Opus 5.5", provider: "Claude" }, { id: "claude-proxy:claude-opus-5-5", name: "Claude Opus 5.5", provider: "Claude Proxy" }]);
+  const providers = new Local([{ prefix: "", adapter: both }], policy);
+  assert.equal(await providers.check(start("p-proj", "claude-proxy:claude-opus-5-5")), null);
+  assert.equal(await providers.check(start("p-proj", "claudeAgent:claude-opus-5-5")), null);
+  assert.equal(await providers.check(start("p-proj", "claude-proxy:claude-sonnet-5-5")), "T3 Code doesn't offer that model for this project now.");
 });

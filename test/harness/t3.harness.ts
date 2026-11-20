@@ -1,7 +1,7 @@
 // T3 Code, for real, against the fake model: its own server (`t3 serve`) with one project, its threads run by Codex. The
-// connector mints its scoped session with T3's CLI and connects; new work starts in the checkout and in a worktree, a
-// thread is listed and read, followed up idle and while busy (queued behind the run), its question answered, and it
-// is settled and snoozed. Runs in the harness container only (run.sh).
+// connector mints its scoped session with T3's CLI and connects; new work starts in the checkout and in a worktree, and
+// on a model T3 offers; a thread is listed and read, followed up idle and while busy (queued behind the run), its
+// question answered, and it is settled and snoozed. Runs in the harness container only (run.sh).
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
@@ -25,7 +25,8 @@ test("T3 Code: start work, list, read, follow up idle and busy, answer a questio
   writeFileSync(join(codexHome, "config.toml"), [
     `model = "mock-model"`, `model_provider = "mock"`, `check_for_update_on_startup = false`, ``,
     `[model_providers.mock]`, `name = "Mock"`, `base_url = "${mock.url}/v1"`, `wire_api = "responses"`, ``,
-    `[projects."${cwd}"]`, `trust_level = "trusted"`, ``,
+    // A literal string: in a basic one, a Windows folder's backslashes (C:\Users) would be read as escapes.
+    `[projects.'${cwd}']`, `trust_level = "trusted"`, ``,
     `[features]`, `plugins = false`, `plugin_discovery_prefetch = false`, `remote_plugin = false`, `daemon_auto_start = false`, ``,
     `[analytics]`, `enabled = false`, ``].join("\n"));
   process.env.CODEX_HOME = codexHome;
@@ -40,7 +41,18 @@ test("T3 Code: start work, list, read, follow up idle and busy, answer a questio
   // Any answer will do (its web root may redirect, or hang while it starts), or its own word that it's listening.
   try { await until("T3's server", async () => /Listening on http/.test(serverLog) || (await fetch(baseUrl, { redirect: "manual", signal: AbortSignal.timeout(2000) }).catch(() => null)) !== null, 180_000); }
   catch (e) { t.diagnostic(serverLog.slice(-4000)); throw e; }
-  execFileSync("t3", ["project", "add", cwd, "--title", "lap-timer"], { stdio: "ignore", timeout: 60_000 });
+  // `t3 project add` goes through the running server only if it answers within a second (T3's
+  // PROJECT_CLI_LIVE_SERVER_PROBE_TIMEOUT); otherwise it opens T3's data itself, which the server owns, and stops with
+  // ServerAlreadyRunningError. A server still starting misses that second when the container is busy, as after the other
+  // harnesses, so it's tried again until the server answers; any other failure is the test's, with what T3 said.
+  for (const end = Date.now() + 60_000; ;) {
+    try { execFileSync("t3", ["project", "add", cwd, "--title", "lap-timer"], { encoding: "utf8", stdio: "pipe", timeout: 60_000 }); break; }
+    catch (e: any) {
+      const said = `${e.stdout ?? ""}${e.stderr ?? ""}`;
+      if (!said.includes("ServerAlreadyRunningError") || Date.now() > end) throw new Error(`t3 project add failed: ${said.slice(-2000)}`, { cause: e });
+      await sleep(500);
+    }
+  }
 
   const adapter = new T3Adapter({ baseUrl, cli: ["t3"], label: "10and2-harness", log: (m) => t.diagnostic(m), worktreeBase: "HEAD" });
   t.after(async () => { await adapter.close(); });
@@ -109,6 +121,25 @@ test("T3 Code: start work, list, read, follow up idle and busy, answer a questio
     const wtId = (started as { itemId: string }).itemId;
     await until("the model to get the worktree's work", () => mock.saw("Worktree words WTONE"), 90_000);
     await until("its reply to be read", async () => (await adapter.report(wtId)).text === "ACK Worktree words WTONE", 90_000);
+  });
+
+  await t.test("start on a chosen model: the project offers T3's models, and new work starts on the one named", async () => {
+    // T3 checks its providers after it starts; the connector reads them at connect, each launch and every 10 minutes.
+    const offered = () => adapter.places().find((p) => p.id === place)?.models ?? [];
+    await until("the project's models", async () => { await (adapter as any).refreshConfig(); return offered().some((m) => m.id.startsWith("codex:")); }, 120_000);
+    t.diagnostic(`offered: ${offered().map((m) => `${m.id} (${m.name} on ${m.provider})`).join(", ")}`);
+    const chosen = offered().find((m) => m.id.startsWith("codex:"))!;
+    assert.equal(chosen.provider, "Codex", "named as T3's picker names its provider");
+    const profile: LaunchProfile = { name: "Normal", runtimeMode: "full-access", workspace: "root", interactionMode: "default" };
+    // Titled, so T3 asks no model for a title (it would, on a small one of its own).
+    const started = await adapter.execute({ kind: "start_work", placeId: place, title: "Harness model", message: "Model words MODELONE", profile, model: chosen.id }, "start-model");
+    assert.equal(started.ok, true, JSON.stringify(started));
+    const modelId = (started as { itemId: string }).itemId;
+    await until("its reply to be read", async () => (await adapter.report(modelId)).text === "ACK Model words MODELONE", 90_000);
+    const slug = chosen.id.slice(chosen.id.indexOf(":") + 1);
+    assert.ok(mock.requests().some((r) => r.texts.some((x) => x.includes("MODELONE")) && r.model === slug), `asked of ${slug}: ${JSON.stringify(mock.requests().filter((r) => r.texts.some((x) => x.includes("MODELONE"))).map((r) => r.model))}`);
+    assert.deepEqual(await adapter.execute({ kind: "start_work", placeId: place, message: "Not this", profile, model: "codex:not-a-model" }, "start-no-model"),
+      { ok: false, error: "T3 Code doesn't offer that model for this project now." });
   });
 
   await t.test("tidy: a thread is settled and snoozed", async () => {

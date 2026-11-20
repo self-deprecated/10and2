@@ -1,11 +1,13 @@
 import { readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { createConnection } from "node:net";
+import { createHash } from "node:crypto";
 import type { RuntimeMode } from "../policy.ts";
+import { PIPE } from "./registry.ts";
 
 /**
- * A live Claude Code session's inbox (Claude Code 2.1.224+, "cross-session messaging"): a Unix socket each session binds,
- * named in its registry entry (`messagingSocketPath`), where a script may post a message
+ * A live Claude Code session's inbox (Claude Code 2.1.224+, "cross-session messaging"): a Unix socket each session binds
+ * (a named pipe on Windows, from 2.1.234), named in its registry entry (`messagingSocketPath`), where a script may post a message
  * (code.claude.com/docs/en/cross-session-messaging, "The session's inbox socket"). A busy session reads it between tool
  * calls; an idle one starts a turn with it. It reaches Claude as a message from another session, never as the user's
  * consent, so it can't answer a permission prompt.
@@ -40,17 +42,32 @@ export function envelope(message: string, mode: "bypass" | "prompting"): string 
 }
 
 /**
- * The session's peer token, which Claude Code publishes beside its registry entry (`<pid>.<hash>.key`) for other
- * processes of the same user. On macOS and Linux the inbox takes a message without it; it's sent when it's there.
+ * The session's peer token, which Claude Code publishes beside its registry entry for other processes of the same user,
+ * in `<pid>.<sha256 of its inbox>.key`: the pipe's name lower-cased after `\\.\pipe\` on Windows, the socket's resolved
+ * path elsewhere. A key file of that pid named otherwise counts only when it records the session's own start, since a
+ * crashed session's file stays behind and Windows soon gives its pid to another. On macOS and Linux the inbox takes a
+ * message without it, and it's sent when it's there; on Windows the inbox reads nothing until it has it.
  */
-export function peerToken(configDir: string, pid: number): string | null {
+export function peerToken(configDir: string, pid: number, socket: string, start: string | null): string | null {
   const dir = join(configDir, "sessions");
-  try {
-    const file = readdirSync(dir).find((f) => f.startsWith(`${pid}.`) && f.endsWith(".key"));
-    if (!file) return null;
-    const token = JSON.parse(readFileSync(join(dir, file), "utf8"))?.peerToken;
-    return typeof token === "string" && /^[A-Za-z0-9_-]{8,256}$/.test(token) ? token : null;
-  } catch { return null; }
+  const read = (file: string) => { try { return JSON.parse(readFileSync(join(dir, file), "utf8")); } catch { return null; } };
+  const valid = (key: any) => typeof key?.peerToken === "string" && /^[A-Za-z0-9_-]{8,256}$/.test(key.peerToken) ? key.peerToken as string : null;
+  const own = valid(read(peerKeyFile(pid, socket)));
+  if (own) return own;
+  if (start === null) return null;
+  let files: string[];
+  try { files = readdirSync(dir).filter((f) => f.startsWith(`${pid}.`) && f.endsWith(".key")); } catch { return null; }
+  for (const file of files) {
+    const key = read(file), recorded = key?.procStart ?? key?.procStartFt;
+    if ((typeof recorded === "string" || typeof recorded === "number") && String(recorded) === start && valid(key)) return valid(key);
+  }
+  return null;
+}
+/** The key file Claude Code names for a session's inbox. */
+export function peerKeyFile(pid: number, socket: string): string {
+  const pipe = PIPE.test(socket) ? socket.replace(/^\\\\[.?]\\pipe\\/i, "") : null;
+  const canonical = pipe !== null ? `\\\\.\\pipe\\${pipe.toLowerCase()}` : resolve(socket);
+  return `${pid}.${createHash("sha256").update(canonical).digest("hex")}.key`;
 }
 
 /**

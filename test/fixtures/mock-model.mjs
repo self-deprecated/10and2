@@ -17,7 +17,7 @@
 //                      options Alpha and Beta; the tool's result (a "tool" message) then comes back as "ACK RESULT <it>"
 //   otherwise          answers at once
 // and is always "ACK <the user's text>", so a test can see exactly what reached the model. Every request is appended
-// to $MOCK_MODEL_LOG (JSON lines: path, the user texts it saw), when set.
+// to $MOCK_MODEL_LOG (JSON lines: path, the model asked for, the user texts it saw), when set.
 import { createServer } from "node:http";
 import { appendFileSync } from "node:fs";
 
@@ -54,7 +54,7 @@ createServer(async (req, res) => {
   const texts = userTexts(body);
   // A harness's own housekeeping requests (titles, summaries) also arrive here; they're answered the same way.
   const last = texts.at(-1) ?? "";
-  if (log) appendFileSync(log, JSON.stringify({ at: new Date().toISOString(), path, stream: !!body.stream, texts }) + "\n");
+  if (log) appendFileSync(log, JSON.stringify({ at: new Date().toISOString(), path, model: body.model ?? null, stream: !!body.stream, texts }) + "\n");
   const reply = `ACK ${last.replace(/\s+/g, " ").trim().slice(0, 400)}`;
   const seconds = Number(/SLOW(\d+)/.exec(last)?.[1] ?? 0);
   const words = reply.split(/(?<= )/);

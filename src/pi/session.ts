@@ -67,7 +67,7 @@ export class PiSession {
   private lines = 0;
   private tail = Buffer.alloc(0);
   private dropping = false;
-  private inode: number | bigint | null = null;
+  private inode: bigint | null = null;
   private cached: Projection | null = null;
   constructor(path: string) { this.path = path; }
 
@@ -76,13 +76,14 @@ export class PiSession {
     let fd: number;
     try { fd = openSync(this.path, "r"); } catch { return; }
     try {
-      const st = fstatSync(fd);
-      if ((this.inode !== null && this.inode !== st.ino) || st.size < this.offset) Object.assign(this, new PiSession(this.path));
+      // File ids as bigints: a Windows one (NTFS's, a sequence number in its high bits) is too big for a number.
+      const st = fstatSync(fd, { bigint: true }), size = Number(st.size);
+      if ((this.inode !== null && this.inode !== st.ino) || size < this.offset) Object.assign(this, new PiSession(this.path));
       this.inode = st.ino;
       this.mtime = st.mtime.toISOString();
       const buffer = Buffer.alloc(64 * 1024);
-      while (this.offset < Math.min(st.size, limit)) {
-        const n = readSync(fd, buffer, 0, Math.min(buffer.length, st.size - this.offset), this.offset);
+      while (this.offset < Math.min(size, limit)) {
+        const n = readSync(fd, buffer, 0, Math.min(buffer.length, size - this.offset), this.offset);
         if (!n) break;
         this.offset += n;
         const chunk = Buffer.concat([this.tail, buffer.subarray(0, n)]);

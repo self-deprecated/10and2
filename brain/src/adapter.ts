@@ -72,13 +72,28 @@ export type Report = {
   earlier?: string[];
 };
 
-/** Where new work can start: a project, named as it's said, with where it is ("driver, on Quartz"). */
+/**
+ * A model a new thread's coding agent can start on, as its coding app offers it in one place: never the model 10 & 2
+ * itself runs on (brain/src/models.ts). `id`: the connector's own, sent back as start_work's `model` and never said;
+ * `name`: what the user says and hears ("Claude Opus 5.5"); `provider`: what serves it, as the coding app names it,
+ * where it has more than one (T3 Code's provider instances: "Claude", "Claude Proxy", "Codex"), from connectors after
+ * 0.10.0. One per name and provider in a place, the one a start with none would use first.
+ */
+export type CodingModel = { id: string; name: string; provider?: string };
+
 /**
  * Where new work can start. `folder`: the end of its checkout's path ("mono/nix"), and `repo`: its repository's name
  * ("mono-nix"), from connectors 0.7.0 on: other names the user may say for it, and how two places with one name are told
- * apart (places.ts).
+ * apart (places.ts). `models`: what a new thread there can be started on (docs/launch/thread-model.md), from connectors
+ * after 0.10.0 on; empty where its coding app offers no choice through 10 & 2, absent from an older connector.
  */
-export type Place = { id: string; name: string; /** When an item there was last active, if any. */ activeAt: string | null; folder?: string; repo?: string };
+export type Place = { id: string; name: string; /** When an item there was last active, if any. */ activeAt: string | null; folder?: string; repo?: string; models?: CodingModel[] };
+
+/**
+ * A place as `tenandtwo://work` carries it: its `models` named by `catalog`, a key into the view's `catalogs`, since
+ * most places share one list. A connector packs them; the brain's RemoteAdapter unpacks them into `Place.models`.
+ */
+export type WirePlace = Omit<Place, "models"> & { catalog?: string };
 
 /**
  * What new work runs with. Voice only ever names a profile; this is the most it can ask for. `workspace`: a fresh
@@ -99,8 +114,12 @@ export type Action =
   | { kind: "unsnooze"; itemId: string }
   | { kind: "unsettle"; itemId: string }
   | { kind: "archive"; itemId: string }
-  /** `title`: the brain's, made from the prompt (titles.ts). None: the work system names the thread (T3 Code's `generateTitle`; Claude Code by itself). */
-  | { kind: "start_work"; placeId: string; title?: string; message: string; profile: LaunchProfile };
+  /**
+   * `title`: the brain's, made from the prompt (titles.ts). None: the work system names the thread (T3 Code's
+   * `generateTitle`; Claude Code by itself). `model`: one of the place's `models` by its `id`, only to a connector whose
+   * start_work schema lists it; none: the coding app's own default, as before.
+   */
+  | { kind: "start_work"; placeId: string; title?: string; message: string; profile: LaunchProfile; model?: string };
 
 export type ActionKind = Action["kind"];
 

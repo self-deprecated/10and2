@@ -1,9 +1,9 @@
 // Helpers every coding-agent adapter shares: where a folder's checkout is, what to call its project, and a place's
 // `folder`.
-import { execFile } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { FirstAsk } from "./contract.ts";
+import { execFileCommand } from "./command.ts";
 
 /** A worktree a coding agent keeps inside its project (`<project>/.claude/worktrees/<name>`, and `.codex`, `.opencode`, `.pi`). */
 const AGENT_WORKTREE = /^(.*?)[/\\]\.(?:claude|codex|opencode|pi)[/\\]worktrees[/\\][^/\\]+(?:[/\\]|$)/;
@@ -45,8 +45,8 @@ export function firstAsk(text: string, at: string, complete: boolean): FirstAsk 
   return words ? { text: limited(words), at, complete } : null;
 }
 
-/** The end of a checkout's path ("mono/nix"), as a place's `folder`; t3/adapter.ts has the same. */
-export const folderOf = (root: string) => root.replace(/[/\\]+$/, "").split(/[/\\]/).filter(Boolean).slice(-2).join("/");
+/** The end of a checkout's path ("mono/nix"), as a place's `folder`, without a Windows drive ("D:"); t3/adapter.ts has the same. */
+export const folderOf = (root: string) => root.replace(/[/\\]+$/, "").split(/[/\\]/).filter((s) => s && !/^[A-Za-z]:$/.test(s)).slice(-2).join("/");
 
 /** What a session's work belongs to, as it's said: a workspace's project ("…/workspaces/driver/…"), else its checkout's name. */
 export function group(cwd: string): string {
@@ -61,15 +61,20 @@ export function group(cwd: string): string {
  * no branch of that name here or from origin (a project whose main branch is named otherwise); else `base`.
  */
 export async function worktreeStart(root: string, base: string): Promise<string | null> {
-  const ok = (...args: string[]) => new Promise<boolean>((done) => execFile("git", ["-C", root, ...args], { timeout: 10_000 }, (e) => done(!e)));
-  if (!await ok("rev-parse", "--is-inside-work-tree")) return null;
+  // "error": git didn't run (not on this PATH), which says nothing about the folder; the agent's own git decides then.
+  const run = (...args: string[]) => new Promise<"yes" | "no" | "error">((done) =>
+    execFileCommand("git", ["-C", root, ...args], { timeout: 10_000 }, (e) => done(!e ? "yes" : typeof (e as { code?: unknown }).code === "number" ? "no" : "error")));
+  const ok = async (...args: string[]) => await run(...args) === "yes";
+  const inside = await run("rev-parse", "--is-inside-work-tree");
+  if (inside === "no") return null;
+  if (inside === "error") return base;
   if (base === "HEAD") return base;
   const has = (ref: string) => ok("rev-parse", "--verify", "--quiet", `${ref}^{commit}`);
   return await has(`refs/remotes/origin/${base}`) || await has(`refs/heads/${base}`) ? base : "HEAD";
 }
 
 const git = (root: string, ...args: string[]) => new Promise<string | null>((done) =>
-  execFile("git", ["-C", root, ...args], { timeout: 60_000 }, (e, out) => done(e ? null : String(out).trim())));
+  execFileCommand("git", ["-C", root, ...args], { timeout: 60_000 }, (e, out) => done(e ? null : out.trim())));
 
 /**
  * A fresh worktree for new work Driver starts, at `<root>/<dir>/10and2-<id>` on the branch `10and2/<id>`, kept out of
@@ -86,11 +91,14 @@ export async function addWorktree(root: string, dir: string, id: string, base = 
     await git(root, "fetch", "--quiet", "origin", start);
     ref = await git(root, "rev-parse", "--verify", "--quiet", `refs/remotes/origin/${start}^{commit}`) ? `origin/${start}` : start;
   }
-  if (await git(root, "worktree", "add", "-B", `10and2/${id}`, path, ref) === null) throw new Error("10 & 2 couldn't make a worktree in that project.");
+  // A worktree's paths are longer by its folder: Git for Windows refuses paths past 260 characters unless told.
+  const long = process.platform === "win32" ? ["-c", "core.longpaths=true"] : [];
+  if (await git(root, ...long, "worktree", "add", "-B", `10and2/${id}`, path, ref) === null) throw new Error("10 & 2 couldn't make a worktree in that project.");
   const common = await git(root, "rev-parse", "--git-common-dir");
   if (common) {
-    const exclude = join(isAbsolute(common) ? common : join(root, common), "info", "exclude"), line = `/${dir}/`;
-    try { if (!(existsSync(exclude) ? readFileSync(exclude, "utf8") : "").split("\n").includes(line)) appendFileSync(exclude, `\n${line}\n`); }
+    // Git's patterns take "/" only: in `/.codex\worktrees/` (a Windows join) the backslash escapes, and nothing matches.
+    const exclude = join(isAbsolute(common) ? common : join(root, common), "info", "exclude"), line = `/${dir.split(/[\\/]+/).join("/")}/`;
+    try { if (!(existsSync(exclude) ? readFileSync(exclude, "utf8") : "").split(/\r?\n/).includes(line)) appendFileSync(exclude, `\n${line}\n`); }
     catch { /* only git status is untidier */ }
   }
   return path;

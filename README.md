@@ -18,6 +18,8 @@ Setup finds the coding agents on this computer and lets you switch off any you d
 10and2 help      # everything else
 ```
 
+New work in T3 Code, Claude Code and Codex can start on a coding model you name (in T3 Code, on the provider you name too), or the one you choose in the app's Settings → New threads → Coding model; otherwise, and in Pi and OpenCode, on the agent's own default.
+
 Needs Node 22.13 or newer. Setup and `10and2 status` say when one of your agents is too old for something 10 & 2 does, and how to update it.
 
 Without a terminal (a script, Nix), every agent found is connected with everything allowed, and flags narrow it: `--agents=claude,pi` (only these), `--off=codex`, `--no-steer`, `--no-answer`, `--no-start`, `--no-tidy`, `--read-only`. Given names, as in `--no-steer=codex`, a flag narrows only those agents.

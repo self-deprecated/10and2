@@ -8,6 +8,7 @@ import { briefedMark, headTail, reportOf, type Briefing, type BriefCard } from "
 import { nameKey, pick, spokenTitle, withGroup, type Named } from "../handles.ts";
 import { START_GRACE_MS } from "../waits.ts";
 import { dictatedParts, newThreadName, newThreadTarget } from "../drafts.ts";
+import { isUsual, keptName, USUAL } from "../thread-models.ts";
 import { placeOptions, type ConfirmLevels, type KeepReplies, type Proposals, type ProposeAction, type ToolResult } from "../proposals.ts";
 import { PURPOSE_MS, startOf } from "../purposes.ts";
 import type { Proposal, Store, ThreadPurpose } from "../store.ts";
@@ -19,6 +20,14 @@ import { NO_DEFAULTS, type NewThreadDefaults } from "../places.ts";
 
 /** How many settled threads `list` names at once, newest first. */
 const SETTLED_SHOWN = 12;
+
+/**
+ * A new thread's coding model, as the tools that start one take it (docs/launch/thread-model.md): the user's words,
+ * maybe with its provider, matched with what the place offers by the app, which reads it back. Never 10 & 2's own voice
+ * model: "which model" there is about the coding agent. The backend learns of it here and from the launch note, not the
+ * locked sections, so Ops' gated prompts stay as they are.
+ */
+const MODEL = "the coding model the user named for its coding agent (\"start it with …\", \"use the … one\", \"Opus on the proxy\"), in their words, with the provider if they said one, only when they name a model, and never also in the message; never 10 & 2's own voice model; else null";
 
 export const TOOLS = [
   {
@@ -65,11 +74,11 @@ export const TOOLS = [
   {
     name: "propose",
     description:
-      "Prepare a change. Returns a readback to say word for word, and nothing happens until confirm; or, when the user's settings ask no yes for it, carries it out at once and returns its result. Actions: follow_up (send `message` to one thread; to a thread waiting on a question, the message is the answer), settle, snooze (needs `until`), archive, settle_subagents (all finished subagent threads; no handles), start_work (start a new thread in `project`, its agent told `message`; no handles; `profile` only when the user asks for one; the thread names itself).",
+      "Prepare a change. Returns a readback to say word for word, and nothing happens until confirm; or, when the user's settings ask no yes for it, carries it out at once and returns its result. Actions: follow_up (send `message` to one thread; to a thread waiting on a question, the message is the answer), settle, snooze (needs `until`), archive, settle_subagents (all finished subagent threads; no handles), start_work (start a new thread in `project`, its agent told `message`; no handles; `profile` and `model` only when the user asks for one; the thread names itself).",
     parameters: {
       type: "object",
       additionalProperties: false,
-      required: ["action", "handles", "message", "until", "project", "profile"],
+      required: ["action", "handles", "message", "until", "project", "profile", "model"],
       properties: {
         action: { enum: ["follow_up", "settle", "snooze", "archive", "settle_subagents", "start_work"] },
         handles: { type: "array", items: { type: "string" } },
@@ -77,6 +86,7 @@ export const TOOLS = [
         until: { type: ["string", "null"], description: "YYYY-MM-DD or YYYY-MM-DDTHH:MM, local time" },
         project: { type: ["string", "null"], description: "start_work: the project, in the user's words, with its machine if they said one" },
         profile: { type: ["string", "null"], description: "start_work: a launch profile's name, or null for the default" },
+        model: { type: ["string", "null"], description: `start_work: ${MODEL}` },
       },
     },
   },
@@ -101,11 +111,12 @@ export const TOOLS = [
     parameters: {
       type: "object",
       additionalProperties: false,
-      required: ["kept_id", "project", "profile"],
+      required: ["kept_id", "project", "profile", "model"],
       properties: {
         kept_id: { type: "string" },
         project: { type: ["string", "null"], description: "A new thread's prompt: the project to start it in, in the user's words, with its machine if they said one; null for where it was dictated for" },
         profile: { type: ["string", "null"], description: "A new thread's prompt: a launch profile's name, only if the user asks for one; else null" },
+        model: { type: ["string", "null"], description: `A new thread's prompt: ${MODEL}; "${USUAL}" only when an answer says to pass it, for starting it as usual` },
       },
     },
   },
@@ -165,11 +176,12 @@ export const TOOLS = [
     parameters: {
       type: "object",
       additionalProperties: false,
-      required: ["handle", "project", "profile"],
+      required: ["handle", "project", "profile", "model"],
       properties: {
         handle: { type: ["string", "null"], description: "The thread to reply to; null for a new thread" },
         project: { type: ["string", "null"], description: "A new thread: the project, only if the user already named it; else null" },
         profile: { type: ["string", "null"], description: "A new thread: a launch profile's name, only if they asked for one; else null" },
+        model: { type: ["string", "null"], description: `A new thread: ${MODEL}` },
       },
     },
   },
@@ -751,6 +763,8 @@ export async function runTool(
       }
       const saved = deps.store.setUserPurpose(found.item.id, set);
       if (!saved?.purpose) return { error: "Nothing was noted: their words didn't say what it's for. Ask them what the thread is for." };
+      // Its card is judged against what it's for: again now, by the user's words.
+      void deps.briefing.purposed([found.item.id]);
       about(found);
       return { noted: true, handle: found.handle, group: found.item.group, purpose: saved.purpose, instruction: 'Say in a few words that it\'s noted ("Noted."), with no readback and no question.' };
     }
@@ -842,6 +856,8 @@ export async function runTool(
         until: args.until ?? null,
         project: args.project ?? null,
         profile: args.profile ?? null,
+        // Missing from a call recorded before models: none.
+        model: typeof args.model === "string" ? args.model : null,
         defaults: ctx.newThreadDefaults,
       }, ctx.keepReplies, ctx.confirm);
     case "confirm": {
@@ -857,7 +873,7 @@ export async function runTool(
     case "keep":
       return deps.proposals.keep(ctx.conversationId, String(args.proposal_id ?? ""));
     case "send_kept":
-      return deps.proposals.sendKept(ctx.conversationId, String(args.kept_id ?? ""), ctx.confirm, { project: typeof args.project === "string" ? args.project : null, profile: typeof args.profile === "string" ? args.profile : null, defaults: ctx.newThreadDefaults });
+      return deps.proposals.sendKept(ctx.conversationId, String(args.kept_id ?? ""), ctx.confirm, { project: typeof args.project === "string" ? args.project : null, profile: typeof args.profile === "string" ? args.profile : null, model: typeof args.model === "string" ? args.model : null, defaults: ctx.newThreadDefaults });
     case "flag":
       return ctx.flag ? ctx.flag(typeof args.note === "string" ? args.note : null) : { error: "The app can't flag moments here. Say so in a few words." };
     case "remember": {
@@ -927,22 +943,34 @@ export async function runTool(
         // A new thread's prompt. Nothing is asked first: the phone keeps the draft for a target that says where to start
         // it if the user already said (drafts.ts), and after the dictation Driver asks only what it still needs.
         if (!deps.adapter.actions.includes("start_work")) return { error: "This system can't start work. Say so." };
-        const asked = typeof args.profile === "string" && args.profile.trim() ? args.profile.trim() : null;
-        const profile = deps.proposals.profileOf(asked);
-        if ("error" in profile) return profile;
+        let asked = typeof args.profile === "string" && args.profile.trim() ? args.profile.trim() : null;
+        let said = typeof args.model === "string" && args.model.trim() && !isUsual(args.model) ? args.model.trim() : null;
+        let profile = deps.proposals.profileOf(asked);
+        if ("error" in profile) {
+          // A model's name passed as the profile (20 November) is the model, if any place offers one of that name.
+          const model = deps.proposals.asModel(asked, said, (deps.adapter.places?.() ?? []).map((p) => p.models ?? []));
+          if (!model) return profile;
+          [asked, said, profile] = [null, model, deps.proposals.profileOf(null)];
+          if ("error" in profile) return profile;
+        }
         // No project named: the default project (Settings → New threads), if there is one.
         const defaults = ctx.newThreadDefaults ?? NO_DEFAULTS;
         const placed = project || defaults.project ? deps.proposals.newThread({ project, conversationId: ctx.conversationId, defaults }, asked) : null;
         // A project not settled yet (on two machines, or no match) is asked about after the dictation, as none is. An
         // older phone can't bring a prompt back to the call, so it's asked about first, as before.
         if (!ctx.promptsBack && (!placed || "error" in placed)) return placed ?? { error: "Which project is the new thread in? Ask the user, then call dictate with it." };
-        if (deps.waits.generation !== generation) return { error: "The user stopped the call; nothing will be recorded." };
         const place = placed && !("error" in placed) ? placed.place : null;
+        // A model named for a place known now is checked now, not after the dictation; it goes with the prompt by its name.
+        const chosen = place && said ? deps.proposals.modelOf(place, said, defaults.codingModel ?? null, defaults.codingProvider ?? null) : null;
+        if (chosen && "error" in chosen) return chosen;
+        if (deps.waits.generation !== generation) return { error: "The user stopped the call; nothing will be recorded." };
         const handle = place?.name ?? "";
         // A project named but not settled ("driver", on two machines) goes with the prompt, so Driver asks which of its
         // places after the dictation, not which project (14 November: "driver" was forgotten and it asked from scratch).
         const named = !place && project && placeOptions(project, deps.adapter.places?.() ?? []).length ? project : null;
-        deps.store.saveHandoff(ctx.conversationId, { handle, dictate: { itemId: newThreadTarget({ placeId: place?.id ?? null, profile: asked && profile.name, named }) } });
+        // Settings' default model goes with it too, for a tap on Send outside a call, which has no settings of its own.
+        const model = chosen?.model ? keptName(chosen.model) : said;
+        deps.store.saveHandoff(ctx.conversationId, { handle, dictate: { itemId: newThreadTarget({ placeId: place?.id ?? null, profile: asked && profile.name, named, model, defaultModel: defaults.codingModel, defaultProvider: defaults.codingProvider }) } });
         ctx.requestEnd({ kind: "dictating", handle: newThreadName(place?.name) });
         return { dictating: true, instruction: DICTATING };
       }

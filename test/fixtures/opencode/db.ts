@@ -23,6 +23,9 @@ CREATE INDEX IF NOT EXISTS \`part_message_id_id_idx\` ON \`part\` (\`message_id\
 CREATE INDEX IF NOT EXISTS \`part_session_idx\` ON \`part\` (\`session_id\`);
 CREATE INDEX IF NOT EXISTS \`session_parent_idx\` ON \`session\` (\`parent_id\`);`;
 
+// OpenCode on Windows stores folders with "/" (`C:/Users/me/proj`: its storagePath), and so does this there.
+const stored = (dir: string) => process.platform === "win32" ? dir.replaceAll("\\", "/") : dir;
+
 let seq = 0;
 /** Ids as OpenCode makes them: a prefix, then hex that sorts in creation order. */
 export const newId = (prefix: string) => `${prefix}_${(BigInt(Date.now()) * 4096n + BigInt(seq++ % 4096)).toString(16).padStart(14, "0")}${randomBytes(6).toString("hex")}`;
@@ -39,13 +42,13 @@ export class FakeDb {
     this.project("/", "global", null);
   }
   project(worktree: string, id = newId("prj"), vcs: string | null = "git") {
-    this.db.prepare("INSERT OR IGNORE INTO project (id, worktree, vcs, time_created, time_updated, sandboxes) VALUES (?,?,?,?,?,?)").run(id, worktree, vcs, Date.now(), Date.now(), "[]");
+    this.db.prepare("INSERT OR IGNORE INTO project (id, worktree, vcs, time_created, time_updated, sandboxes) VALUES (?,?,?,?,?,?)").run(id, stored(worktree), vcs, Date.now(), Date.now(), "[]");
     return id;
   }
   session(o: { directory: string; id?: string; title?: string; parentId?: string; archived?: number; permission?: unknown; agent?: string; updated?: number; created?: number; projectId?: string }): string {
     const id = o.id ?? newId("ses"), at = o.updated ?? Date.now();
     this.db.prepare(`INSERT INTO session (id, project_id, parent_id, slug, directory, path, title, version, permission, agent, model, time_created, time_updated, time_archived)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, o.projectId ?? "global", o.parentId ?? null, "brave-orchid", o.directory, "", o.title ?? `New session - ${new Date(at).toISOString()}`,
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(id, o.projectId ?? "global", o.parentId ?? null, "brave-orchid", stored(o.directory), "", o.title ?? `New session - ${new Date(at).toISOString()}`,
       "1.19.5", o.permission === undefined ? null : JSON.stringify(o.permission), o.agent ?? "build", JSON.stringify({ id: "mock-model", providerID: "mock" }), o.created ?? at, at, o.archived ?? null);
     return id;
   }

@@ -127,7 +127,7 @@ export const THREADS: DemoThread[] = [
       summary: "It's building demo mode: a fake workspace for App Review.",
       finishesInSec: 75,
       text: "Demo mode is in. The brain has a demo adapter with a fixed workspace of 13 threads across 5 projects, with questions, subagents and a snoozed thread; every command succeeds without changing anything, and replies arrive about 20 seconds after a follow-up. It's picked per account, so App Review lands in it. All 412 tests pass. It's on the branch demo-mode, not merged yet. Want me to merge it and deploy to the staging brain?",
-      card: ready("Demo mode is built and tests pass; it's asking to merge it and deploy to staging."),
+      card: ready("Demo mode is built and tests pass, on a branch not merged yet. It offers to merge it and deploy to staging."),
     },
     next: [{
       when: /merge|deploy|ship|go ahead|yes|do it/i,

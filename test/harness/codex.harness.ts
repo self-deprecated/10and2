@@ -22,7 +22,8 @@ test("Codex: list, read, steer idle and busy, answer a question, continue a clos
   writeFileSync(join(codexHome, "config.toml"), [
     `model = "mock-model"`, `model_provider = "mock"`, `check_for_update_on_startup = false`, ``,
     `[model_providers.mock]`, `name = "Mock"`, `base_url = "${mock.url}/v1"`, `wire_api = "responses"`, ``,
-    `[projects."${cwd}"]`, `trust_level = "trusted"`, ``,
+    // A literal string: in a basic one, a Windows folder's backslashes (C:\Users) would be read as escapes.
+    `[projects.'${cwd}']`, `trust_level = "trusted"`, ``,
     `[features]`, `plugins = false`, `plugin_discovery_prefetch = false`, `remote_plugin = false`, ``,
     `[analytics]`, `enabled = false`, ``,
     `[tui]`, `screen_reader_detection_done = true`, `show_tooltips = false`, ``].join("\n"));

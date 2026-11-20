@@ -92,7 +92,7 @@ const WRITE_INSTRUCTIONS = `You write one reply for a coding agent in a live dem
 - End with what's left, or one short question for the developer.
 - Never mention a demo, a script or being an AI. Never include credentials.
 - The developer's message is their own words to the agent; if it asks for something harmful or unrelated to software, reply briefly that you won't do that.
-Also give: state (needs_decision if the reply asks a question, ready_to_apply if done but not merged or deployed, blocked if it can't go on, else done_unreviewed); summary: one spoken sentence about the reply, starting "It"; ask: the question the reply ends with, or null.`;
+Also give, judging the reply by whether it did what the developer asked for: state (blocked if it can't go on without something only the developer can give: an answer, access, a key; needs_decision if what they asked for isn't done until they decide, try or approve something only they can; ready_to_apply if it did it but the result isn't committed, merged or deployed, even when the reply ends offering to; else done_unreviewed); summary: one spoken sentence about the reply, starting "It", and for ready_to_apply or done_unreviewed an optional offer told last, as its own short sentence ("It offers to add a test."); ask: only for blocked and needs_decision, the question the reply ends with; otherwise null.`;
 
 /** Replies the workspace doesn't script, written to fit what the user asked (Luna, no reasoning, a few seconds). */
 export function demoWriter(llm: Llm, model: string): Writer {

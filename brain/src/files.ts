@@ -2,7 +2,7 @@
 // Lattice, an R2 bucket under the user's own prefix in the cloud. Paths are relative and use "/".
 import { createWriteStream, mkdirSync } from "node:fs";
 import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { dirname, join, posix } from "node:path";
 import { Writable } from "node:stream";
 
 export type FileInfo = { path: string; size: number; at: number };
@@ -42,7 +42,8 @@ export function dirFiles(root: string): Files {
       const out: FileInfo[] = [];
       for (const name of names) {
         const s = await stat(full(join(dir, name))).catch(() => null);
-        if (s?.isFile()) out.push({ path: join(dir, name), size: s.size, at: s.mtimeMs });
+        // "/" on every system, as the callers split and compare it (Windows' join would give sessions\x.jsonl).
+        if (s?.isFile()) out.push({ path: posix.join(dir, name), size: s.size, at: s.mtimeMs });
       }
       return out;
     },

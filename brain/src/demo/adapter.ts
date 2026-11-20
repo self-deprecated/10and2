@@ -107,7 +107,8 @@ export class DemoAdapter implements Adapter {
   places(): Place[] {
     const active = new Map<string, string>();
     for (const t of this.threads.values()) if ((active.get(t.item.group) ?? "") < t.item.updatedAt) active.set(t.item.group, t.item.updatedAt);
-    return [...active].map(([name, activeAt]) => ({ id: `demo-place-${name}`, name, activeAt }));
+    // No models to choose from (docs/launch/thread-model.md): a model asked for starts as usual, if the user says so.
+    return [...active].map(([name, activeAt]) => ({ id: `demo-place-${name}`, name, activeAt, models: [] }));
   }
 
   async report(id: string): Promise<Report> {

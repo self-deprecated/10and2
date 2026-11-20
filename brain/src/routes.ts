@@ -122,7 +122,22 @@ export const ROUTES: Route[] = [
   { method: "DELETE", path: "/api/account", access: "signed_in", by: "worker", where: "cloud" },
   { method: "GET", path: "/api/account", access: "signed_in", by: "brain", where: "both" },
   { method: "GET", path: "/api/account/usage", access: "signed_in", by: "brain", where: "cloud" },
+  // A phone's report of the message `/api/account` gave it (docs/launch/messages.md). `message` is Ops' id for it, the
+  // same for every account, so it isn't one of `ids`; one this account was never served is refused all the same.
+  {
+    method: "POST", path: "/api/messages", access: "signed_in", by: "brain", where: "cloud", body: { message: "m_k3x9q2b7wd", event: "shown" },
+    idempotent: { key: "message and event: the first of each counts", tested: ["cloud/test/workerd.test.ts", "messages to users: one chosen for the phone that asks, reported once, counted in Ops with no id"] },
+  },
+  // What only the phone sees the account do: the day it last did is kept (docs/launch/messages.md).
+  {
+    method: "POST", path: "/api/actions", access: "signed_in", by: "brain", where: "cloud", body: { action: "call_ear" },
+    idempotent: { key: "action: it sets the day the account last did it", tested: ["cloud/test/workerd.test.ts", "what people have done, and builds in use: the phone's actions kept as a day, a build counted once a week"] },
+  },
   { method: "PUT", path: "/api/account/call-audio", access: "signed_in", by: "brain", where: "cloud", body: { on: false } },
+  {
+    method: "PUT", path: "/api/account/stale-after", access: "signed_in", by: "brain", where: "both", body: { days: 14 },
+    idempotent: { key: "days: it sets the account's stale age" },
+  },
   { method: "PUT", path: "/api/analytics", access: "signed_in", by: "brain", where: "both", body: { share: true } },
   { method: "POST", path: "/api/machines/revoke", access: "signed_in", by: "brain", where: "cloud", body: { deviceId: "d-0123456789" }, ids: [body("deviceId", "device")] },
   { method: "GET", path: "/api/credits/packs", access: "signed_in", by: "worker", where: "cloud" },

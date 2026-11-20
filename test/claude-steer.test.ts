@@ -3,15 +3,18 @@
 // work as background sessions. All against synthetic sockets, transcripts and a fake `claude`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { createServer, type Socket } from "node:net";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { createServer } from "node:net";
 import type { TestContext } from "node:test";
-import { answersFor, goAhead } from "../src/claude/adapter.ts";
-import { attestedMode, envelope, heldFor } from "../src/claude/inbox.ts";
+import { answersFor, goAhead, placeId } from "../src/claude/adapter.ts";
+import { attestedMode, envelope, heldFor, peerKeyFile, peerToken } from "../src/claude/inbox.ts";
+import { inboxPath } from "../src/claude/registry.ts";
 import { relayHook } from "../src/claude/hooks.ts";
 import type { Action, LaunchProfile } from "../src/contract.ts";
-import { harness, until } from "./fixtures/claude/helpers.ts";
+import { filetime, harness, keyFile, PEER_TOKEN, until } from "./fixtures/claude/helpers.ts";
+import { ipcPath, WINDOWS } from "./fixtures/platform.ts";
 
 function env(t: TestContext, key: string, value: string) {
   const old = process.env[key]; process.env[key] = value;
@@ -33,7 +36,7 @@ async function inbox(t: TestContext, path: string, onUser?: (line: any) => void)
       }
     });
   });
-  await new Promise<void>((resolve) => server.listen(path, resolve));
+  await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(path, resolve); });
   t.after(() => server.close());
   return lines;
 }
@@ -63,16 +66,17 @@ test("a message is Claude Code's peer envelope from 10 & 2, attesting the sessio
 });
 
 test("a follow-up to a session open in a terminal goes to its inbox, with its token, and counts once Claude Code queues it", async (t) => {
-  const h = harness(t), f = h.completed(undefined, h.cwd, "auto"), sock = join(h.root, "inbox.sock");
+  const h = harness(t), f = h.completed(undefined, h.cwd, "auto"), sock = ipcPath(h.root, "inbox.sock");
   const lines = await inbox(t, sock, (line) => f.append({ type: "queue-operation", operation: "enqueue", content: line.message.content }));
   h.registry(f.id, "busy", { messagingSocketPath: sock });
-  writeFileSync(join(h.config, "sessions", `${process.pid}.abc.key`), JSON.stringify({ peerToken: "peer-token-123", procStart: "1", pidDomain: "x" }));
+  // A crashed session's key, left behind under the same pid: never the one used.
+  writeFileSync(join(h.config, "sessions", `${process.pid}.stale.key`), JSON.stringify({ peerToken: "stale-token-999", procStart: "1", procStartFt: "1", pidDomain: "x" }));
   await h.adapter.start();
   const action: Action = { kind: "follow_up", itemId: f.id, message: "Stop after the first command" };
   assert.equal(await h.adapter.check(action), null, "a live session with an inbox isn't refused");
   assert.equal(h.adapter.refusals()[f.id], undefined);
   assert.deepEqual(await h.adapter.execute(action, "steer"), { ok: true });
-  assert.deepEqual(lines[0], { type: "auth", token: "peer-token-123" });
+  assert.deepEqual(lines[0], { type: "auth", token: PEER_TOKEN });
   assert.equal(lines[1].session_id, f.id);
   assert.match(lines[1].uuid, /^[0-9a-f-]{36}$/);
   assert.equal(lines[1].message.content, envelope(action.message, "prompting"));
@@ -81,7 +85,7 @@ test("a follow-up to a session open in a terminal goes to its inbox, with its to
 });
 
 test("a message that starts a turn counts by its own id in the transcript", async (t) => {
-  const h = harness(t), f = h.completed(undefined, h.cwd, "auto"), sock = join(h.root, "inbox.sock");
+  const h = harness(t), f = h.completed(undefined, h.cwd, "auto"), sock = ipcPath(h.root, "inbox.sock");
   await inbox(t, sock, (line) => f.append({ type: "user", uuid: line.uuid, isMeta: true, origin: { kind: "peer" }, message: { content: line.message.content } }));
   h.registry(f.id, "idle", { messagingSocketPath: sock });
   await h.adapter.start();
@@ -89,30 +93,30 @@ test("a message that starts a turn counts by its own id in the transcript", asyn
 });
 
 test("a session that bypasses prompts gets bypass attested under a full-access ceiling, and is told to wait otherwise", async (t) => {
-  const full = harness(t, { policy: { maxRuntimeMode: "full-access" } }), a = full.completed(undefined, full.cwd, "bypassPermissions"), sockA = join(full.root, "a.sock");
+  const full = harness(t, { policy: { maxRuntimeMode: "full-access" } }), a = full.completed(undefined, full.cwd, "bypassPermissions"), sockA = ipcPath(full.root, "a.sock");
   const sentA = await inbox(t, sockA, (line) => a.append({ type: "queue-operation", operation: "enqueue", content: line.message.content }));
   full.registry(a.id, "idle", { messagingSocketPath: sockA });
   await full.adapter.start();
   assert.deepEqual(await full.adapter.execute({ kind: "follow_up", itemId: a.id, message: "Go" }, "bypass"), { ok: true });
-  assert.match(sentA[0].message.content, /from-mode="bypass"/);
+  assert.match(sentA.find((l) => l.type === "user").message.content, /from-mode="bypass"/);
 
-  const capped = harness(t, { acceptanceTimeoutMs: 200 }), b = capped.completed(undefined, capped.cwd, "bypassPermissions"), sockB = join(capped.root, "b.sock");
+  const capped = harness(t, { acceptanceTimeoutMs: 200 }), b = capped.completed(undefined, capped.cwd, "bypassPermissions"), sockB = ipcPath(capped.root, "b.sock");
   const sentB = await inbox(t, sockB); // Claude Code holds it for the user's approval: nothing is queued.
   capped.registry(b.id, "idle", { messagingSocketPath: sockB });
   await capped.adapter.start();
   const receipt = await capped.adapter.execute({ kind: "follow_up", itemId: b.id, message: "Go" }, "held");
   assert.equal(receipt.ok, false); if (!receipt.ok) { assert.equal(receipt.unknown, true); assert.match(receipt.error, /waiting for your OK/); }
-  assert.match(sentB[0].message.content, /from-mode="prompting"/);
+  assert.match(sentB.find((l) => l.type === "user").message.content, /from-mode="prompting"/);
 });
 
 test("an inbox nobody answers, or one that takes nothing, is never retried", async (t) => {
   const h = harness(t, { acceptanceTimeoutMs: 200 }), f = h.completed(undefined, h.cwd, "auto");
-  h.registry(f.id, "idle", { messagingSocketPath: join(h.root, "gone.sock") });
+  h.registry(f.id, "idle", { messagingSocketPath: ipcPath(h.root, "gone.sock") });
   await h.adapter.start();
   const gone = await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "Hello" }, "gone");
   assert.equal(gone.ok, false); if (!gone.ok) { assert.equal(gone.unknown, undefined); assert.match(gone.error, /couldn't reach/); }
 
-  const g = harness(t, { acceptanceTimeoutMs: 200 }), s = g.completed(undefined, g.cwd, "auto"), sock = join(g.root, "quiet.sock");
+  const g = harness(t, { acceptanceTimeoutMs: 200 }), s = g.completed(undefined, g.cwd, "auto"), sock = ipcPath(g.root, "quiet.sock");
   const sent = await inbox(t, sock);
   g.registry(s.id, "idle", { messagingSocketPath: sock });
   await g.adapter.start();
@@ -136,7 +140,7 @@ function asking(h: ReturnType<typeof harness>) {
   const questions = [{ question: "Should lap times show seconds or milliseconds?", header: "Lap format", multiSelect: false,
     options: [{ label: "Seconds", description: "12.3 s" }, { label: "Milliseconds", description: "12345 ms" }] }];
   f.append({ type: "user", uuid: "prompt-2", promptId: "turn-2", permissionMode: "auto", message: { content: "Ask me about the format." } });
-  h.registry(f.id, "waiting", { messagingSocketPath: join(h.root, "unused.sock") });
+  h.registry(f.id, "waiting", { messagingSocketPath: ipcPath(h.root, "unused.sock") });
   return { f, questions };
 }
 
@@ -181,7 +185,7 @@ test("a plan goes ahead on a plain yes; other words go back to Claude as what to
 
 test("Claude's plan, held by the hook, is read out, then approved as it is or sent back with the user's words", async (t) => {
   const h = harness(t), f = h.completed(undefined, h.cwd, "plan");
-  h.registry(f.id, "waiting", { messagingSocketPath: join(h.root, "unused.sock") });
+  h.registry(f.id, "waiting", { messagingSocketPath: ipcPath(h.root, "unused.sock") });
   await h.adapter.start();
   const plan = "1. Add a laps module. 2. Show the fastest lap at the end. 3. Add tests.";
   const ask = (key: string, words: string) => {
@@ -253,19 +257,21 @@ test("new work can start in any folder trusted in Claude Code, not only one with
   const h = harness(t, { policy: { projects: "*" } });
   const old = join(h.root, "old-project"), untrusted = join(h.root, "untrusted"), gone = join(h.root, "gone");
   for (const dir of [old, untrusted]) mkdirSync(join(dir, ".git"), { recursive: true });
+  // Claude Code keys them with forward slashes on Windows (C:/Users/me/proj).
+  const key = (dir: string) => WINDOWS ? dir.replaceAll("\\", "/") : dir;
   writeFileSync(join(h.config, ".claude.json"), JSON.stringify({ projects: {
-    [old]: { hasTrustDialogAccepted: true }, [untrusted]: { hasTrustDialogAccepted: false }, [gone]: { hasTrustDialogAccepted: true } } }));
+    [key(old)]: { hasTrustDialogAccepted: true }, [key(untrusted)]: { hasTrustDialogAccepted: false }, [key(gone)]: { hasTrustDialogAccepted: true } } }));
   await h.adapter.start();
   assert.deepEqual(h.adapter.places().map((p) => p.name), ["old-project"]);
 
   const hidden = harness(t); // only its own project folder is visible
-  writeFileSync(join(hidden.config, ".claude.json"), JSON.stringify({ projects: { [old]: { hasTrustDialogAccepted: true } } }));
+  writeFileSync(join(hidden.config, ".claude.json"), JSON.stringify({ projects: { [key(old)]: { hasTrustDialogAccepted: true } } }));
   await hidden.adapter.start();
   assert.deepEqual(hidden.adapter.places(), [], "a trusted folder the policy hides isn't offered");
 });
 
 test("with steering off, a session open in a terminal is refused in words; with answering off, questions aren't held", async (t) => {
-  const h = harness(t, { policy: { steer: false, answer: false } }), f = h.completed(undefined, h.cwd, "auto"), sock = join(h.root, "inbox.sock");
+  const h = harness(t, { policy: { steer: false, answer: false } }), f = h.completed(undefined, h.cwd, "auto"), sock = ipcPath(h.root, "inbox.sock");
   const sent = await inbox(t, sock);
   h.registry(f.id, "waiting", { messagingSocketPath: sock });
   await h.adapter.start();
@@ -276,4 +282,58 @@ test("with steering off, a session open in a terminal is refused in words; with 
   let printed = "";
   await relayHook(JSON.stringify({ session_id: f.id, hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion", tool_input: { questions: [{ question: "Q?", options: [{ label: "A" }] }] } }), h.adapter.socketPath, (s) => { printed += s; });
   assert.equal(printed, "", "the hook let go at once: the terminal answers");
+});
+
+test("a session whose inbox key is gone gets no message on Windows, in words; elsewhere the message goes without it", async (t) => {
+  const h = harness(t, { acceptanceTimeoutMs: 500 }), f = h.completed(undefined, h.cwd, "auto"), sock = ipcPath(h.root, "inbox.sock");
+  const lines = await inbox(t, sock, (line) => f.append({ type: "queue-operation", operation: "enqueue", content: line.message.content }));
+  h.registry(f.id, "idle", { messagingSocketPath: sock });
+  rmSync(join(h.config, "sessions", keyFile(process.pid, sock)));
+  await h.adapter.start();
+  const receipt = await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "Hello" }, "no-key");
+  if (WINDOWS) {
+    assert.equal(receipt.ok, false); if (!receipt.ok) { assert.equal(receipt.unknown, undefined); assert.match(receipt.error, /wouldn't take a message from 10 & 2/); }
+    assert.equal(lines.length, 0, "nothing was sent");
+  } else {
+    assert.deepEqual(receipt, { ok: true });
+    assert.equal(lines[0].type, "user", "no auth line");
+  }
+});
+
+test("Claude Code's Windows inbox is a pipe: taken there, and only there", () => {
+  const pipe = "\\\\.\\pipe\\LOCAL\\cc-msg-0123456789abcdef0123456789abcdef";
+  assert.equal(inboxPath(pipe, "win32"), pipe);
+  assert.equal(inboxPath("\\\\.\\pipe\\10and2-test-x-inbox.sock", "win32"), "\\\\.\\pipe\\10and2-test-x-inbox.sock");
+  assert.equal(inboxPath("\\\\?\\pipe\\local\\cc-msg-ab", "win32"), "\\\\?\\pipe\\local\\cc-msg-ab");
+  for (const other of ["C:\\Users\\me\\.claude\\inbox.sock", "\\\\server\\share\\x", "\\\\.\\pipe\\", "\\\\.\\pipe\\a\\b\\c", 42, null]) assert.equal(inboxPath(other, "win32"), null, String(other));
+  assert.equal(inboxPath(pipe, "linux"), null);
+  assert.equal(inboxPath("/run/user/1000/claude/inbox.sock", "linux"), "/run/user/1000/claude/inbox.sock");
+  assert.equal(inboxPath("relative.sock", "darwin"), null);
+});
+
+test("the peer token is read from the key file Claude Code names for that inbox, else one recording the session's start", (t) => {
+  const h = harness(t), sessions = join(h.config, "sessions"), pid = 4242, start = filetime(1_700_000_000_000);
+  const pipe = "\\\\.\\pipe\\LOCAL\\cc-msg-0123456789ABCDEF0123456789abcdef";
+  // Claude Code hashes the pipe's name after \\.\pipe\, lower-cased.
+  const named = `${pid}.${createHash("sha256").update("\\\\.\\pipe\\local\\cc-msg-0123456789abcdef0123456789abcdef").digest("hex")}.key`;
+  assert.equal(peerKeyFile(pid, pipe), named);
+  assert.equal(peerKeyFile(pid, pipe.replace("\\\\.\\", "\\\\?\\")), named);
+  assert.equal(peerKeyFile(pid, "/tmp/x/../inbox.sock"), `${pid}.${createHash("sha256").update(resolve("/tmp/inbox.sock")).digest("hex")}.key`);
+  writeFileSync(join(sessions, named), JSON.stringify({ peerToken: "exact-token-1", procStartFt: "1", pidDomain: "win32:host" }));
+  assert.equal(peerToken(h.config, pid, pipe, start), "exact-token-1", "the exact file, whatever it records");
+  rmSync(join(sessions, named));
+  writeFileSync(join(sessions, `${pid}.${randomUUID()}.key`), JSON.stringify({ peerToken: "stale-token-1", procStartFt: "1" }));
+  assert.equal(peerToken(h.config, pid, pipe, start), null, "a stale session's key isn't taken");
+  assert.equal(peerToken(h.config, pid, pipe, null), null);
+  writeFileSync(join(sessions, `${pid}.other.key`), JSON.stringify({ peerToken: "start-token-1", procStartFt: start }));
+  writeFileSync(join(sessions, `${pid + 1}.other.key`), JSON.stringify({ peerToken: "other-pid-token", procStartFt: start }));
+  assert.equal(peerToken(h.config, pid, pipe, start), "start-token-1");
+  writeFileSync(join(sessions, `${pid}.other.key`), JSON.stringify({ peerToken: "bad token!", procStartFt: start }));
+  assert.equal(peerToken(h.config, pid, pipe, start), null, "a malformed token isn't sent");
+});
+
+test("on Windows a project is one place whatever the case its folder was recorded in", () => {
+  assert.equal(placeId("C:\\Users\\Me\\Proj", "win32"), placeId("c:\\users\\me\\proj", "win32"));
+  assert.notEqual(placeId("/home/me/Proj", "linux"), placeId("/home/me/proj", "linux"));
+  assert.equal(placeId("/home/me/proj", "linux"), placeId("/home/me/proj", "win32"));
 });

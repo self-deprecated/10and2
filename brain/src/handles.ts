@@ -120,9 +120,11 @@ export const isMark = (w: string) => mark(w);
  * Quartz"), when `where` keeps its clause marks. `named`: where in `head` the thread's name starts, before which "the
  * thread called" (the setting `threadNames`, which the voice model says in readbacks too) is passed over: "Snooze the
  * thread called Agent Reel" says "snooze agent reel" (named 1), but "The thread called Archive Agent Reel" doesn't say
- * "archive agent reel": there "archive" is part of a name.
+ * "archive agent reel": there "archive" is part of a name. `clauses` follow `where`, in order, each word for word and each
+ * left out only when it's `optional`: a new thread's profile and model ("…, with the Plan profile, using Claude Opus
+ * 5.5, with this…"), any of which may be needed while one before it isn't.
  */
-export function saysHead(spoken: string[], head: string[], next: string | string[] | null, where: string[] = [], named?: number): boolean {
+export function saysHead(spoken: string[], head: string[], next: string | string[] | null, where: string[] = [], named?: number, clauses: { words: string[]; optional: boolean }[] = []): boolean {
   const after = typeof next === "string" ? [next] : next;
   start: for (let i = 0; i < spoken.length; i++) {
     // A clause starts after any mark, including where a new utterance began.
@@ -153,6 +155,11 @@ export function saysHead(spoken: string[], head: string[], next: string | string
       if (k >= 0) j = k;
       else if (clause >= 0) j = clause;
     }
+    for (const c of clauses) {
+      const end = clauseAt(spoken, j, c.words);
+      if (end >= 0) j = end;
+      else if (!c.optional) continue start;
+    }
     if (after === null) {
       // Only a real sentence end finishes the name; never the end of what's been said so far (the name may go on:
       // "Agent Reel" → "… Dashboard"), nor an utterance start. A comma does only before the readback's own question.
@@ -167,6 +174,20 @@ export function saysHead(spoken: string[], head: string[], next: string | string
     })) return true;
   }
   return false;
+}
+
+/**
+ * Where `words` end when `spoken` says them from `at`, perhaps after marks, or -1. A number's point is heard between its
+ * digits: "Opus five point five" says "opus 5 5" (Opus 5.5).
+ */
+function clauseAt(spoken: string[], at: number, words: string[]): number {
+  let k = at;
+  for (const [n, w] of words.entries()) {
+    while (mark(spoken[k])) k++;
+    if (n > 0 && (spoken[k] === "point" || spoken[k] === "dot") && /^\d+$/.test(words[n - 1]) && /^\d+$/.test(w)) k++;
+    if (spoken[k++] !== w) return -1;
+  }
+  return k;
 }
 
 /** The words that identify a name, as said (not stemmed). Numbers count, even one digit: "proj 2" is not "proj". */

@@ -6,15 +6,19 @@ import type { RuntimeMode } from "../policy.ts";
 
 export type Rule = { permission: string; pattern: string; action: "allow" | "ask" | "deny" };
 
-/** OpenCode's wildcard: `*` any run, `?` one character, and a trailing " *" also matches nothing ("ls *" matches "ls"). */
-export function wildcard(value: string, pattern: string): boolean {
-  let re = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+/**
+ * OpenCode's wildcard: `*` any run, `?` one character, and a trailing " *" also matches nothing ("ls *" matches "ls").
+ * Like OpenCode's own (core/src/util/wildcard.ts, 1.19.6), "\" counts as "/" in both, and on Windows case is ignored,
+ * so a rule for `C:\*` covers `c:/users/...` there as OpenCode decides it.
+ */
+export function wildcard(value: string, pattern: string, platform: NodeJS.Platform = process.platform): boolean {
+  let re = pattern.replaceAll("\\", "/").replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
   if (re.endsWith(" .*")) re = re.slice(0, -3) + "( .*)?";
-  return new RegExp(`^${re}$`, "s").test(value);
+  return new RegExp(`^${re}$`, platform === "win32" ? "si" : "s").test(value.replaceAll("\\", "/"));
 }
 
-export function evaluate(rules: readonly Rule[], permission: string, pattern: string): Rule["action"] {
-  return rules.findLast((r) => wildcard(permission, r.permission) && wildcard(pattern, r.pattern))?.action ?? "ask";
+export function evaluate(rules: readonly Rule[], permission: string, pattern: string, platform: NodeJS.Platform = process.platform): Rule["action"] {
+  return rules.findLast((r) => wildcard(permission, r.permission, platform) && wildcard(pattern, r.pattern, platform))?.action ?? "ask";
 }
 
 export const isRules = (v: unknown): v is Rule[] => Array.isArray(v) && v.every((r) =>
@@ -22,12 +26,14 @@ export const isRules = (v: unknown): v is Rule[] => Array.isArray(v) && v.every(
 
 /**
  * The runtime mode a ruleset amounts to: files outside the project unasked is full access; any command unasked is
- * auto; edits unasked is auto-accept-edits; else approval required.
+ * auto; edits unasked is auto-accept-edits; else approval required. On Windows a folder outside is also one on the
+ * system drive (`C:\...`), which a rule such as `C:/*` allows without allowing `/...`.
  */
-export function reach(rules: readonly Rule[]): RuntimeMode {
-  if (evaluate(rules, "external_directory", "/10and2-probe/outside/file") === "allow") return "full-access";
-  if (evaluate(rules, "bash", "10and2-probe --any command") === "allow") return "auto";
-  if (evaluate(rules, "edit", "10and2-probe.txt") === "allow") return "auto-accept-edits";
+export function reach(rules: readonly Rule[], platform: NodeJS.Platform = process.platform): RuntimeMode {
+  const outside = ["/10and2-probe/outside/file", ...platform === "win32" ? [`${process.env.SystemDrive || "C:"}\\10and2-probe\\outside\\file`] : []];
+  if (outside.some((p) => evaluate(rules, "external_directory", p, platform) === "allow")) return "full-access";
+  if (evaluate(rules, "bash", "10and2-probe --any command", platform) === "allow") return "auto";
+  if (evaluate(rules, "edit", "10and2-probe.txt", platform) === "allow") return "auto-accept-edits";
   return "approval-required";
 }
 export const atMost = (mode: RuntimeMode, ceiling: RuntimeMode) => RUNTIME_MODES.indexOf(mode) <= RUNTIME_MODES.indexOf(ceiling);

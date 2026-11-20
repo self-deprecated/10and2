@@ -11,14 +11,15 @@ import { attachConnectors, type ConnectorMachine } from "./connectors.ts";
 import type { Config } from "./config.ts";
 import { defaults, MAX_MINUTES_CAP, type Settings } from "./settings.ts";
 import type { Beat, CallEvent, Calls } from "./calls.ts";
-import { headTail } from "./briefing.ts";
+import { headTail, setStaleAfterDays, staleAfterDays, staleAfterOf } from "./briefing.ts";
 import { TAP, type KeptReply, type Proposal, type Seen, type Store } from "./store.ts";
 import { markRead, newReplies, syncVisits } from "./reads.ts";
 import { WatchedReplies } from "./updates.ts";
 import { inRange, masked, pastReplies, prepare, prepareReply, type ReadingStyle } from "./reading.ts";
 import { briefingHeard, prepareBriefing, type BriefingWriter } from "./briefing-reading.ts";
-import { CONVERSATION_VOICES, READING_VOICES } from "./voice/voices.ts";
-import type { Speech } from "./voice/speech.ts";
+import { REALTIME_READER } from "./models.ts";
+import { CONVERSATION_VOICES, READING_VOICES, REALTIME_READING_VOICES } from "./voice/voices.ts";
+import { isReadingOff, type Speech } from "./voice/speech.ts";
 import { holdAfter, namedItems, recordNames, setStar, type ToolDeps, type Watched } from "./voice/tools.ts";
 import { wakeWordOf } from "./voice/wakeWord.ts";
 import { newThreadPromptOf, threadNamesOf, type NewThreadPrompt, type ThreadNames } from "./voice/prompts.ts";
@@ -31,6 +32,7 @@ import { buildSessionConfig, speaksFirst, VoiceSession, type Conversations, type
 import { CallView, type CallRecord } from "./voice/callview.ts";
 import { describe, spokenHost } from "./util.ts";
 import { newThreadDefaultsOf, placeParts, spokenPlaces, type NewThreadDefaults } from "./places.ts";
+import { codingModels } from "./thread-models.ts";
 import type { ConsentHolder, Props } from "./analytics.ts";
 import { recentDrives, summarize, summaryText } from "./drives.ts";
 import { assemble, dictatedParts, DRAFT_MAX, draftStateOf, isNewThread, mentionedPlaces, newThreadName, parseDraft, parseNewThread, placedTarget, REPLY_PARTS_MAX, tappedReplies, tappedReply, tappedWords, wordCount, type Draft, type NewThread } from "./drafts.ts";
@@ -39,6 +41,12 @@ import { SHOWN, timeline, timelineQuery } from "./timeline.ts";
 import { merge, ownOf, parseOwn, STORE_KEY as VOCABULARY_KEY } from "./vocabulary.ts";
 import type { RecordSpend } from "./spend.ts";
 import { keepsThroughStop, type Ringer } from "./ring.ts";
+
+/**
+ * What a 503 says while the reading voice is switched off (settings `readingEngine`): the phone reads it in its own
+ * voice, and shows this under a voice sample.
+ */
+export const READING_OFF = "The natural voice is off for now; your phone's voice reads instead.";
 
 /** A session request that can't go ahead, for a reason the phone shows the user. */
 class Refused extends Error {}
@@ -242,7 +250,11 @@ const styleOf = (body: any, style: unknown): ReadingStyle => ({
   fast: fastOf(body).readings,
 });
 
-function api(cfg: Config, deps: ServerDeps): Api {
+/**
+ * One world's API: the real brain's, or a demo world's. `own`: the user's own store, for what's theirs in a demo world
+ * too (how long a question may wait before it's stale, `GET /api/account`).
+ */
+function api(cfg: Config, deps: ServerDeps, own: Pick<Store, "get"> = deps.store): Api {
   const updates = new WatchedReplies(deps);
   const brainRev = deps.brainRev ?? "dev";
   /** The settings a call starting now gets. */
@@ -1322,8 +1334,10 @@ function api(cfg: Config, deps: ServerDeps): Api {
         const places = (deps.adapter.actions.includes("start_work") ? spokenPlaces(deps.adapter.places?.() ?? []) : [])
           .filter((p) => (deps.adapter.actionsFor?.(p.id) ?? deps.adapter.actions).includes("start_work"))
           .sort((a, b) => (b.activeAt ?? "").localeCompare(a.activeAt ?? ""));
-        // Each with its project, machine and coding app, for Settings → New threads' lists.
-        return send(200, { places: places.map((p) => ({ id: p.id, name: p.name, activeAt: p.activeAt, ...placeParts(p) })) });
+        // Each with its project, machine and coding app, for Settings → New threads' lists; and every coding model they
+        // offer, once per name and provider, under its heading, for its Coding model (a name and provider: each place's
+        // own list is matched when a thread starts, thread-models.ts).
+        return send(200, { places: places.map((p) => ({ id: p.id, name: p.name, activeAt: p.activeAt, ...placeParts(p) })), codingModels: codingModels(places) });
       }
       if (req.method === "POST" && url.pathname === "/api/kept/send") {
         const body = await readJson(req);
@@ -1392,7 +1406,7 @@ function api(cfg: Config, deps: ServerDeps): Api {
       // The account, on a brain without accounts (Lattice): no meter, so no credits. The cloud answers this itself.
       if (req.method === "GET" && url.pathname === "/api/account") {
         const machines = deps.adapter.connectionStatus?.() ?? [{ name: deps.adapter.name, connected: deps.adapter.connected() }];
-        return send(200, { userId: "lattice", mode: "lattice", credits: null, allowance: null, machines, rev: brainRev });
+        return send(200, { userId: "lattice", mode: "lattice", credits: null, allowance: null, machines, staleAfterDays: staleAfterDays(own), rev: brainRev });
       }
       // Local cues during a call use this read-only path, with no GPT-Live events or classification work.
       if (req.method === "GET" && url.pathname === "/api/updates") {
@@ -1413,7 +1427,10 @@ function api(cfg: Config, deps: ServerDeps): Api {
       }
       if (req.method === "GET" && url.pathname === "/api/voices") {
         const settings = current();
-        return send(200, { conversation: CONVERSATION_VOICES, reading: READING_VOICES, conversationDefault: settings.voice, readingDefault: "marin", sample: settings.sampleText });
+        // The voices the account's engine has: the replacement lacks fable, nova and onyx (it reads them in marin), so
+        // they aren't offered; a phone that saved one keeps it, and hears marin.
+        const reading = settings.readingEngine === REALTIME_READER ? REALTIME_READING_VOICES : READING_VOICES;
+        return send(200, { conversation: CONVERSATION_VOICES, reading, conversationDefault: settings.voice, readingDefault: "marin", sample: settings.sampleText });
       }
       // A reading voice saying the same few words as every other (Ops' `sampleText`), to hear it before choosing it.
       // Free (contracts §4).
@@ -1422,7 +1439,10 @@ function api(cfg: Config, deps: ServerDeps): Api {
         if (!(READING_VOICES as readonly string[]).includes(voice)) return send(400, { error: "unknown voice" });
         const samples = deps.samples ?? deps.speech;
         if (!samples) return send(503, { error: "speech isn't set up on this brain" });
-        const audio = await samples.audio(current().sampleText, voice).catch((e) => (deps.log(`voice sample: ${describe(e)}`), null));
+        let off = false;
+        const audio = await samples.audio(current().sampleText, voice).catch((e) => ((off = isReadingOff(e)) || deps.log(`voice sample: ${describe(e)}`), null));
+        // Switched off (settings `readingEngine`): nothing is made, and the phone says why.
+        if (off) return send(503, { error: READING_OFF });
         if (!audio) return send(502, { error: "Couldn't play that voice. Try again." });
         return new Response(new Uint8Array(audio), { status: 200, headers: { "content-type": "audio/aac", "content-length": String(audio.length), "cache-control": "private, max-age=86400" } });
       }
@@ -1472,13 +1492,17 @@ function api(cfg: Config, deps: ServerDeps): Api {
         if (!(READING_VOICES as readonly string[]).includes(voice)) return send(400, { error: "unknown voice" });
         if (!deps.speech) return send(503, { error: "speech isn't set up on this brain" });
         let outOfCredits: string | null = null;
+        let off = false;
         const audio = await deps.speech.audio(text, voice).catch((e) => {
           // The cloud's meter refuses to make audio the account can't pay for (contracts §4); kept audio still plays.
           if ((e as { code?: unknown }).code === "out_of_credits") outOfCredits = (e as Error).message;
+          else if (isReadingOff(e)) off = true;
           else deps.log(`speech: ${describe(e)}`);
           return null;
         });
         if (outOfCredits) return send(402, { error: outOfCredits, code: "out_of_credits" });
+        // The reading voice is switched off (settings `readingEngine`): nothing is made; the phone reads it in its own.
+        if (off) return send(503, { error: READING_OFF });
         if (!audio) return send(502, { error: "The reading voice failed; try again or use the phone's voice" });
         // The minutes making it used, once (made ahead, or for this request), so a call's playback can count them.
         const used = deps.speech.charge(text, voice);
@@ -1617,7 +1641,7 @@ export function createBrain(cfg: Config, deps: ServerDeps, demo?: DemoWorlds) {
       if (world && !fresh) return world.api;
       const old = world;
       const made = await demo!();
-      world = { api: api(cfg, made), deps: made };
+      world = { api: api(cfg, made, deps.store), deps: made };
       if (old) void old.api.close().then(() => old.deps.close()).catch((e) => deps.log(`demo: closing the last demo failed: ${describe(e)}`));
       deps.log(old ? "demo: a fresh demo" : "demo: the first demo");
       return world.api;
@@ -1668,6 +1692,14 @@ export function createBrain(cfg: Config, deps: ServerDeps, demo?: DemoWorlds) {
         if (typeof own === "string") return send(400, { error: own });
         deps.store.set(VOCABULARY_KEY, JSON.stringify(own));
         return send(200, { words: merge(own) });
+      }
+      // How long a question may wait on the user before its thread is stale (briefing.ts `aged`): the user's own setting,
+      // demo mode or not, so always the real store. It shows at once in what the briefing gives.
+      if (req.method === "PUT" && url.pathname === "/api/account/stale-after") {
+        const days = staleAfterOf(await readJson(req).catch(() => null));
+        if (days === undefined) return send(400, { error: "days must be 3, 7, 14, 30 or null" });
+        setStaleAfterDays(deps.store, days);
+        return send(200, { ok: true, staleAfterDays: days });
       }
 
       const starting = req.method === "POST" && url.pathname === "/api/session";

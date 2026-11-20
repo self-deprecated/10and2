@@ -1,9 +1,10 @@
 // A brain of your own (`10and2 brain`): its settings, kept in one private file of environment variables that
 // `10and2 brain run` reads before it loads the brain. The AI key and the access code live only there.
-import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseEnv } from "node:util";
 import { configDirectory, stateDirectory } from "./paths.ts";
+import { replaceFile } from "./util.ts";
 
 export const DEFAULT_PORT = 8790;
 export const brainEnvPath = (env: NodeJS.ProcessEnv = process.env) => join(configDirectory(env), "brain.env");
@@ -26,7 +27,7 @@ export function writeBrainEnv(vars: Record<string, string>, path = brainEnvPath(
   mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, `# Your 10 & 2 brain's settings (10and2 brain setup). Only you can read this file.\n${lines.join("\n")}\n`, { mode: 0o600 });
-  renameSync(tmp, path);
+  replaceFile(tmp, path);
 }
 
 /** The port the brain listens on, from its settings. */

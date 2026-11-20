@@ -7,7 +7,7 @@ export const SUBPROTOCOL = "10and2.mcp.1";
 /** The MCP revision whose message shapes both ends speak. */
 export const MCP_VERSION = "2025-06-18";
 /** This connector's version, as `serverInfo.version` (kept equal to package.json's). */
-export const VERSION = "0.10.0";
+export const VERSION = "0.11.0";
 export const MAX_FRAME = 8 << 20;
 /** The keep-alive frames, outside JSON-RPC, so the brain's auto-response answers them without waking. */
 export const PING = '{"type":"ping"}';
@@ -38,14 +38,17 @@ function onlyFields(value: object, fields: string[]) {
 export function actionOf(v: any): Action {
   if (!v || typeof v !== "object" || Array.isArray(v)) throw new Error("An action is required.");
   if (v.kind === "start_work") {
-    onlyFields(v, ["kind", "placeId", "title", "message", "profile"]);
+    onlyFields(v, ["kind", "placeId", "title", "message", "profile", "model"]);
     const p = v.profile;
     // No title: the work system names the thread from its prompt (a brain before 8 November always sends one).
     if (!text(v.placeId) || (v.title !== undefined && !text(v.title)) || !text(v.message) || !p || !text(p.name) ||
       !["worktree", "root"].includes(p.workspace) || !["approval-required", "auto-accept-edits", "auto", "full-access"].includes(p.runtimeMode) ||
       !["default", "plan"].includes(p.interactionMode)) throw new Error("That launch profile or project isn't valid.");
     onlyFields(p, ["name", "workspace", "runtimeMode", "interactionMode"]);
-    return { kind: v.kind, placeId: v.placeId, ...(v.title !== undefined ? { title: v.title } : {}), message: v.message, profile: { name: p.name, workspace: p.workspace, runtimeMode: p.runtimeMode, interactionMode: p.interactionMode } };
+    // One of the place's models, by the id this connector gave it; none, the coding app's own default. Copied only when
+    // given, so a start without one hashes in the ledger exactly as before.
+    if (v.model !== undefined && !(typeof v.model === "string" && v.model.length <= 200 && v.model.trim() === v.model && v.model !== "")) throw new Error("That model isn't valid.");
+    return { kind: v.kind, placeId: v.placeId, ...(v.title !== undefined ? { title: v.title } : {}), message: v.message, profile: { name: p.name, workspace: p.workspace, runtimeMode: p.runtimeMode, interactionMode: p.interactionMode }, ...(v.model !== undefined ? { model: v.model } : {}) };
   }
   if (!text(v.itemId)) throw new Error("A thread is required.");
   switch (v.kind) {
@@ -81,7 +84,8 @@ const ACTING: Record<ActionKind, Tool> = {
   unsnooze: { name: "unsnooze", description: "Wakes a snoozed thread now.", inputSchema: obj({ itemId: str }) },
   unsettle: { name: "unsettle", description: "Brings a settled thread back.", inputSchema: obj({ itemId: str }) },
   // `title` isn't required: a brain that sees so lets the work system name the thread (brain/src/connector-client.ts).
-  start_work: { name: "start_work", description: "Starts new work in a place, with a named launch profile; named by the work system from its message unless given a title.", inputSchema: obj({ placeId: str, title: str, message: str, profile }, ["placeId", "message", "profile"]) },
+  // `model` listed is how a brain knows it may send one (docs/launch/thread-model.md).
+  start_work: { name: "start_work", description: "Starts new work in a place, with a named launch profile, on one of the place's models if given one; named by the work system from its message unless given a title.", inputSchema: obj({ placeId: str, title: str, message: str, profile, model: { ...str, maxLength: 200 } }, ["placeId", "message", "profile"]) },
 };
 
 /** The tools this machine offers: reading always, acting only as its local policy allows. */

@@ -1,9 +1,11 @@
 // A client for the Codex CLI's shared app-server daemon (measured on codex-cli 0.167.0): WebSocket over the daemon's
-// control socket ($CODEX_HOME/app-server-control/app-server-control.sock, a symlink into /tmp), JSON-RPC 2.0 without
-// the "jsonrpc" field. One connection: `initialize` then `initialized`, then requests both ways and notifications.
+// control socket ($CODEX_HOME/app-server-control/app-server-control.sock: on macOS and Linux a symlink into /tmp, on
+// Windows a Windows Unix-domain socket, which Node can't open, so reached there through `codex app-server proxy`), JSON-RPC
+// 2.0 without the "jsonrpc" field. One connection: `initialize` then `initialized`, then requests both ways and notifications.
 //   us → Codex:  {id, method, params} · {method, params} · {id, result} / {id, error} (answers to its requests)
 //   Codex → us:  {id, result} / {id, error} · {method, params} (notifications) · {id, method, params} (its requests:
 //                approvals and questions, `currentTime/read`)
+import type { Duplex } from "node:stream";
 import { WebSocket } from "ws";
 
 /** Codex refused the request: a definite answer, so nothing was done. */
@@ -34,6 +36,11 @@ export type ConnectOptions = {
   /** Notifications this connection never needs (streaming deltas). */
   optOut?: string[];
   timeoutMs?: number;
+  /**
+   * Pings this often, and drops a connection that doesn't answer by the next one. Codex's proxy (Windows) keeps its end
+   * open when the daemon goes away, so without this a restarted daemon would never be reconnected to.
+   */
+  heartbeatMs?: number;
 };
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: NodeJS.Timeout };
@@ -53,15 +60,34 @@ export class CodexRpc {
     ws.on("message", (data) => this.onFrame(String(data)));
     ws.on("close", (code) => this.fail(new Error(`Codex closed the connection (${code})`)));
     ws.on("error", (err) => this.fail(err));
+    if (opts.heartbeatMs) {
+      let answered = true;
+      ws.on("pong", () => { answered = true; });
+      const beat = setInterval(() => {
+        if (!answered) { ws.terminate(); return; }
+        answered = false;
+        try { ws.ping(); } catch { /* closing */ }
+      }, opts.heartbeatMs);
+      beat.unref();
+      ws.on("close", () => clearInterval(beat));
+    }
   }
 
-  /** Opens the socket and completes the handshake. Rejects when nothing listens there (ENOENT/ECONNREFUSED) or Codex refuses. */
-  static async connect(socketPath: string, opts: ConnectOptions): Promise<CodexRpc> {
-    const ws = new WebSocket(`ws+unix://${socketPath}:/`, { handshakeTimeout: opts.timeoutMs ?? 10_000, maxPayload: 256 << 20, perMessageDeflate: false });
+  /**
+   * Opens the connection, over the socket at a path or a stream something else opened to it (Codex's proxy), and completes
+   * the handshake. Rejects when nothing listens there (ENOENT/ECONNREFUSED) or Codex refuses.
+   */
+  static async connect(to: string | (() => Duplex), opts: ConnectOptions): Promise<CodexRpc> {
+    const options = { handshakeTimeout: opts.timeoutMs ?? 10_000, maxPayload: 256 << 20, perMessageDeflate: false };
+    const ws = typeof to === "string" ? new WebSocket(`ws+unix://${to}:/`, options)
+      : new WebSocket("ws://codex/", { ...options, createConnection: to as any });
     await new Promise<void>((resolve, reject) => {
-      ws.once("open", () => resolve());
-      ws.once("unexpected-response", (_req, r) => reject(new Error(`Codex refused the connection (HTTP ${r.statusCode})`)));
-      ws.once("error", reject);
+      // ws's own handshake timeout needs a socket's timeout event, which a proxy's stream never gives: time it here too.
+      const timer = setTimeout(() => { ws.terminate(); reject(new Error("Codex didn't answer the connection in time")); }, opts.timeoutMs ?? 10_000);
+      const settle = (f: () => void) => { clearTimeout(timer); f(); };
+      ws.once("open", () => settle(resolve));
+      ws.once("unexpected-response", (_req, r) => settle(() => { ws.terminate(); reject(new Error(`Codex refused the connection (HTTP ${r.statusCode})`)); }));
+      ws.once("error", (e) => settle(() => reject(e)));
     });
     const rpc = new CodexRpc(ws, opts);
     try {

@@ -18,18 +18,32 @@ export type Draft = { id: string; itemId: string; parts: DraftPart[] };
  * the phone keeps and sends it like any other. The thread is titled as it starts. Everything in it is checked again when
  * it's proposed, as a start said aloud is; with no place, Driver asks which project after the dictation. `named`: with
  * no place, the project as the user named it when it couldn't be settled before dictating ("driver", on two machines),
- * so Driver asks which of its places rather than which project (14 November).
+ * so Driver asks which of its places rather than which project (14 November). `model`: a coding model the user named
+ * before dictating, as they said it; `defaultModel` and `defaultProvider`: Settings' default coding model then, and its
+ * provider, for a tap on Send outside a call, which has no settings of its own (docs/launch/thread-model.md). Each is
+ * matched with the place's models when it starts.
  */
-export type NewThread = { placeId: string | null; profile: string | null; named?: string | null };
+export type NewThread = { placeId: string | null; profile: string | null; named?: string | null; model?: string | null; defaultModel?: string | null; defaultProvider?: string | null };
+
+/** At most what `parseDraft` takes for a draft's thread. */
+const TARGET_MAX = 300;
 
 /**
- * `new:` and, base64url, `{"n": <a fresh id, so two prompts never share a draft>, "p": place, "f": profile, "w": named}`
- * (`named` cut to 60 characters, and only with no place: the target stays well under `parseDraft`'s 300). Phones in
- * TestFlight before 8 November keep `[placeId, title, profile]` instead: still read, the title ignored. That shape can go
- * once every tester's build is from 8 November or later (voice-new-thread.md).
+ * `new:` and, base64url, `{"n": <a fresh id, so two prompts never share a draft>, "p": place, "f": profile, "w": named,
+ * "m": model, "d": defaultModel, "e": defaultProvider}` (each but the profile cut to 60 characters, `named` only with no
+ * place, and `defaultProvider` only with `defaultModel`: the target stays under `parseDraft`'s 300; past it, the
+ * default goes, with its provider, then the model). Phones in TestFlight before 8 November keep `[placeId, title,
+ * profile]` instead: still read, the title ignored. That shape can go once every tester's build is from 8 November or
+ * later (voice-new-thread.md).
  */
-export const newThreadTarget = (t: NewThread, id = randomUUID().slice(0, 8)) =>
-  `new:${Buffer.from(JSON.stringify({ n: id, ...(t.placeId ? { p: t.placeId } : t.named?.trim() ? { w: t.named.trim().slice(0, 60) } : {}), ...(t.profile ? { f: t.profile } : {}) })).toString("base64url")}`;
+export function newThreadTarget(t: NewThread, id = randomUUID().slice(0, 8)): string {
+  const cut = (s: string | null | undefined) => s?.trim().slice(0, 60) || null;
+  const [m, d] = [cut(t.model), cut(t.defaultModel)];
+  const e = d && cut(t.defaultProvider);
+  const made = (parts: { m?: string | null; d?: string | null; e?: string | null }) =>
+    `new:${Buffer.from(JSON.stringify({ n: id, ...(t.placeId ? { p: t.placeId } : t.named?.trim() ? { w: t.named.trim().slice(0, 60) } : {}), ...(t.profile ? { f: t.profile } : {}), ...(parts.m ? { m: parts.m } : {}), ...(parts.d ? { d: parts.d } : {}), ...(parts.e ? { e: parts.e } : {}) })).toString("base64url")}`;
+  return [made({ m, d, e }), made({ m }), made({})].find((s) => s.length <= TARGET_MAX) ?? made({});
+}
 
 export const isNewThread = (itemId: string) => itemId.startsWith("new:");
 
@@ -42,7 +56,12 @@ export function parseNewThread(itemId: string): NewThread | null {
       const [placeId, title, profile] = t;
       return [placeId, title, profile].every((v) => typeof v === "string" && v) ? { placeId, profile } : null;
     }
-    return t && typeof t === "object" && given(t.n) ? { placeId: given(t.p), profile: given(t.f), ...(given(t.w) && !given(t.p) ? { named: given(t.w) } : {}) } : null;
+    if (!t || typeof t !== "object" || !given(t.n)) return null;
+    // Only what it carries: a target from before models (or with none said) is `{ placeId, profile }`, as ever.
+    return {
+      placeId: given(t.p), profile: given(t.f), ...(given(t.w) && !given(t.p) ? { named: given(t.w) } : {}),
+      ...(given(t.m) ? { model: given(t.m) } : {}), ...(given(t.d) ? { defaultModel: given(t.d), ...(given(t.e) ? { defaultProvider: given(t.e) } : {}) } : {}),
+    };
   } catch {
     return null;
   }
@@ -50,7 +69,7 @@ export function parseNewThread(itemId: string): NewThread | null {
 
 /**
  * The same new thread, to start in `placeId` (picked on the phone, in Drafts): its own id kept, so the same pick sent
- * again is the same target. Null when `target` isn't a new thread's.
+ * again is the same target, and its profile and models kept. Null when `target` isn't a new thread's.
  */
 export function placedTarget(target: string, placeId: string): string | null {
   const t = parseNewThread(target);
@@ -58,7 +77,7 @@ export function placedTarget(target: string, placeId: string): string | null {
   // Its own id (`n`); the shape from before 8 November has none, so the old target stands in for it.
   let id: unknown;
   try { id = JSON.parse(Buffer.from(target.slice(4), "base64url").toString("utf8")).n; } catch {}
-  return newThreadTarget({ placeId, profile: t.profile }, typeof id === "string" && id ? id : target.slice(4, 20));
+  return newThreadTarget({ placeId, profile: t.profile, model: t.model, defaultModel: t.defaultModel, defaultProvider: t.defaultProvider }, typeof id === "string" && id ? id : target.slice(4, 20));
 }
 
 /**

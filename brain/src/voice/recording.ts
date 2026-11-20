@@ -103,7 +103,8 @@ function* clean(value: unknown, key: string, inAudio: boolean, mode: "cut" | "sc
   }
   const audio = inAudio || audioTyped(obj.type);
   const out: Record<string, unknown> = {};
-  // `for…in` stops where the budget does, without listing every name first.
+  // `for…in` stops where the budget does. V8 still lists every name before the first, so an object of 100,000 names
+  // costs about 11 ms however soon it stops; nothing cheaper reads a plain object's names.
   for (const k in obj) {
     if (!Object.hasOwn(obj, k) || secretKey(k)) continue;
     const name = k.length > MAX_KEY ? copied(k.slice(0, MAX_KEY)) : k;

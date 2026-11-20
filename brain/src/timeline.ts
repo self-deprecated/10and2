@@ -2,7 +2,7 @@
 // with Driver and what changed in them, and what the user changed with a tap on the phone. Built only from what the
 // brain keeps already: each thread's card (its latest reply), the conversations, their carried-out changes, and the
 // taps (`TAP`). A thread's page is the same stream narrowed to it, with every one of its replies.
-import { isNew } from "./briefing.ts";
+import { aged, ASKS, isNew, staleAfterDays } from "./briefing.ts";
 import { tappedWords } from "./drafts.ts";
 import { pastReplies } from "./reading.ts";
 import type { ReadDeps } from "./reads.ts";
@@ -80,6 +80,10 @@ export async function timeline(deps: ReadDeps, q: TimelineQuery): Promise<{ item
     // The stream has each briefed thread's latest reply, with its card; a thread's page has all its replies, whatever
     // its state, the earlier ones saying how they begin (as the reply picker does).
     const threads = q.thread === null ? [...cards.keys()] : [q.thread];
+    // A question asks only while it counts on Home: one gone stale with age (the account's setting) has no ask here
+    // either, so it gets no dot and no answers to tap.
+    const staleAfter = staleAfterDays(store);
+    const now = Date.now();
     for (const id of threads) {
       const i = items.get(id);
       const card = cards.get(id);
@@ -90,7 +94,7 @@ export async function timeline(deps: ReadDeps, q: TimelineQuery): Promise<{ item
         const latest = card?.reply?.messageId === r.messageId;
         out.push({
           kind: "reply", id: `reply:${id}:${r.messageId}`, at: Date.parse(r.at), thread: threadOf(id), messageId: r.messageId,
-          ask: latest ? card!.ask : null, summary: latest ? card!.summary : r.firstSentence || null,
+          ask: latest && ASKS.has(aged(card!, i, null, now, staleAfter).state) ? card!.ask : null, summary: latest ? card!.summary : r.firstSentence || null,
           // Every reply the user hasn't heard, not only the newest: hearing that one marks the rest heard too.
           unread: isNew({ runId: null, messageId: r.messageId, at: r.at }, reads.get(id), visited.has(id) ? visited.get(id) : i.visitedAt),
         });

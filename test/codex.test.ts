@@ -3,15 +3,18 @@
 // approving commands, unknown outcomes never resent, reconnecting. No real Codex, no network.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { TestContext } from "node:test";
-import { answersFor, CodexAdapter, daemonDisabled, messageIdFor, reachOf, trustedProjects, turnSettings } from "../src/codex/adapter.ts";
+import { answersFor, CodexAdapter, daemonDisabled, messageIdFor, reachOf, trustedProjects, turnSettings, windowsSandbox } from "../src/codex/adapter.ts";
 import type { Policy } from "../src/policy.ts";
 import type { Action, LaunchProfile } from "../src/contract.ts";
 import { FakeCodex, HANG } from "./fixtures/codex/fake-daemon.ts";
+import { removeDir, SLOW } from "./fixtures/platform.ts";
 
 const pause = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 async function until(test: () => boolean | Promise<boolean>, ms = 3000) {
@@ -28,16 +31,28 @@ function project(root: string, name = "lap-timer") {
   return dir;
 }
 
-async function setup(t: TestContext, opts: { policy?: Partial<Policy>; acceptanceTimeoutMs?: number; before?: (fake: FakeCodex, cwd: string, root: string) => void; start?: boolean } = {}) {
+/** Codex's config as a test writes it, on Windows with its sandbox set up, as setup() makes it there. */
+const config = (fake: FakeCodex, text: string) =>
+  writeFileSync(join(fake.home, "config.toml"), process.platform === "win32" ? `${text}\n[windows]\nsandbox = "unelevated"\n` : text);
+
+// Codex's proxy (the way in on Windows) as the fake daemon's: `node proxy.mjs app-server proxy`.
+const PROXY = [process.execPath, fileURLToPath(new URL("./fixtures/codex/proxy.mjs", import.meta.url))];
+
+async function setup(t: TestContext, opts: { policy?: Partial<Policy>; acceptanceTimeoutMs?: number; before?: (fake: FakeCodex, cwd: string, root: string) => void; start?: boolean; transport?: "socket" | "proxy"; heartbeatMs?: number; autoStart?: boolean; platform?: NodeJS.Platform } = {}) {
   const fake = await FakeCodex.start();
-  const root = mkdtempSync(join(tmpdir(), "driver-codex-test-")), cwd = project(root);
+  // As a Windows computer whose Codex has its sandbox set up: without one, Codex won't edit on its own there, and the
+  // adapter refuses such work (tested on its own below).
+  if (process.platform === "win32") writeFileSync(join(fake.home, "config.toml"), "[windows]\nsandbox = \"unelevated\"\n");
+  // Real paths, as parsePolicy makes a policy's folders and visible() compares them: macOS's $TMPDIR is under /var, a
+  // link to /private/var, so a policy written with it saw nothing there.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "driver-codex-test-"))), cwd = project(root);
   const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [cwd], actions: ["follow_up", "settle", "snooze", "archive", "start_work"], maxRuntimeMode: "auto",
     claude: false, t3: false, codex: true, opencode: false, pi: false, steer: true, answer: true, limits: {}, worktreeBase: "HEAD", ...opts.policy };
   opts.before?.(fake, cwd, root);
   const logs: string[] = [];
   const adapter = new CodexAdapter({ policy, codexHome: fake.home, db: join(root, "codex.db"), stateDir: join(root, "state"), log: (m) => logs.push(m),
-    autoStart: false, acceptanceTimeoutMs: opts.acceptanceTimeoutMs ?? 1000, refreshMs: 60_000 });
-  t.after(async () => { await adapter.close(); await fake.stop().catch(() => {}); rmSync(root, { recursive: true, force: true }); rmSync(fake.home, { recursive: true, force: true }); });
+    autoStart: opts.autoStart ?? false, acceptanceTimeoutMs: opts.acceptanceTimeoutMs ?? 1000 * SLOW, refreshMs: 60_000, codexCommand: PROXY, transport: opts.transport, heartbeatMs: opts.heartbeatMs, platform: opts.platform });
+  t.after(async () => { await adapter.close(); await fake.stop().catch(() => {}); removeDir(root); removeDir(fake.home); });
   if (opts.start !== false) await adapter.start();
   return { fake, adapter, cwd, root, policy, logs };
 }
@@ -71,6 +86,62 @@ test("only the user's own threads are listed: not T3 Code's, internal ones or in
   assert.equal(items.find((i) => i.id === empty)!.title, "a Codex session in lap-timer");
   assert.equal((await adapter.list()).find((i) => i.id === oldLoaded)!.status, "completed");
   void cwd;
+});
+
+test("through Codex's proxy (how Windows reaches it), threads are read and a follow-up reaches them", async (t) => {
+  let own = "";
+  const { adapter, fake } = await setup(t, { transport: "proxy", before: (fake, cwd) => { own = fake.thread(cwd, { prompt: "Add a lap counter", reply: "Added it.", status: { type: "idle" } }).id; } });
+  assert.deepEqual((await adapter.list()).map((i) => i.id), [own]);
+  const r = await adapter.execute(follow(own, "And a reset button."), "k-proxy");
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(fake.count("turn/start"), 1);
+});
+
+test("through Codex's proxy, which keeps its end open, a daemon that goes away is noticed and reconnected to", async (t) => {
+  const { adapter, fake, logs } = await setup(t, { transport: "proxy", heartbeatMs: 100, before: (fake, cwd) => { fake.thread(cwd, { status: { type: "idle" } }); } });
+  assert.equal(adapter.connected(), true);
+  await fake.stop();
+  await until(() => logs.some((l) => l.startsWith("codex: connection lost")));
+  await fake.listen();
+  await until(() => adapter.connected(), 5000);
+});
+
+test("through Codex's proxy, a socket file nothing listens on (Windows, after a restart) is a daemon to start", async (t) => {
+  const { adapter, fake } = await setup(t, { transport: "proxy", start: false, autoStart: true });
+  await fake.stop();
+  // What Codex leaves on Windows: the socket's file, with no daemon behind it.
+  writeFileSync(fake.socketPath, process.platform === "win32" ? "\\\\.\\pipe\\10and2-test-nobody-listens" : "");
+  void adapter.start();
+  await until(() => existsSync(join(fake.home, "daemon-starts")), 5000);
+});
+
+test("through Codex's proxy, one that never answers the connection is given up on, and stopped", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-silent-"));
+  const silent = join(dir, "silent.mjs"), pidFile = join(dir, "pid");
+  // Starts, then reads its input and never answers.
+  writeFileSync(silent, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.stdin.resume();`);
+  mkdirSync(join(dir, "home", "app-server-control"), { recursive: true });
+  writeFileSync(join(dir, "home", "app-server-control", "app-server-control.sock"), "");
+  const logs: string[] = [];
+  const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [dir], actions: [], maxRuntimeMode: "auto", claude: false, t3: false, codex: true, opencode: false, pi: false, steer: true, answer: true, limits: {}, worktreeBase: "HEAD" };
+  const adapter = new CodexAdapter({ policy, codexHome: join(dir, "home"), db: join(dir, "codex.db"), log: (m) => logs.push(m), autoStart: false,
+    transport: "proxy", codexCommand: [process.execPath, silent], connectTimeoutMs: 300 });
+  // Closed before its folder goes: Windows can't delete the database while it's open.
+  t.after(async () => { await adapter.close(); removeDir(dir); });
+  await adapter.start();
+  assert.equal(adapter.connected(), false);
+  // Given up on (through the proxy, any failure before the connection is up is a daemon to start), not left waiting.
+  assert.ok(logs.some((l) => l.startsWith("codex: can't reach Codex")), logs.join("\n"));
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  await until(() => { try { process.kill(pid, 0); return false; } catch { return true; } }, 5000);
+});
+
+test("through Codex's proxy, a daemon that isn't there is a daemon to start, not a broken connection", async (t) => {
+  const { adapter, fake, logs } = await setup(t, { transport: "proxy", start: false });
+  await fake.stop();
+  await adapter.start();
+  assert.ok(logs.some((l) => l.includes("its daemon isn't running")), logs.join("\n"));
+  assert.equal(adapter.connected(), false);
 });
 
 test("T3 Code's worktrees are left out by their folders, whatever the originator says", async (t) => {
@@ -240,7 +311,7 @@ test("new work starts in the project's checkout with the profile's settings, get
   const { fake, adapter, cwd, root } = await setup(t, { policy: { projects: "*" }, before: (fake, cwd, root) => {
     fake.thread(cwd);
     const trusted = project(root, "trusted-one");
-    writeFileSync(join(fake.home, "config.toml"), `model = "m"\n\n[projects."${trusted}"]\ntrust_level = "trusted"\n\n[projects."${join(root, "missing")}"]\ntrust_level = "trusted"\n`);
+    config(fake, `model = "m"\n\n[projects."${trusted}"]\ntrust_level = "trusted"\n\n[projects."${join(root, "missing")}"]\ntrust_level = "trusted"\n`);
   } });
   const places = adapter.places();
   assert.deepEqual(places.map((p) => p.name).sort(), ["lap-timer", "trusted-one"]);
@@ -287,7 +358,7 @@ test("new work with a worktree profile runs in a fresh worktree inside the proje
   const r = await adapter.execute({ kind: "start_work", placeId: place, message: "Build it", profile: build }, "wt-1");
   assert.equal(r.ok, true, JSON.stringify(r));
   const cwd: string = fake.last("thread/start").cwd;
-  assert.match(cwd, /[/]\.codex[/]worktrees[/]10and2-[0-9a-f]{12}$/);
+  assert.match(cwd, /[/\\]\.codex[/\\]worktrees[/\\]10and2-[0-9a-f]{12}$/);
   assert.ok(cwd.startsWith(project));
   assert.ok(existsSync(join(cwd, "README")), "the worktree has the project's files");
   assert.equal(execFileSync("git", ["-C", project, "status", "--porcelain"], { encoding: "utf8" }), "", "the worktree stays out of the project's status");
@@ -295,14 +366,17 @@ test("new work with a worktree profile runs in a fresh worktree inside the proje
   assert.equal(adapter.places().length, 1, "the worktree isn't offered as a project of its own");
 });
 
-test("Codex's question is answered with the option the user named, or their own words", async (t) => {
+// Through the proxy too (Windows' way in, and its only one), whose slower round trips once let a replayed question lose
+// its answer.
+for (const transport of process.platform === "win32" ? ["proxy"] as const : ["socket", "proxy"] as const) test(`Codex's question is answered with the option the user named, or their own words (${transport})`, async (t) => {
   let id = "";
-  const { fake, adapter } = await setup(t, { before: (fake, cwd) => { id = fake.thread(cwd, { status: { type: "idle" } }).id; } });
+  const { fake, adapter, logs } = await setup(t, { transport, before: (fake, cwd) => { id = fake.thread(cwd, { status: { type: "idle" } }).id; } });
   fake.begin(id, "Ask me");
   fake.ask(id, QUESTION, { questions: QUESTIONS, isBlocking: true });
   await until(async () => !!(await adapter.report(id)).question?.startsWith("Which one?"));
   assert.equal(await adapter.check(follow(id, "Beta, please")), null);
-  assert.deepEqual(await adapter.execute(follow(id, "Beta, please"), "answer-1"), { ok: true });
+  const first = await adapter.execute(follow(id, "Beta, please"), "answer-1");
+  assert.deepEqual(first, { ok: true }, JSON.stringify({ answers: fake.answers, calls: fake.calls.map((c) => c.method), logs }));
   assert.deepEqual(fake.answers, [{ method: QUESTION, result: { answers: { pick: { answers: ["Beta"] } } } }]);
   await until(async () => !(await adapter.list())[0]!.pendingQuestion);
   fake.ask(id, QUESTION, { questions: QUESTIONS, isBlocking: true });
@@ -373,10 +447,10 @@ test("reconnects when Codex's daemon restarts, and reads everything again", asyn
 
 test("with no daemon (and starting one off), it isn't connected and refuses in words", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "driver-codex-none-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
   const adapter = new CodexAdapter({ policy: { brain: "wss://x.invalid/c", projects: "*", actions: ["follow_up"], maxRuntimeMode: "auto", claude: false, t3: false, codex: true, opencode: false, pi: false, steer: true, answer: true, limits: {}, worktreeBase: "HEAD" },
     codexHome: join(root, "codex"), db: join(root, "codex.db"), log: () => {}, autoStart: false });
-  t.after(() => adapter.close());
+  // Its store is closed first: Windows won't remove a folder with a file open in it.
+  t.after(async () => { await adapter.close(); removeDir(root); });
   await adapter.start();
   assert.equal(adapter.isLoaded, false);
   assert.equal(adapter.connected(), false);
@@ -410,7 +484,16 @@ test("helpers: runtime modes, reach, answers, trusted projects, daemon switch, m
   assert.deepEqual(answersFor([{ id: "r", question: "Which?", isOther: false, options: [{ label: "Red (Recommended)" }, { label: "Blue" }] }], "red"), { answers: { r: { answers: ["Red (Recommended)"] } } });
   const dir = mkdtempSync(join(tmpdir(), "codex-trust-"));
   assert.deepEqual(trustedProjects(`[projects."${dir}"]\ntrust_level = "trusted"\n[projects.'/nope/x']\ntrust_level = "trusted"\n[projects."${tmpdir()}"]\ntrust_level = "untrusted"\n`), [dir]);
-  rmSync(dir, { recursive: true });
+  // A Windows folder (C:\Users\…) is written as a literal string, or a basic one with its backslashes escaped.
+  assert.deepEqual(trustedProjects(`[projects.'${dir}']\ntrust_level = "trusted"\n`), [dir]);
+  assert.deepEqual(trustedProjects(`[projects."${dir.replaceAll("\\", "\\\\")}"]\ntrust_level = 'trusted'\n`), [dir]);
+  removeDir(dir);
+  assert.equal(windowsSandbox("[windows]\nsandbox = \"elevated\"\n"), true);
+  assert.equal(windowsSandbox("windows.sandbox = 'unelevated'\n"), true);
+  assert.equal(windowsSandbox("[profiles.work.windows]\nsandbox = \"unelevated\"\n"), true, "Codex writes it to the profile in use");
+  assert.equal(windowsSandbox("[features]\nexperimental_windows_sandbox = true\n"), true, "Codex's older switch");
+  assert.equal(windowsSandbox("[features]\nexperimental_windows_sandbox = false\n# sandbox = \"elevated\"\nsandbox_mode = \"workspace-write\"\n"), false);
+  assert.equal(windowsSandbox(""), false);
   assert.equal(daemonDisabled("[features]\ndaemon_auto_start = false\n"), true);
   assert.equal(daemonDisabled("features.daemon_auto_start = false\n"), true);
   assert.equal(daemonDisabled("[tui]\ndaemon_auto_start = false\n"), false);
@@ -418,4 +501,96 @@ test("helpers: runtime modes, reach, answers, trusted projects, daemon switch, m
   assert.match(messageIdFor("k"), /^[0-9a-f]{8}-[0-9a-f]{4}-8[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
   assert.equal(messageIdFor("k"), messageIdFor("k"));
   assert.notEqual(messageIdFor("k"), messageIdFor("l"));
+});
+
+test("new work can start on a model Codex lists: on thread/start, which a plan follows; one it doesn't list isn't sent", async (t) => {
+  const { fake, adapter, cwd } = await setup(t, { before: (fake, cwd) => { fake.thread(cwd); fake.modelPage = 1; } });
+  // Every page of `model/list`, less the hidden one.
+  await until(() => adapter.places()[0]!.models!.length > 0);
+  assert.deepEqual(adapter.places()[0]!.models, [{ id: "astra-6", name: "Astra-6" }, { id: "astra-6-mini", name: "Astra-6 Mini" }]);
+  assert.equal(fake.count("model/list"), 3);
+  const place = adapter.places()[0]!.id;
+  const normal: LaunchProfile = { name: "Normal", workspace: "root", runtimeMode: "auto", interactionMode: "default" };
+  assert.equal((await adapter.execute({ kind: "start_work", placeId: place, message: "Build it", profile: normal, model: "astra-6-mini" }, "model-1")).ok, true);
+  assert.deepEqual(fake.last("thread/start"), { cwd, approvalPolicy: "on-request", sandbox: "workspace-write", approvalsReviewer: "auto_review", threadSource: "10and2", model: "astra-6-mini" });
+  const plan: LaunchProfile = { name: "Plan", workspace: "root", runtimeMode: "approval-required", interactionMode: "plan" };
+  assert.equal((await adapter.execute({ kind: "start_work", placeId: place, message: "Plan it", profile: plan, model: "astra-6-mini" }, "model-plan")).ok, true);
+  assert.equal(fake.last("turn/start").collaborationMode.settings.model, "astra-6-mini");
+  for (const model of ["astra-5-codex", "nope"]) {
+    assert.deepEqual(await adapter.execute({ kind: "start_work", placeId: place, message: "x", profile: normal, model }, `no-${model}`), { ok: false, error: "Codex doesn't offer that model now." }, model);
+  }
+  assert.equal(fake.count("thread/start"), 2);
+  // Read again: the same list says nothing; a new model tells the brain.
+  const seen: string[][] = [];
+  adapter.watch((ids) => seen.push(ids));
+  await (adapter as any).readModels();
+  assert.deepEqual(seen, []);
+  fake.models.push({ id: "astra-7", model: "astra-7", displayName: "Astra-7", hidden: false, isDefault: false });
+  await (adapter as any).readModels();
+  assert.deepEqual(seen, [[]]);
+  assert.equal(adapter.places()[0]!.models!.at(-1)!.id, "astra-7");
+});
+
+test("a Codex that doesn't list its models offers none, and a start on one is refused before anything is sent", async (t) => {
+  const { fake, adapter, logs } = await setup(t, { before: (fake, cwd) => { fake.thread(cwd); fake.handlers["model/list"] = () => { throw Object.assign(new Error("unknown method model/list"), { code: -32601 }); }; } });
+  await until(() => logs.some((l) => /couldn't read Codex's models/.test(l)));
+  assert.deepEqual(adapter.places()[0]!.models, []);
+  const normal: LaunchProfile = { name: "Normal", workspace: "root", runtimeMode: "auto", interactionMode: "default" };
+  assert.deepEqual(await adapter.execute({ kind: "start_work", placeId: adapter.places()[0]!.id, message: "x", profile: normal, model: "astra-6" }, "none"), { ok: false, error: "Codex doesn't offer that model now." });
+  assert.equal(fake.count("thread/start"), 0);
+});
+
+test("on Windows, work that would edit on its own waits for Codex's Windows sandbox: refused in words, with nothing sent", async (t) => {
+  const NO_SANDBOX = "Codex can't edit on its own here until its Windows sandbox is set up. Set it up in Codex, then try again.";
+  let edits = "", full = "", readOnly = "";
+  const { fake, adapter } = await setup(t, { platform: "win32", policy: { maxRuntimeMode: "full-access" }, before: (fake, cwd) => {
+    writeFileSync(join(fake.home, "config.toml"), ""); // no sandbox set up, even where setup() made one (Windows)
+    edits = fake.thread(cwd, { status: { type: "idle" } }).id; // on-request in its workspace
+    full = fake.thread(cwd, { settings: { approvalPolicy: "never", sandbox: { type: "dangerFullAccess" }, approvalsReviewer: "user" } }).id;
+    readOnly = fake.thread(cwd, { settings: { approvalPolicy: "untrusted", sandbox: { type: "readOnly", networkAccess: false }, approvalsReviewer: "user" } }).id;
+  } });
+  const place = adapter.places()[0]!.id;
+  const auto: LaunchProfile = { name: "Normal", workspace: "root", runtimeMode: "auto", interactionMode: "default" };
+  const start = (profile: LaunchProfile, key: string) => adapter.execute({ kind: "start_work", placeId: place, message: "Build it", profile }, key);
+  assert.equal(await adapter.check({ kind: "start_work", placeId: place, message: "Build it", profile: auto }), NO_SANDBOX);
+  assert.deepEqual(await start(auto, "auto"), { ok: false, error: NO_SANDBOX });
+  assert.deepEqual(await start({ ...auto, runtimeMode: "auto-accept-edits" }, "edits"), { ok: false, error: NO_SANDBOX });
+  assert.deepEqual(await adapter.execute(follow(edits, "Next step"), "follow-edits"), { ok: false, error: NO_SANDBOX });
+  assert.equal(fake.count("thread/start") + fake.count("turn/start"), 0, "nothing was sent");
+  // Full access has no sandbox, and read-only work asks before editing wherever it runs.
+  assert.equal((await start({ ...auto, runtimeMode: "full-access" }, "full")).ok, true);
+  assert.deepEqual(await adapter.execute(follow(full, "Carry on"), "follow-full"), { ok: true });
+  assert.deepEqual(await adapter.execute(follow(readOnly, "Carry on"), "follow-read-only"), { ok: true });
+  // Once it's set up in Codex, the same work goes.
+  writeFileSync(join(fake.home, "config.toml"), "[windows]\nsandbox = \"unelevated\"\n");
+  assert.equal(await adapter.check({ kind: "start_work", placeId: place, message: "Build it", profile: auto }), null);
+  assert.deepEqual(await adapter.execute(follow(edits, "Next step"), "follow-edits-again"), { ok: true });
+
+  // Under an auto ceiling, a full-access session is capped to work that edits on its own: refused too.
+  let capped = "";
+  const narrow = await setup(t, { platform: "win32", before: (fake, cwd) => {
+    writeFileSync(join(fake.home, "config.toml"), ""); // no sandbox set up
+    capped = fake.thread(cwd, { settings: { approvalPolicy: "never", sandbox: { type: "dangerFullAccess" }, approvalsReviewer: "user" } }).id;
+  } });
+  assert.deepEqual(await narrow.adapter.execute(follow(capped, "Carry on"), "capped"), { ok: false, error: NO_SANDBOX });
+  assert.equal(narrow.fake.count("turn/start"), 0);
+});
+
+test("on Windows, a folder Codex trusts in lower case and a session's folder are one place, named as the session spells it", async (t) => {
+  // Lower case to its end on Linux, so the folder Codex's lower-cased key names can be made there too.
+  const home = join(realpathSync(tmpdir()), `driver-codex-case-${randomUUID()}`);
+  t.after(() => removeDir(home));
+  const spelled = project(home, "Lap-Timer"), trusted = spelled.toLowerCase();
+  mkdirSync(join(trusted, ".git"), { recursive: true }); // the same folder on Windows and macOS
+  const places = async (platform: NodeJS.Platform) => {
+    const { adapter } = await setup(t, { platform, policy: { projects: "*" }, before: (fake) => {
+      fake.thread(spelled, { status: { type: "idle" } });
+      config(fake, `[projects.'${trusted}']\ntrust_level = "trusted"\n`);
+    } });
+    return adapter.places();
+  };
+  const windows = await places("win32");
+  assert.deepEqual(windows.map((p) => p.name), ["Lap-Timer"]);
+  assert.ok(windows[0]!.activeAt, "the session's work counts for the place");
+  assert.equal((await places("linux")).length, 2, "elsewhere, folders differ by case");
 });

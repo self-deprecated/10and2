@@ -54,7 +54,8 @@ export function ianaZone(zone: unknown): string | null {
 /**
  * The zone this machine is in now. Node reads the computer's zone once and keeps it, so a connector left running while
  * its computer moves zone (travel) would say the old one; unsetting TZ, which isn't set, makes it read the zone again.
- * A TZ that is set is the user's choice, and kept.
+ * A TZ that is set is the user's choice, and kept. Node on Windows doesn't read it again that way, so there the zone is
+ * the one the connector started in, until it next starts (at sign-in).
  */
 function hostZone(): string {
   if (process.env.TZ === undefined) delete process.env.TZ;

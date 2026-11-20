@@ -2,20 +2,24 @@
 // `pi` run through the headless runner. No real Pi, no model, no network.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { Readable } from "node:stream";
 import { sessionForKey, shortTitle } from "../src/pi/adapter.ts";
-import { installPiExtension, MARKER, piExtensionStatus, uninstallPiExtension, extensionSource } from "../src/pi/extension.ts";
-import { promptText } from "../src/pi/turn.ts";
+import { PI_PIPE, readRegistry } from "../src/pi/bridge.ts";
+import { installPiExtension, MARKER, piExtensionStatus, piPath, uninstallPiExtension, extensionSource } from "../src/pi/extension.ts";
+import { NOT_STARTED, promptText, runPiTurn, startable } from "../src/pi/turn.ts";
 import type { Action, LaunchProfile } from "../src/contract.ts";
-import { fakePi, harness, until } from "./fixtures/pi/helpers.ts";
+import { harness, until } from "./fixtures/pi/helpers.ts";
+import { loadExtension, openPi } from "./fixtures/pi/extension.ts";
+import { assertPrivate, WINDOWS } from "./fixtures/platform.ts";
 
 const build: LaunchProfile = { name: "Build", runtimeMode: "full-access", workspace: "worktree", interactionMode: "default" };
 const plan: LaunchProfile = { name: "Plan", runtimeMode: "full-access", workspace: "worktree", interactionMode: "plan" };
 const normal: LaunchProfile = { name: "Normal", runtimeMode: "auto", workspace: "root", interactionMode: "default" };
 const follow = (itemId: string, message: string): Action => ({ kind: "follow_up", itemId, message });
-chmodSync(fakePi, 0o755);
 
 test("sessions at both folder levels are listed with their state, title and group; hidden, old and foreign files aren't", async (t) => {
   const h = harness(t);
@@ -155,9 +159,9 @@ test("an open Pi that doesn't ack is unknown and never resent; one that can't be
   assert.deepEqual(await h.adapter.execute(follow(s.id, "Hello"), "quiet"), first);
   assert.equal(lines.length, 1);
 
-  const g = harness(t, { acceptanceTimeoutMs: 200 }), u = g.completed();
-  writeFileSync(join(g.agent, "10and2", `${u.id}.json`), JSON.stringify({ sessionId: u.id, cwd: g.cwd, pid: process.pid, status: "idle" }));
-  writeFileSync(join(g.agent, "10and2", `${u.id}.sock`), ""); // a socket file nobody listens on
+  const g = harness(t, { acceptanceTimeoutMs: 200 }), u = g.completed(), socket = g.socketFor(u.id);
+  writeFileSync(join(g.agent, "10and2", `${u.id}.json`), JSON.stringify({ sessionId: u.id, cwd: g.cwd, pid: process.pid, status: "idle", socket }));
+  if (!WINDOWS) writeFileSync(socket, ""); // a socket file nobody listens on (on Windows, a pipe nobody made)
   await g.adapter.start();
   const gone = await g.adapter.execute(follow(u.id, "Hello"), "gone");
   assert.equal(gone.ok, false); if (!gone.ok) { assert.equal(gone.unknown, undefined); assert.match(gone.error, /couldn't reach/); }
@@ -233,7 +237,7 @@ test("a headless turn with no evidence in the file is unknown and never repeated
 
 test("a missing pi is said plainly, and nothing counts as sent", async (t) => {
   const h = harness(t), s = h.completed();
-  const a = h.reopen({ piBin: join(h.root, "no-such-pi") }); await a.start();
+  const a = h.reopen({ piCommand: [join(h.root, "no-such-pi")] }); await a.start();
   assert.deepEqual(await a.execute(follow(s.id, "Hello"), "no-pi"), { ok: false, error: "Pi couldn't be started. Check that it's installed on this machine." });
 });
 
@@ -251,19 +255,159 @@ test("continuing a closed session needs the extension, and a ceiling that allows
 test("new work starts headless under a session id from its key, named, in the place's folder", async (t) => {
   const h = harness(t); h.completed(); await h.adapter.start();
   const place = h.adapter.places()[0]!.id;
-  const started = await h.adapter.execute({ kind: "start_work", placeId: place, title: "Fastest lap", message: "Show the fastest lap", profile: build }, "start-1");
+  // The title goes to Pi with the words, never on its command line: on Windows a command script's shell would read it.
+  const title = `-Fastest "lap" & 100% ^ more`;
+  const started = await h.adapter.execute({ kind: "start_work", placeId: place, title, message: "Show the fastest lap", profile: build }, "start-1");
   const id = sessionForKey("start-1");
   assert.deepEqual(started, { ok: true, itemId: id });
   assert.notEqual(id, sessionForKey("start-2"));
   const call = h.calls().find((c) => c.args)!;
-  assert.deepEqual(call.args, ["--mode", "rpc", "--session-id", id, "--name", "Fastest lap"]);
+  assert.deepEqual(call.args, ["--mode", "rpc", "--session-id", id]);
   assert.equal(call.cwd, h.cwd);
-  await until(async () => (await h.adapter.list()).some((i) => i.id === id && i.title === "Fastest lap"));
-  assert.deepEqual(await h.adapter.execute({ kind: "start_work", placeId: place, title: "Fastest lap", message: "Show the fastest lap", profile: build }, "start-1"), started);
+  await until(() => h.calls().some((c) => c.prompt));
+  const order = h.calls().filter((c) => !c.args);
+  assert.deepEqual(order.map((c) => c.name ?? c.prompt), [title, "Show the fastest lap"], "named before its first words, exactly as given");
+  await until(async () => (await h.adapter.list()).some((i) => i.id === id && i.title === title));
+  assert.deepEqual(await h.adapter.execute({ kind: "start_work", placeId: place, title, message: "Show the fastest lap", profile: build }, "start-1"), started);
   assert.equal(h.calls().filter((c) => c.args).length, 1);
 
   await h.adapter.execute({ kind: "start_work", placeId: place, message: "Tidy the README", profile: build }, "start-untitled");
   assert.deepEqual(h.calls().filter((c) => c.args)[1]!.args, ["--mode", "rpc", "--session-id", sessionForKey("start-untitled")]);
+  assert.equal(h.calls().filter((c) => c.name).length, 1, "untitled work isn't named");
+  // It lists no models to 10 & 2 yet, so a start can't name one.
+  assert.deepEqual(h.adapter.places()[0]!.models, []);
+  assert.deepEqual(await h.adapter.execute({ kind: "start_work", placeId: place, message: "Go", profile: build, model: "anthropic/opus" }, "start-model"), { ok: false, error: "Pi can't start on a chosen model through 10 & 2 yet." });
+  assert.equal(h.calls().filter((c) => c.args).length, 2);
+});
+
+test("on Windows an open Pi is reached only through a pipe of the extension's own form, while its process is alive", (t) => {
+  const h = harness(t), dir = join(h.agent, "10and2");
+  const pipe = () => `\\\\.\\pipe\\10and2-pi-${randomUUID()}`;
+  const entry = (socket: unknown, pid = process.pid) => {
+    const id = randomUUID();
+    writeFileSync(join(dir, `${id}.json`), JSON.stringify({ sessionId: id, cwd: h.cwd, pid, status: "idle", ...(socket === undefined ? {} : { socket }) }));
+    return id;
+  };
+  const ours = pipe(), upper = ours.toUpperCase().replace("\\\\.\\PIPE", "\\\\.\\pipe");
+  const good = entry(ours), shouting = entry(upper);
+  const refused = [
+    entry(`\\\\fileserver\\pipe\\10and2-pi-${randomUUID()}`), // another machine
+    entry(`\\\\?\\pipe\\10and2-pi-${randomUUID()}`),
+    entry("\\\\.\\pipe\\10and2-hooks-1234"), // someone else's pipe
+    entry(`${ours}\\..\\x`),
+    entry(join(dir, "x.sock")), // a file, as on Unix
+    entry(undefined),
+    entry(42),
+    entry(pipe(), 2 ** 22 + 12345), // its Pi is gone
+  ];
+  const win = readRegistry(h.agent, "win32");
+  assert.equal(win.get(good)?.socket, ours);
+  assert.equal(win.get(shouting)?.socket, upper, "pipe names ignore case");
+  assert.deepEqual(refused.filter((id) => win.has(id)), []);
+  // Elsewhere the socket is the file beside the entry, whatever the entry names, and only while that file is there.
+  writeFileSync(join(dir, `${good}.sock`), "");
+  const unix = readRegistry(h.agent, "linux");
+  assert.equal(unix.get(good)?.socket, join(dir, `${good}.sock`));
+  assert.deepEqual([...unix.keys()], [good]);
+});
+
+test("on Windows a Pi whose pid refuses the check (an administrator's, or another account's) is open but out of reach: nothing is sent to it, and it isn't run headless", async (t) => {
+  // The system's first process is one, unless these tests run as an administrator or in a sandbox whose first is theirs.
+  const foreign = [1, 4].find((pid) => { try { process.kill(pid, 0); return false; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; } });
+  if (foreign === undefined) return t.skip("no process here refuses the check");
+  const h = harness(t), s = h.completed();
+  const sent = await h.live(s.id, "waiting", { pid: foreign, prompt: { kind: "confirm", title: "Ship it?", since: null }, questions: [{ questionId: "q1", title: "Ship it?", options: ["Yes", "No"] }] });
+  // What it says it's doing can't be checked, so nothing it asks is announced.
+  assert.deepEqual({ ...readRegistry(h.agent, "win32").get(s.id), updatedAt: null },
+    { sessionId: s.id, sessionFile: null, cwd: h.cwd, name: null, pid: foreign, mode: "tui", status: "idle", prompt: null, questions: [], socket: null, updatedAt: null });
+  if (!WINDOWS) assert.equal(readRegistry(h.agent, "linux").get(s.id)?.status, "waiting", "elsewhere it's running, and reached");
+  const adapter = h.reopen({ platform: "win32" });
+  await adapter.start();
+  const item = (await adapter.list()).find((i) => i.id === s.id)!;
+  assert.equal(item.pendingQuestion, false);
+  assert.equal((await adapter.report(s.id)).question, null);
+  const unreachable = "10 & 2 couldn't reach that session. Is it still open?";
+  assert.equal(adapter.refusals()[s.id]?.follow_up, unreachable);
+  assert.deepEqual(await adapter.execute(follow(s.id, "Yes"), "k"), { ok: false, error: unreachable });
+  assert.deepEqual(sent, [], "nothing went to its pipe");
+  assert.deepEqual(h.calls(), [], "no headless Pi on the session it has open");
+});
+
+test("a headless turn from the previous release, which named Pi as one string, is run, not refused", async () => {
+  const turn = { pi: join(tmpdir(), `no-such-pi-${randomUUID()}`), cwd: tmpdir(), message: "Hello", sessionId: randomUUID() };
+  assert.equal(await runPiTurn(Readable.from([JSON.stringify(turn)])), NOT_STARTED, "a missing Pi isn't started, and that's said, not 64");
+  assert.equal(await runPiTurn(Readable.from(["{\"pi\":42}"])), 64);
+});
+
+test("the extension registers an open Pi where the connector reads it, takes words there, keeps a second Pi out, and leaves nothing behind", async (t) => {
+  const h = harness(t), s = h.completed(), dir = join(h.agent, "10and2"), entry = join(dir, `${s.id}.json`);
+  const extension = await loadExtension(h.root);
+  const session = { id: s.id, cwd: h.cwd, file: s.path };
+  const first = openPi(session), second = openPi(session, true), third = openPi(session, true);
+  for (const p of [first, second, third]) { extension(p.api); t.after(() => p.emit("session_shutdown")); }
+  await first.emit("session_start");
+  const live = readRegistry(h.agent).get(s.id)!;
+  assert.ok(live?.socket, "it's registered, where it can be reached");
+  if (WINDOWS) assert.match(live.socket, PI_PIPE); else { assert.equal(live.socket, join(dir, `${s.id}.sock`)); assertPrivate(live.socket); }
+  assert.equal(JSON.parse(readFileSync(entry, "utf8")).socket, live.socket, "the entry says where it listens");
+  assertPrivate(entry);
+  await first.emit("agent_start");
+  assert.equal(readRegistry(h.agent).get(s.id)?.status, "busy");
+
+  await h.adapter.start();
+  assert.deepEqual(await h.adapter.execute(follow(s.id, "Also the README"), "steer"), { ok: true });
+  assert.deepEqual(first.sent, [["Also the README", { deliverAs: "steer" }]]);
+
+  // A second Pi on the same session would split its file into branches: it says so, and stays out of Driver's way.
+  await second.emit("session_start");
+  assert.equal(second.notes.length, 1);
+  assert.equal(readRegistry(h.agent).get(s.id)?.socket, live.socket);
+  await second.emit("session_shutdown");
+  assert.ok(readRegistry(h.agent).has(s.id), "the first is still open");
+
+  await first.emit("session_shutdown");
+  assert.equal(existsSync(entry), false);
+  if (!WINDOWS) assert.equal(existsSync(live.socket), false);
+  assert.equal((await h.adapter.list()).find((i) => i.id === s.id)?.status, "completed");
+
+  // A Pi that crashed left its entry (and on Unix its socket file): the next one takes the session.
+  writeFileSync(entry, JSON.stringify({ sessionId: s.id, cwd: h.cwd, pid: 2 ** 22 + 12345, status: "busy", socket: h.socketFor(s.id) }));
+  if (!WINDOWS) writeFileSync(join(dir, `${s.id}.sock`), "");
+  await third.emit("session_start");
+  assert.deepEqual(third.notes, []);
+  assert.equal(JSON.parse(readFileSync(entry, "utf8")).pid, process.pid);
+  assert.ok(readRegistry(h.agent).has(s.id));
+  await third.emit("session_shutdown");
+  assert.equal(existsSync(entry), false);
+});
+
+test("Pi's folders are read as Pi reads them: ~, ~/ and ~\\, file URLs, and on Windows Git Bash and WSL drive paths", () => {
+  assert.equal(piPath("~", "/home/me", "linux"), "/home/me");
+  assert.equal(piPath("~/pi", "/home/me", "linux"), "/home/me/pi");
+  assert.equal(piPath("~\\pi", "/home/me", "linux"), "~\\pi", "a backslash is a name's own character elsewhere");
+  assert.equal(piPath("file:///home/me/pi", "/home/me", "linux"), "/home/me/pi");
+  assert.equal(piPath("/c/pi", "/home/me", "linux"), "/c/pi");
+  const home = "C:\\Users\\me";
+  assert.equal(piPath("~", home, "win32"), home);
+  assert.equal(piPath("~\\pi\\agent", home, "win32"), "C:\\Users\\me\\pi\\agent");
+  assert.equal(piPath("~/pi/agent", home, "win32"), "C:\\Users\\me\\pi\\agent");
+  assert.equal(piPath("/c/Users/me/.pi-alt", home, "win32"), "C:\\Users\\me\\.pi-alt");
+  assert.equal(piPath("/mnt/d/pi", home, "win32"), "D:\\pi");
+  assert.equal(piPath("/cygdrive/e", home, "win32"), "E:\\");
+  assert.equal(piPath("file:///C:/Users/me/pi", home, "win32"), "C:\\Users\\me\\pi");
+  assert.equal(piPath("D:\\pi", home, "win32"), "D:\\pi");
+  assert.equal(piPath("//server/share/pi", home, "win32"), "//server/share/pi");
+});
+
+test("on Windows Pi is run only when it's on PATH, never from the project's folder", (t) => {
+  const h = harness(t), bin = join(h.root, "bin");
+  mkdirSync(bin); writeFileSync(join(bin, "pi.cmd"), "@ECHO off\r\n"); writeFileSync(join(bin, "node.exe"), "");
+  writeFileSync(join(h.cwd, "pi.exe"), ""); // what Windows would find first in the folder Pi runs in
+  const env = (path: string) => ({ PATH: path, PATHEXT: ".COM;.EXE;.BAT;.CMD" });
+  assert.equal(startable("pi", env(bin), "win32"), true);
+  assert.equal(startable("pi", env(join(h.root, "nothing")), "win32"), false);
+  assert.equal(startable(join(bin, "node.exe"), env(""), "win32"), true, "a path is run as it is");
+  assert.equal(startable("pi", env(""), "linux"), true, "elsewhere spawn reports a missing one");
 });
 
 test("new work is refused for plan mode, a profile short of full access, or a ceiling below it", async (t) => {
@@ -303,7 +447,7 @@ test("the extension is installed, updated and removed only where the file is our
   assert.equal(piExtensionStatus(h.agent).state, "missing");
   assert.deepEqual(installPiExtension(h.agent), { state: "installed", path });
   assert.equal(readFileSync(path, "utf8"), readFileSync(extensionSource(), "utf8"));
-  assert.equal(readFileSync(path, "utf8").split("\n")[0], MARKER);
+  assert.equal(readFileSync(path, "utf8").split(/\r?\n/)[0], MARKER);
   assert.equal(piExtensionStatus(h.agent).state, "installed");
   writeFileSync(path, `${MARKER}\n// an older copy\n`);
   assert.equal(piExtensionStatus(h.agent).state, "outdated");

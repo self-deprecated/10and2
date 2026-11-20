@@ -1,12 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createHash } from "node:crypto";
 import { ClaudeAdapter, permissionMode, resumeMode, sessionForKey } from "../src/claude/adapter.ts";
 import type { Action, LaunchProfile } from "../src/contract.ts";
 import { harness, until } from "./fixtures/claude/helpers.ts";
+import { assertPrivate, SLOW } from "./fixtures/platform.ts";
 
 const profile: LaunchProfile = { name: "Normal", runtimeMode: "approval-required", workspace: "root", interactionMode: "default" };
 function env(t: Parameters<typeof harness>[0], key: string, value: string) {
@@ -51,12 +52,19 @@ test("cold follow-up accepts exact replay, caps the session's own mode at the ce
   await until(async () => (await h.adapter.list())[0]?.status === "completed");
   assert.equal((await h.adapter.replies(f.id))[0]?.prompt, action.message);
   const { readdirSync } = await import("node:fs");
-  for (const name of readdirSync(h.options.stateDir).filter((n) => n.endsWith(".log") || n.endsWith(".jsonl"))) assert.equal(statSync(join(h.options.stateDir, name)).mode & 0o777, 0o600);
+  for (const name of readdirSync(h.options.stateDir).filter((n) => n.endsWith(".log") || n.endsWith(".jsonl"))) assertPrivate(join(h.options.stateDir, name));
 });
 
 test("a new transcript user record is positive evidence without stdout replay", async (t) => {
   env(t, "FAKE_CLAUDE_NO_REPLAY", "1"); const h = harness(t), f = h.completed(); await h.adapter.start();
   assert.deepEqual(await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "Transcript evidence" }, "record"), { ok: true });
+});
+
+test("a transcript in a folder named otherwise (the cwd as Claude Code saw it) is found by the session's id", async (t) => {
+  env(t, "FAKE_CLAUDE_NO_REPLAY", "1"); env(t, "FAKE_CLAUDE_FOLDER", "C--Elsewhere-project");
+  const h = harness(t); h.completed(); await h.adapter.start();
+  const receipt = await h.adapter.execute({ kind: "start_work", placeId: h.adapter.places()[0]!.id, message: "Found by id", profile }, "elsewhere");
+  assert.deepEqual(receipt, { ok: true, itemId: sessionForKey("elsewhere") });
 });
 
 test("matching init and exact user replay are sufficient even before transcript persistence", async (t) => {
@@ -90,7 +98,7 @@ test("a reused key with changed words is rejected before any spawn", async (t) =
 });
 
 test("a run 10 & 2 started blocks a different follow-up while held, including across adapter restart", async (t) => {
-  env(t, "FAKE_CLAUDE_HOLD_MS", "1500"); const h = harness(t), f = h.completed(); await h.adapter.start();
+  env(t, "FAKE_CLAUDE_HOLD_MS", String(1500 * SLOW)); const h = harness(t), f = h.completed(); await h.adapter.start();
   assert.equal((await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "One" }, "one")).ok, true);
   unlinkSync(join(h.config, "sessions", `${calls(h.config)[0].pid}.json`));
   await h.adapter.close(); const next = h.reopen(); await next.start();
@@ -156,7 +164,7 @@ test("a crash-left dispatch row never starts a process, and an unknown run reser
 });
 
 test("close during acceptance finishes bookkeeping and leaves the detached child running", async (t) => {
-  env(t, "FAKE_CLAUDE_HOLD_MS", "1000"); env(t, "FAKE_CLAUDE_BEFORE_ACCEPT_MS", "80");
+  env(t, "FAKE_CLAUDE_HOLD_MS", String(1000 * SLOW)); env(t, "FAKE_CLAUDE_BEFORE_ACCEPT_MS", "80");
   const h = harness(t), f = h.completed(); await h.adapter.start();
   const pending = h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "Detached" }, "detached");
   await until(() => existsSync(join(h.config, "calls.jsonl")));
@@ -167,11 +175,14 @@ test("close during acceptance finishes bookkeeping and leaves the detached child
 
 test("a missing Claude executable is a known local failure", async (t) => {
   const h = harness(t), f = h.completed(); await h.adapter.close();
-  const adapter = new ClaudeAdapter({ ...h.options, claudeBin: join(h.root, "missing-claude") }); t.after(() => adapter.close()); await adapter.start();
-  const receipt = await adapter.execute({ kind: "follow_up", itemId: f.id, message: "x" }, "no-bin"); assert.equal(receipt.ok, false);
-  if (!receipt.ok) { assert.equal(receipt.unknown, undefined); assert.match(receipt.error, /installed/); }
-  const db = new DatabaseSync(h.options.db);
-  assert.equal(db.prepare("SELECT 1 FROM claude_runs").get(), undefined); db.close();
+  // Closed here, before the harness removes its folder: Windows can't delete the database while it's open.
+  const adapter = new ClaudeAdapter({ ...h.options, claudeCommand: [join(h.root, "missing-claude")] }); await adapter.start();
+  try {
+    const receipt = await adapter.execute({ kind: "follow_up", itemId: f.id, message: "x" }, "no-bin"); assert.equal(receipt.ok, false);
+    if (!receipt.ok) { assert.equal(receipt.unknown, undefined); assert.match(receipt.error, /installed/); }
+    const db = new DatabaseSync(h.options.db);
+    assert.equal(db.prepare("SELECT 1 FROM claude_runs").get(), undefined); db.close();
+  } finally { await adapter.close(); }
 });
 
 
@@ -190,8 +201,9 @@ test("startup clears pidless reservations without replaying the original operati
 
 test("known acceptance removes logs; unknown logs survive until the seven-day startup prune", async (t) => {
   const { readdirSync, writeFileSync, utimesSync } = await import("node:fs");
-  const h = harness(t, { acceptanceTimeoutMs: 160 }), f = h.completed(); await h.adapter.start();
-  await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "Accepted" }, "known-logs");
+  // Long enough for the first to be accepted; the second waits it out.
+  const h = harness(t, { acceptanceTimeoutMs: 500 * SLOW }), f = h.completed(); await h.adapter.start();
+  assert.deepEqual(await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "Accepted" }, "known-logs"), { ok: true });
   const logs = () => readdirSync(h.options.stateDir).filter((n) => /\.(jsonl|log)$/.test(n));
   assert.deepEqual(logs(), []);
   await until(async () => await h.adapter.check({ kind: "follow_up", itemId: f.id, message: "x" }) === null);
@@ -199,7 +211,7 @@ test("known acceptance removes logs; unknown logs survive until the seven-day st
   const result = await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "Unknown" }, "unknown-logs");
   assert.equal(result.ok, false); if (!result.ok) assert.equal(result.unknown, true);
   const retained = logs(); assert.equal(retained.length, 2);
-  for (const name of retained) assert.equal(statSync(join(h.options.stateDir, name)).mode & 0o777, 0o600);
+  for (const name of retained) assertPrivate(join(h.options.stateDir, name));
   await h.adapter.close();
   const recent = h.reopen(); await recent.start(); assert.deepEqual(logs(), retained); await recent.close();
   const old = new Date(h.clock.now - 8 * 86_400_000);
@@ -211,7 +223,8 @@ test("known acceptance removes logs; unknown logs survive until the seven-day st
 test("synchronous spawn failure releases its reservation and removes private logs", async (t) => {
   const { readdirSync } = await import("node:fs");
   const h = harness(t), f = h.completed(); await h.adapter.start();
-  h.options.claudeBin = "invalid\0executable";
+  // A null byte is refused as spawn is called, on every system, after the command is found.
+  h.options.claudeCommand = [process.execPath, "invalid\0argument"];
   const receipt = await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "x" }, "bad-spawn");
   assert.equal(receipt.ok, false); if (!receipt.ok) assert.match(receipt.error, /couldn't start/);
   const db = new DatabaseSync(h.options.db);

@@ -1,7 +1,7 @@
 {
   "name": "10and2",
   "type": "module",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "The connector for 10 & 2: lets you talk to the coding agents on your computer (Claude Code, Codex, Pi, OpenCode, T3 Code) from the 10 & 2 iPhone app.",
   "keywords": [
     "10and2",
@@ -28,7 +28,8 @@
   },
   "os": [
     "darwin",
-    "linux"
+    "linux",
+    "win32"
   ],
   "bin": {
     "10and2": "bin/10and2.js"

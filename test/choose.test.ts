@@ -1,9 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { applyChoice, applyFlags, capsFor, choiceOf, defaultChoice, policyFields, startingChoice, summary, type Choice } from "../src/choose.ts";
-import { describeFound, type Found } from "../src/agents.ts";
+import { describeFound, detect, type Found } from "../src/agents.ts";
 import { allows, answers, ceilingFor, parsePolicy, steers } from "../src/policy.ts";
-import { listStep, type ListState } from "../src/ui.ts";
+import { listStep, marks, type ListState } from "../src/ui.ts";
+import { removeDir, WINDOWS } from "./fixtures/platform.ts";
 
 const found = (installed: Partial<Record<Found["agent"], boolean>>): Found[] =>
   (["claude", "codex", "pi", "opencode", "t3"] as const).map((agent) => ({
@@ -122,4 +126,41 @@ test("choosing again starts from the file; agents a file from before agents does
   assert.equal(chosen.on.codex, false, "a choice made with agents stays as made");
   assert.equal(startingChoice({ ...base, claude: true, codex: false }, all).on.codex, false, "an agent the file names stays as named");
   assert.deepEqual(startingChoice(null, all).on, defaultChoice(all).on);
+});
+
+test("an agent is found by its command on PATH or by its own folder; T3 Code by its command, or one that didn't answer where T3 has run", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "agents-"));
+  t.after(() => removeDir(dir));
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env, PATH: bin, CLAUDE_CONFIG_DIR: join(dir, "claude"), CODEX_HOME: join(dir, "codex"), PI_CODING_AGENT_DIR: join(dir, "pi"),
+    XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3",
+  };
+  const installed = async () => (await detect(env)).filter((f) => f.installed).map((f) => [f.agent, f.version]);
+  assert.deepEqual(await installed(), []);
+  mkdirSync(join(dir, "t3", "userdata"), { recursive: true });
+  mkdirSync(join(dir, "pi", "sessions"), { recursive: true });
+  assert.deepEqual(await installed(), [["pi", null]], "T3's folder without its command: the connector couldn't reach it");
+  // A command npm installed: on Windows the script it writes (codex.cmd), which is run as Node and its script.
+  const command = (name: string, out: string, code = 0) => {
+    if (!WINDOWS) return writeFileSync(join(bin, name), `#!/bin/sh\necho ${out}\nexit ${code}\n`, { mode: 0o755 });
+    writeFileSync(join(bin, `${name}.mjs`), `console.log(${JSON.stringify(out)}); process.exitCode = ${code};\n`);
+    writeFileSync(join(bin, `${name}.cmd`), `@ECHO off\r\nnode "%~dp0\\${name}.mjs" %*\r\n`);
+  };
+  command("codex", "codex-cli 0.169.0");
+  command("t3", "", 1);
+  assert.deepEqual(await installed(), [["codex", "0.169.0"], ["pi", null], ["t3", null]]);
+});
+
+test("the old Windows console gets marks its fonts have; Windows Terminal, VS Code's terminal and every other system get Unicode", () => {
+  const unicode = marks("linux", {});
+  assert.equal(unicode.ok, "✓");
+  assert.deepEqual(marks("darwin", {}), unicode);
+  const old = marks("win32", {});
+  assert.match(old.spinner, /^[\x21-\x7e]+$/, "an ASCII spinner");
+  assert.notEqual(old.ok, unicode.ok);
+  assert.notEqual(old.cursor, unicode.cursor);
+  assert.deepEqual(marks("win32", { WT_SESSION: "3f1c" }), unicode);
+  assert.deepEqual(marks("win32", { TERM_PROGRAM: "vscode" }), unicode);
 });

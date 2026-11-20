@@ -1,17 +1,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Ledger, actionHash } from "../src/ledger.ts";
+import { assertPrivate, removeDir } from "./fixtures/platform.ts";
 import type { Action, Receipt } from "../src/contract.ts";
 
 const action: Action = { kind: "settle", itemId: "a" };
 
 test("the ledger dedupes concurrent and durable receipts, and refuses a changed action", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ledger-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => removeDir(dir));
   let ledger = new Ledger(dir);
   let calls = 0;
   const opts = { retrySafe: false, execute: async (): Promise<Receipt> => { calls++; return { ok: true }; } };
@@ -24,7 +25,7 @@ test("the ledger dedupes concurrent and durable receipts, and refuses a changed 
   assert.deepEqual(await ledger.execute(action, "k", opts), { ok: true });
   await ledger.close();
   assert.equal(calls, 1);
-  assert.equal(statSync(join(dir, "connector.db")).mode & 0o777, 0o600);
+  assertPrivate(join(dir, "connector.db"));
   const audit = readFileSync(join(dir, "audit.jsonl"), "utf8").trim().split("\n").map((s) => JSON.parse(s));
   assert.deepEqual(audit.map((a) => a.state), ["dispatching", "accepted"]);
   assert.deepEqual(audit[0].action, action);
@@ -32,7 +33,7 @@ test("the ledger dedupes concurrent and durable receipts, and refuses a changed 
 
 for (const retrySafe of [true, false]) test(`crash recovery only resends a retry-safe adapter (${retrySafe})`, async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ledger-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => removeDir(dir));
   const created = new Ledger(dir);
   await created.close();
   // This is exactly the durable boundary a process killed before its receipt leaves behind.
@@ -52,7 +53,7 @@ for (const retrySafe of [true, false]) test(`crash recovery only resends a retry
 
 for (const retrySafe of [true, false]) test(`unknown receipts retry only with backend deduplication (${retrySafe})`, async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ledger-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => removeDir(dir));
   const ledger = new Ledger(dir);
   let calls = 0;
   const opts = { retrySafe, execute: async (): Promise<Receipt> => ++calls === 1 ? { ok: false, unknown: true, error: "lost" } : { ok: true } };
@@ -69,7 +70,7 @@ test("action hashes ignore property order, including the launch profile", () => 
 
 test("only one connector owns a ledger, and closing releases its crash-safe SQLite lock", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ledger-owner-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => removeDir(dir));
   const first = new Ledger(dir);
   assert.throws(() => new Ledger(dir), /locked/);
   await first.close();
@@ -79,7 +80,7 @@ test("only one connector owns a ledger, and closing releases its crash-safe SQLi
 
 test("a refusal before dispatch isn't kept, so the same key can still go ahead later", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ledger-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => removeDir(dir));
   const ledger = new Ledger(dir);
   let calls = 0, refusing = true;
   const opts = {
@@ -102,7 +103,7 @@ test("a refusal before dispatch isn't kept, so the same key can still go ahead l
 
 test("a refusal on a retry-safe key whose outcome was lost stays unknown", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "ledger-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => removeDir(dir));
   const ledger = new Ledger(dir);
   let refusing = false;
   const opts = {

@@ -20,7 +20,10 @@ import { Waits } from "./waits.ts";
  */
 export function wire(o: { adapter: Adapter; store: Store; classify: Classifier; writeOpener: OpenerWriter; title?: Titler; purpose?: Purposer; purposeCanRun?: () => boolean; profiles: LaunchProfile[]; log: (m: string) => void; track?: Track; onDemand?: boolean }) {
   const { adapter, store, log } = o;
-  const purposes = o.purpose ? new Purposes({ adapter, store, make: o.purpose, canRun: o.purposeCanRun, log, report: (id) => briefing.report(id) }) : undefined;
+  // A purpose written later has its thread's card judged again against it (briefing.ts `purposed`).
+  const purposes = o.purpose
+    ? new Purposes({ adapter, store, make: o.purpose, canRun: o.purposeCanRun, log, report: (id) => briefing.report(id), written: (ids) => void briefing.purposed(ids) })
+    : undefined;
   const briefing = new Briefing({ adapter, store, classify: o.classify, writeOpener: o.writeOpener, log, onDemand: o.onDemand, purposes });
   const conversations = new Conversations(store);
   const proposals = new Proposals({

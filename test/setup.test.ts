@@ -2,21 +2,41 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer, type IncomingMessage } from "node:http";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
-import { Credentials, parseCredential, type Runner } from "../src/credential.ts";
+import { Credentials, parseCredential, powershellArgs, type Runner } from "../src/credential.ts";
 import { Expired, linkUrl, originOf, pair } from "../src/pair.ts";
-import { launchAgent, Service, systemdUnit } from "../src/service.ts";
+import { launchAgent, launchFor, Service, systemdUnit } from "../src/service.ts";
+import { assertPrivate, removeDir, WINDOWS } from "./fixtures/platform.ts";
 
-const main = new URL("../src/main.ts", import.meta.url).pathname;
+const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 const credential = `dc1.${Buffer.from("user_abc123").toString("base64url")}.${"d".repeat(22)}.${"s".repeat(43)}`;
 
 function temp(t: { after: (f: () => void) => void }, prefix: string) {
   const dir = mkdtempSync(join(tmpdir(), prefix));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => removeDir(dir));
   return dir;
+}
+
+/**
+ * A test's environment: this one's (Windows can't run much without SystemRoot and the rest), with nothing of the user's
+ * own agents or 10 & 2, no colour (`node --test` forces it at a terminal), and `home` as the home folder (HOME, or
+ * USERPROFILE on Windows).
+ */
+function testEnv(home: string, vars: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const k of Object.keys(env)) if (/^(XDG_|CLAUDE_|CODEX_|PI_|T3|OPENCODE|TENANDTWO_|OPENAI_|DRIVER_|FORCE_COLOR$)/i.test(k)) delete env[k];
+  return { ...env, HOME: home, USERPROFILE: home, ...vars };
+}
+
+/** A command on PATH that prints `out`: a shell script, or on Windows a command script as npm writes one, run as Node and its script. */
+function fakeCommand(bin: string, name: string, out: string) {
+  if (!WINDOWS) return writeFileSync(join(bin, name), `#!/bin/sh\necho ${out}\n`, { mode: 0o755 });
+  writeFileSync(join(bin, `${name}.mjs`), `console.log(${JSON.stringify(out)});\n`);
+  writeFileSync(join(bin, `${name}.cmd`), `@ECHO off\r\nnode "%~dp0\\${name}.mjs" %*\r\n`);
 }
 
 test("a credential names its user and device; anything else isn't one", () => {
@@ -49,12 +69,63 @@ test("the Keychain and libsecret get the secret on stdin, never as an argument; 
   const broken = new Credentials({ runner: async () => null, platform: "linux", env });
   assert.equal(await broken.save("https://10and2-stg.selfdep.com", credential), "file");
   const file = join(dir, "10and2", "credentials.json");
-  assert.equal(statSync(file).mode & 0o777, 0o600);
+  assertPrivate(file);
   assert.deepEqual(await broken.load("https://10and2-stg.selfdep.com"), { secret: credential, store: "file" });
   await broken.delete("https://10and2-stg.selfdep.com");
   assert.equal(await broken.load("https://10and2-stg.selfdep.com"), null);
+  // Windows has no file modes to check: its profile's own permissions keep the file private.
+  if (WINDOWS) return;
   chmodSync(file, 0o644);
   await assert.rejects(broken.load("https://10and2-stg.selfdep.com"), /mode 0600/);
+});
+
+test("on Windows the credential is encrypted for the Windows account through Windows PowerShell, the secret only on stdin", async (t) => {
+  const dir = temp(t, "creds-win-");
+  const calls: { command: string; args: string[]; input?: string }[] = [];
+  // DPAPI as a reversible stand-in, so what's kept can be told from the secret: base64 in, base64 out.
+  const flip = (b64: string) => Buffer.from(Buffer.from(b64, "base64").map((x) => x ^ 0x5a)).toString("base64");
+  const dpapi = (opts: { protect?: boolean; unprotect?: boolean } = {}): Runner => async (command, args, input) => {
+    calls.push({ command, args, input });
+    const script = Buffer.from(args.at(-1)!, "base64").toString("utf16le");
+    if (/::Protect\(/.test(script)) return opts.protect === false ? null : flip(input!);
+    if (/::Unprotect\(/.test(script)) return opts.unprotect === false ? null : flip(input!);
+    return null;
+  };
+  const env = { XDG_CONFIG_HOME: dir, SystemRoot: "D:\\Win" };
+  const origin = "https://10and2.selfdep.com";
+  const file = join(dir, "10and2", "credentials.json");
+  const win = new Credentials({ runner: dpapi(), platform: "win32", env });
+  assert.equal(await win.save(origin, credential), "dpapi");
+  const kept = JSON.parse(readFileSync(file, "utf8"))[origin] as string;
+  assert.match(kept, /^dpapi:[A-Za-z0-9+/]+=*$/);
+  assert.ok(!kept.includes(credential) && !kept.includes(Buffer.from(credential).toString("base64")), "never kept as it is");
+  assert.deepEqual(await win.load(origin), { secret: credential, store: "dpapi" });
+  for (const c of calls) {
+    assert.equal(c.command, "D:\\Win\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    assert.deepEqual(c.args.slice(0, 3), ["-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+    assert.ok(!c.args.some((a) => a.includes(credential) || a.includes(Buffer.from(credential).toString("base64"))), "the secret is never an argument");
+    assert.ok(c.args.every((a) => !Buffer.from(a, "base64").toString("utf16le").includes(credential)), "nor inside the script");
+  }
+  assert.ok(calls.some((c) => c.input === Buffer.from(credential).toString("base64")), "it goes on stdin");
+  assert.deepEqual(powershellArgs("Protect"), calls[0].args);
+  await win.delete(origin);
+  assert.equal(await win.load(origin), null);
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), {});
+
+  // Where PowerShell can't (Constrained Language Mode), or what it encrypts won't decrypt, the plain file instead.
+  assert.equal(await new Credentials({ runner: async () => null, platform: "win32", env }).save(origin, credential), "file");
+  assert.equal(JSON.parse(readFileSync(file, "utf8"))[origin], credential);
+  assert.deepEqual(await new Credentials({ runner: async () => null, platform: "win32", env }).load(origin), { secret: credential, store: "file" });
+  assert.equal(await new Credentials({ runner: dpapi({ unprotect: false }), platform: "win32", env }).save(origin, credential), "file");
+  // A key encrypted for another account (a copied profile) can't be read: as good as none, so setup pairs again.
+  await win.save(origin, credential);
+  assert.equal(await new Credentials({ runner: dpapi({ unprotect: false }), platform: "win32", env }).load(origin), null);
+  // TENANDTWO_CREDENTIAL_STORE=file never asks PowerShell, and reads what's kept plainly.
+  calls.length = 0;
+  const plain = new Credentials({ runner: dpapi(), platform: "win32", env: { ...env, TENANDTWO_CREDENTIAL_STORE: "file" } });
+  assert.equal(await plain.save("http://127.0.0.1:8790", "a-token"), "file");
+  assert.deepEqual(await plain.load("http://127.0.0.1:8790"), { secret: "a-token", store: "file" });
+  assert.equal(calls.length, 0);
 });
 
 test("Ctrl-C while waiting for approval stops at once, not at the next poll", async () => {
@@ -100,8 +171,8 @@ test("the brain's origin and link URL come from each other", () => {
   assert.equal(linkUrl("http://127.0.0.1:8790"), "ws://127.0.0.1:8790/connector");
 });
 
-test("login services run this node and script with setup's PATH, and don't restart a revoked connector", () => {
-  const l = { node: "/usr/bin/node", script: "/opt/10and2 app/dist/10and2.js", path: "/usr/local/bin:/usr/bin" };
+test("login services run what they're given with setup's PATH, and don't restart a revoked connector", () => {
+  const l = { program: ["/usr/bin/node", "/opt/10and2 app/dist/10and2.js"], path: "/usr/local/bin:/usr/bin" };
   const unit = systemdUnit(l);
   assert.match(unit, /^ExecStart=\/usr\/bin\/node "\/opt\/10and2 app\/dist\/10and2.js" run --wait-for-credential$/m);
   assert.match(unit, /^Environment=PATH=\/usr\/local\/bin:\/usr\/bin$/m);
@@ -110,6 +181,56 @@ test("login services run this node and script with setup's PATH, and don't resta
   assert.match(plist, /<string>--fatal-exit=0<\/string>/);
   assert.match(plist, /<key>SuccessfulExit<\/key><false\/>/);
   assert.match(plist, /<string>\/opt\/10and2 app\/dist\/10and2.js<\/string>/);
+});
+
+// macOS's and Linux's login services; Windows' entry runs `10and2` from the PATH at sign-in instead (service.ts runEntry).
+test("a login service runs the 10and2 on PATH when it's this install, by the path PATH names (npm, Nix), else this node and script", { skip: WINDOWS && "macOS's and Linux's login services" }, (t) => {
+  const root = mkdtempSync(join(tmpdir(), "launch-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const file = (p: string) => { mkdirSync(join(p, ".."), { recursive: true }); writeFileSync(p, "#!/usr/bin/env node\n"); chmodSync(p, 0o755); return p; };
+  // npm: <prefix>/bin/10and2 links to the package's bin/10and2.js; the script is that link as run.
+  const prefix = join(root, "npm");
+  file(join(prefix, "lib/node_modules/10and2/bin/10and2.js"));
+  mkdirSync(join(prefix, "bin"));
+  symlinkSync("../lib/node_modules/10and2/bin/10and2.js", join(prefix, "bin/10and2"));
+  assert.deepEqual(launchFor(join(prefix, "bin/10and2"), "/nix/store/x-node/bin/node", `/nowhere:${join(prefix, "bin")}`),
+    { program: [join(prefix, "bin/10and2")], path: `/nowhere:${join(prefix, "bin")}` });
+  // Nix: the profile's bin/10and2 links to <out>/bin/10and2, a wrapper running <out>/lib/10and2/dist/10and2.js.
+  const out = join(root, "store/abc-10and2-0.10.1");
+  file(join(out, "bin/10and2"));
+  const bundle = file(join(out, "lib/10and2/dist/10and2.js"));
+  mkdirSync(join(root, "profile/bin"), { recursive: true });
+  symlinkSync(join(out, "bin/10and2"), join(root, "profile/bin/10and2"));
+  assert.deepEqual(launchFor(bundle, "/x/node", join(root, "profile/bin")).program, [join(root, "profile/bin/10and2")]);
+  // Another install's 10and2 on PATH, or none: this node and this script, resolved.
+  assert.deepEqual(launchFor(bundle, "/x/node", join(prefix, "bin")).program, ["/x/node", bundle]);
+  assert.deepEqual(launchFor(join(prefix, "bin/10and2"), "/x/node", "/nowhere").program, ["/x/node", join(prefix, "lib/node_modules/10and2/bin/10and2.js")]);
+});
+
+test("a login service whose program is gone is stale (systemd and launchd), and one whose program is there isn't", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "stale-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const real = join(home, "10and2 real");
+  writeFileSync(real, "");
+  const linux = new Service({ platform: "linux", home, env: { XDG_CONFIG_HOME: join(home, ".config") }, runner: async () => "" });
+  const unit = join(home, ".config/systemd/user/10and2.service");
+  mkdirSync(join(unit, ".."), { recursive: true });
+  assert.equal(linux.program(), null);
+  assert.equal(linux.missing(), null, "nothing installed isn't stale");
+  writeFileSync(unit, systemdUnit({ program: [real], path: "/usr/bin" }));
+  assert.deepEqual(linux.program(), [real, "run", "--wait-for-credential"], "a quoted path read back");
+  assert.equal(linux.missing(), null);
+  writeFileSync(unit, systemdUnit({ program: ["/home/u/.nvm/versions/node/v24.22.1/bin/10and2"], path: "/usr/bin" }));
+  assert.equal(linux.missing(), "/home/u/.nvm/versions/node/v24.22.1/bin/10and2");
+  const mac = new Service({ platform: "darwin", home, runner: async () => "" });
+  mkdirSync(join(home, "Library/LaunchAgents"), { recursive: true });
+  const plist = join(home, "Library/LaunchAgents/com.selfdeprecated.10and2.plist");
+  // Quartz, 20 November: the Node it ran was still there, the script gone.
+  writeFileSync(plist, launchAgent({ program: [real, "/nix/store/gone-10and2-0.2.0/lib/10and2/10and2.js"], path: "/usr/bin" }, "/l"));
+  assert.deepEqual(mac.program(), [real, "/nix/store/gone-10and2-0.2.0/lib/10and2/10and2.js", "run", "--fatal-exit=0"]);
+  assert.equal(mac.missing(), "/nix/store/gone-10and2-0.2.0/lib/10and2/10and2.js");
+  writeFileSync(plist, launchAgent({ program: [real], path: "/usr/bin" }, "/l"));
+  assert.equal(mac.missing(), null);
 });
 
 /** Runs the CLI against a fake brain; returns its output and exit status. */
@@ -125,7 +246,7 @@ function cli(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: number |
 
 test("setup refuses an address given as a word or a mistyped flag before pairing anywhere; every command refuses what it wouldn't read", async (t) => {
   const dir = temp(t, "setup-stray-");
-  const env: NodeJS.ProcessEnv = { HOME: dir, PATH: "/nonexistent", XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1" };
+  const env = testEnv(dir, { PATH: join(dir, "nonexistent"), XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1" });
   const run = await cli(["setup", "10and2-stg.selfdep.com", "--no-autostart"], env);
   assert.notEqual(run.status, 0);
   assert.match(run.out, /10and2 setup --brain=10and2-stg\.selfdep\.com/);
@@ -144,7 +265,7 @@ test("setup pairs in the browser, keeps the credential private, writes a policy;
   const dir = temp(t, "setup-");
   const bin = join(dir, "bin");
   mkdirSync(bin);
-  writeFileSync(join(bin, "t3"), "#!/bin/sh\necho 1.0\n", { mode: 0o755 });
+  fakeCommand(bin, "t3", "1.0");
   const seen: { path: string; auth?: string; body: string }[] = [];
   let polls = 0;
   const server = createServer(async (req: IncomingMessage, res) => {
@@ -160,7 +281,7 @@ test("setup pairs in the browser, keeps the credential private, writes a policy;
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   t.after(() => server.close());
   const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const env: NodeJS.ProcessEnv = { HOME: dir, PATH: bin, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1" };
+  const env = testEnv(dir, { PATH: bin, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1" });
 
   const setup = await cli(["setup", `--brain=${origin}`, "--name=testbox", "--no-autostart"], env);
   assert.equal(setup.status, 0, setup.out);
@@ -168,7 +289,7 @@ test("setup pairs in the browser, keeps the credential private, writes a policy;
   assert.ok(!setup.out.includes(credential), "the credential is never printed");
   assert.match(seen[0].body, /"name":"testbox"/);
   const creds = join(dir, "config", "10and2", "credentials.json");
-  assert.equal(statSync(creds).mode & 0o777, 0o600);
+  assertPrivate(creds);
   assert.equal(JSON.parse(readFileSync(creds, "utf8"))[origin], credential);
   const policy = JSON.parse(readFileSync(join(dir, "config", "10and2", "connector.json"), "utf8"));
   assert.deepEqual(policy, { brain: `${origin.replace("http", "ws")}/connector`, projects: "*", actions: ["follow_up", "settle", "snooze", "archive", "start_work"], steer: true, answer: true, maxRuntimeMode: "full-access", agents: { claude: false, codex: false, pi: false, opencode: false, t3: true }, worktreeBase: "main" });
@@ -232,7 +353,7 @@ test("a LaunchAgent is loaded only once launchd has let go of the old one, and r
     return "";
   };
   const service = new Service({ runner, platform: "darwin", home, sleep: async () => {} });
-  const s = await service.install({ node: "/usr/bin/node", script: "/opt/10and2.js", path: "/usr/bin" });
+  const s = await service.install({ program: ["/usr/bin/node", "/opt/10and2.js"], path: "/usr/bin" });
   assert.equal(s.running, true);
   assert.equal(calls.filter((c) => c === "bootstrap").length, 1, "never bootstrapped while the old job was still there");
   await service.uninstall();
@@ -244,10 +365,12 @@ test("run refuses with 78 when the machine isn't paired, or its credentials file
   const dir = temp(t, "run-");
   mkdirSync(join(dir, "10and2"));
   writeFileSync(join(dir, "10and2", "connector.json"), JSON.stringify({ brain: "ws://127.0.0.1:1/connector" }));
-  const env: NodeJS.ProcessEnv = { HOME: dir, PATH: "/nonexistent", XDG_CONFIG_HOME: dir, XDG_STATE_HOME: join(dir, "state"), TENANDTWO_CREDENTIAL_STORE: "file" };
+  const env = testEnv(dir, { PATH: join(dir, "nonexistent"), XDG_CONFIG_HOME: dir, XDG_STATE_HOME: join(dir, "state"), TENANDTWO_CREDENTIAL_STORE: "file" });
   const unpaired = await cli(["run"], env);
   assert.equal(unpaired.status, 78);
   assert.match(unpaired.out, /isn't paired/);
+  // Windows has no file modes to check: its profile's own permissions keep the file private.
+  if (WINDOWS) return;
   writeFileSync(join(dir, "10and2", "credentials.json"), JSON.stringify({ "http://127.0.0.1:1": "private-token" }), { mode: 0o644 });
   chmodSync(join(dir, "10and2", "credentials.json"), 0o644);
   const open = await cli(["run"], env);

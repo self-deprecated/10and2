@@ -4,7 +4,6 @@
 import { watch, existsSync, readdirSync, readFileSync, statSync, mkdirSync, openSync, closeSync, readSync, unlinkSync } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
-import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Action, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
@@ -17,7 +16,7 @@ import { answersFor } from "../claude/adapter.ts";
 import { PiSession, textOf } from "./session.ts";
 import { piSessionId, readRegistry, talk } from "./bridge.ts";
 import type { Live } from "./bridge.ts";
-import { MARKER, installedPath, piAgentDir } from "./extension.ts";
+import { MARKER, installedPath, piAgentDir, piPath } from "./extension.ts";
 import { NOT_STARTED } from "./turn.ts";
 import type { Turn } from "./turn.ts";
 
@@ -33,11 +32,13 @@ export type Options = {
   acceptanceTimeoutMs?: number;
   /** How old a scan reads may reuse (1 s); file events and the periodic rescan keep it current. Tests use 0. */
   readCacheMs?: number;
-  /** The `pi` command (on PATH by default). */
-  piBin?: string;
+  /** The command that runs Pi, as its program and any arguments before Pi's own (`pi`, found on PATH, by default). */
+  piCommand?: string[];
   /** The headless runner: `<nodeBin> <entryScript> pi-turn` (this Node and the connector's own command by default). */
   nodeBin?: string;
   entryScript?: string;
+  /** The system it's on (tests try Windows' way on Linux). */
+  platform?: NodeJS.Platform;
 };
 
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -84,8 +85,11 @@ export class PiAdapter implements Adapter {
   private closing = false;
   private shutdown: Promise<void> | null = null;
   private readers = new Map<string, PiSession>();
-  /** Files left out on their header (another folder, not a session), with the inode they had. */
-  private skipped = new Map<string, number | bigint>();
+  /**
+   * Files left out on their header (another folder, not a session), with the file id they had: a bigint, since a
+   * Windows one (NTFS's, with a sequence number in its high bits) is too big for a number to hold exactly.
+   */
+  private skipped = new Map<string, bigint>();
   private rows = new Map<string, Row>();
   private roots = new Map<string, string>();
   private keys = new Map<string, string>();
@@ -101,7 +105,8 @@ export class PiAdapter implements Adapter {
   constructor(opts: Options) {
     this.opts = opts; this.now = opts.now ?? Date.now;
     this.agentDir = resolve(opts.agentDir ?? piAgentDir());
-    this.sessionsDir = resolve(opts.sessionsDir ?? process.env.PI_CODING_AGENT_SESSION_DIR ?? this.settingsSessionDir() ?? join(this.agentDir, "sessions"));
+    const envSessions = process.env.PI_CODING_AGENT_SESSION_DIR;
+    this.sessionsDir = resolve(opts.sessionsDir ?? (envSessions ? piPath(envSessions) : null) ?? this.settingsSessionDir() ?? join(this.agentDir, "sessions"));
     this.store = new Store(opts.db);
   }
   /** The `sessionDir` setting in Pi's settings.json, when it names one. */
@@ -109,8 +114,7 @@ export class PiAdapter implements Adapter {
     try {
       const dir = JSON.parse(readFileSync(join(this.agentDir, "settings.json"), "utf8"))?.sessionDir;
       if (typeof dir !== "string" || !dir.trim()) return null;
-      const home = homedir();
-      const expanded = dir === "~" ? home : dir.startsWith("~/") ? join(home, dir.slice(2)) : dir;
+      const expanded = piPath(dir);
       // Pi reads a relative one from wherever it starts; there's no one folder to read then.
       return isAbsolute(expanded) ? expanded : null;
     } catch { return null; }
@@ -173,7 +177,7 @@ export class PiAdapter implements Adapter {
     if (this.closed) return;
     this.scannedAt = Date.now();
     const policy = this.opts.policy;
-    const live = readRegistry(this.agentDir);
+    const live = readRegistry(this.agentDir, this.opts.platform);
     for (const run of this.store.runs()) if (run.pid && pidState(run.pid, run.procStart) === "dead") this.store.ended(run.sessionId, run.pid);
     this.extension = (() => { try { return readFileSync(installedPath(this.agentDir), "utf8").startsWith(MARKER); } catch { return false; } })();
     const wanted = new Set<string>([this.agentDir, this.sessionsDir, join(this.agentDir, "10and2")]);
@@ -183,8 +187,8 @@ export class PiAdapter implements Adapter {
       // `<timestamp>_<id>.jsonl`: the timestamp has no underscore.
       const name = basename(path, ".jsonl"), id = name.slice(name.indexOf("_") + 1);
       try {
-        const st = statSync(path);
-        if (st.mtimeMs < cutoff && !live.has(id) && !this.store.run(id)) continue;
+        const st = statSync(path, { bigint: true });
+        if (Number(st.mtimeMs) < cutoff && !live.has(id) && !this.store.run(id)) continue;
         if (this.skipped.get(path) === st.ino) continue;
       } catch { continue; }
       paths.add(path);
@@ -201,7 +205,7 @@ export class PiAdapter implements Adapter {
         reader = new PiSession(path);
         reader.read(HEAD_BYTES);
         if (reader.offset > 0 && (reader.invalid || (reader.cwd !== null && !visible(policy, reader.cwd)))) {
-          try { this.skipped.set(path, statSync(path).ino); } catch { /* gone: the next scan drops it */ }
+          try { this.skipped.set(path, statSync(path, { bigint: true }).ino); } catch { /* gone: the next scan drops it */ }
           continue;
         }
       }
@@ -277,7 +281,7 @@ export class PiAdapter implements Adapter {
     const counts = new Map<string, number>();
     for (const [, root] of roots) counts.set(basename(root), (counts.get(basename(root)) ?? 0) + 1);
     return roots.map(([id, root]) => ({ id, name: basename(root) + ((counts.get(basename(root)) ?? 0) > 1 ? ` (${id})` : ""), folder: folderOf(root),
-      activeAt: [...this.rows.values()].filter((r) => gitRoot(r.cwd) === root).map((r) => r.item.updatedAt).sort().at(-1) ?? null }));
+      activeAt: [...this.rows.values()].filter((r) => gitRoot(r.cwd) === root).map((r) => r.item.updatedAt).sort().at(-1) ?? null, models: [] }));
   }
   async list(): Promise<WorkItem[]> { this.fresh(); return [...this.rows.values()].map((r) => ({ ...r.item })); }
   private row(id: string): Row {
@@ -308,9 +312,10 @@ export class PiAdapter implements Adapter {
     if (!policy.pi) return "Pi sessions are disabled on this machine.";
     if (!allows(policy, action.kind, "pi")) return "This machine's local policy doesn't allow that action.";
     if (action.kind === "start_work") {
-      if (action.title?.trimStart().startsWith("-")) return "A session title must not start with a dash.";
       if (!this.roots.has(action.placeId)) return "That project isn't visible to 10 & 2.";
       const worktrees = join(this.roots.get(action.placeId)!, ".pi", "worktrees");
+      // It lists no models to 10 & 2 yet (docs/launch/thread-model.md), so none can be chosen.
+      if (action.model !== undefined) return "Pi can't start on a chosen model through 10 & 2 yet.";
       if (action.profile.workspace === "worktree" && existsSync(worktrees) && !visible(this.opts.policy, worktrees)) return "That project's worktree folder is outside 10 & 2's visible folders.";
       if (action.profile.interactionMode === "plan") return "Pi has no plan mode, so 10 & 2 can't start it with a plan first. Choose a profile without one.";
       if (!withinCeiling(policy, { runtimeMode: "full-access" }, "pi")) return NO_FULL_ACCESS_START;
@@ -325,8 +330,10 @@ export class PiAdapter implements Adapter {
   }
   private followUpRefusal(id: string, row: Row): string | null {
     const policy = this.opts.policy;
-    // An open session: the extension's question takes the answer; otherwise its socket takes the words.
+    // An open session: the extension's question takes the answer; otherwise its socket takes the words. One open where
+    // 10 & 2 can't reach it (an administrator's terminal on Windows) gets neither, and isn't run headless either.
     if (row.live) {
+      if (!row.live.socket) return UNREACHABLE;
       if (row.live.questions.length) return answers(policy, "pi") ? null : NO_ANSWERING;
       if (row.live.status === "waiting") return OTHER_DIALOG;
       return steers(policy, "pi") ? null : NO_STEERING;
@@ -374,11 +381,12 @@ export class PiAdapter implements Adapter {
     if (action.kind === "follow_up") {
       const live = this.rows.get(action.itemId)?.live;
       if (live) {
+        if (!live.socket) return { ok: false, error: UNREACHABLE };
         const q = live.questions[0];
-        if (q) return answers(this.opts.policy, "pi") ? this.tracked(this.answer(action, key, digest, live, q)) : { ok: false, error: NO_ANSWERING };
+        if (q) return answers(this.opts.policy, "pi") ? this.tracked(this.answer(action, key, digest, live.socket, q)) : { ok: false, error: NO_ANSWERING };
         if (live.status === "waiting") return { ok: false, error: OTHER_DIALOG };
         if (!steers(this.opts.policy, "pi")) return { ok: false, error: NO_STEERING };
-        return this.tracked(this.steer(action, key, digest, live));
+        return this.tracked(this.steer(action, key, digest, live.socket));
       }
     }
     const id = action.kind === "start_work" ? sessionForKey(key) : action.itemId;
@@ -398,9 +406,9 @@ export class PiAdapter implements Adapter {
   }
 
   /** Words to a session open in Pi, as if typed there: a new turn when it's idle, a steer between its steps when busy. */
-  private async steer(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string, live: Live): Promise<Receipt> {
+  private async steer(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string, socket: string): Promise<Receipt> {
     if (!this.store.begin(key, digest)) return this.repeat(key, digest) ?? UNKNOWN;
-    const r = await talk(live.socket, { id: randomUUID(), type: "user", text: action.message, deliverAs: "steer" }, this.opts.acceptanceTimeoutMs ?? 5000);
+    const r = await talk(socket, { id: randomUUID(), type: "user", text: action.message, deliverAs: "steer" }, this.opts.acceptanceTimeoutMs ?? 5000);
     this.schedule();
     // The extension's ack is Pi itself saying it took the words.
     if (r === "unreachable") return this.store.finish(key, { ok: false, error: UNREACHABLE });
@@ -410,10 +418,10 @@ export class PiAdapter implements Adapter {
   }
 
   /** The answer to a question the extension asked: the option the user named, else their own words. */
-  private async answer(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string, live: Live, q: Live["questions"][number]): Promise<Receipt> {
+  private async answer(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string, socket: string, q: Live["questions"][number]): Promise<Receipt> {
     if (!this.store.begin(key, digest)) return this.repeat(key, digest) ?? UNKNOWN;
     const value = answersFor([{ question: q.title, options: q.options, multiSelect: false }], action.message)[q.title]!;
-    const r = await talk(live.socket, { id: randomUUID(), type: "answer", questionId: q.questionId, value }, this.opts.acceptanceTimeoutMs ?? 5000);
+    const r = await talk(socket, { id: randomUUID(), type: "answer", questionId: q.questionId, value }, this.opts.acceptanceTimeoutMs ?? 5000);
     this.schedule();
     if (r === "unreachable") return this.store.finish(key, { ok: false, error: UNREACHABLE });
     if (r === "silent") return this.store.finish(key, { ok: false, unknown: true, error: "Pi may have had its answer already. 10 & 2 won't send it again." });
@@ -438,7 +446,7 @@ export class PiAdapter implements Adapter {
     let baseline = 0;
     if (sessionPath) { try { baseline = statSync(sessionPath).size; } catch { /* gone: everything in it is new */ } }
     if (!cwd || (!starting && !sessionPath)) { this.store.ended(id); return this.store.finish(key, { ok: false, error: "That session isn't visible to 10 & 2." }); }
-    const turn: Turn = { pi: this.opts.piBin ?? "pi", cwd, message: action.message,
+    const turn: Turn = { pi: this.opts.piCommand ?? ["pi"], cwd, message: action.message,
       ...(starting ? { sessionId: id, ...(action.title ? { name: action.title } : {}) } : { session: sessionPath! }) };
     const token = hash(key).slice(0, 24), stderrPath = join(this.opts.stateDir, `${token}.stderr.log`);
     const finish = (receipt: Receipt): Receipt => {
@@ -452,7 +460,7 @@ export class PiAdapter implements Adapter {
     catch { this.store.ended(id); return finish({ ok: false, error: "10 & 2 couldn't create a private run log." }); }
     let child: ChildProcess;
     try {
-      child = spawn(this.opts.nodeBin ?? process.execPath, [this.opts.entryScript ?? process.argv[1]!, "pi-turn"], { cwd, detached: true, env: this.childEnv(), stdio: ["pipe", "ignore", err] });
+      child = spawn(this.opts.nodeBin ?? process.execPath, [this.opts.entryScript ?? process.argv[1]!, "pi-turn"], { cwd, detached: true, windowsHide: true, env: this.childEnv(), stdio: ["pipe", "ignore", err] });
     } catch {
       closeSync(err); this.store.ended(id);
       return finish({ ok: false, error: "10 & 2 couldn't start Pi on this machine." });

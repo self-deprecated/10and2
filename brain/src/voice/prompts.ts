@@ -3,12 +3,13 @@
 // filler ("One moment.") is now at most "Okay.": said before every tool call, it was the commonest thing Driver said.
 // Told to say nothing, GPT-Live still filled the gap, with "Sure, I'll take care of that." before a readback.
 import type { LaunchProfile, Place } from "../adapter.ts";
-import type { BriefingView } from "../briefing.ts";
+import { ASKS, type BriefingView } from "../briefing.ts";
 import { ago } from "../util.ts";
 import { fill, type Prompts } from "./sections.ts";
 import { READBACK_ALL, type ConfirmLevels, type KeepReplies, type Level } from "../proposals.ts";
 import { STANDARD_WAKE_WORD } from "./wakeWord.ts";
-import { APPS, hasDefaults, NO_DEFAULTS, type NewThreadDefaults } from "../places.ts";
+import { APPS, hasDefaults, NO_DEFAULTS, placeParts, type NewThreadDefaults } from "../places.ts";
+import { byName, withProvider } from "../thread-models.ts";
 
 /**
  * What Driver may recall from earlier conversations: the user's notes and the changes made, both dated. A change is a
@@ -49,10 +50,12 @@ export function briefingBlock(view: BriefingView, recent: Recent | null, now: Da
   // "needs a system switch" was told as how things stood).
   // A thread that replied after its summary was made says so first (14 November: a three-hour-old summary was told as
   // the update on a thread that had replied 8 minutes before).
+  // Only a thread blocked or needing a decision waits on the user; one whose question has gone stale only asked it.
+  const asked = (c: BriefingView["cards"][number]) => (!c.ask ? "" : ASKS.has(c.state) ? ` Waiting on the user: ${c.ask}` : ` It asked: ${c.ask}`);
   const card = (c: BriefingView["cards"][number]) =>
     c.newer
       ? `- "${c.handle}" [${c.group}] replied again ${ago(c.newer.at, t)}, not summarized yet: say so, and have the backend read it before saying how it stands. Its summary before that${c.reply ? `, ${asOf(c.reply.at, t)}` : ""}: ${c.summary}`
-      : `- "${c.handle}" [${c.group}] ${c.state.replace(/_/g, " ")}${c.reply ? ` ${asOf(c.reply.at, t)}` : ""}, last active ${ago(c.updatedAt, t)}: ${c.summary}${c.ask ? ` Waiting on the user: ${c.ask}` : ""}`;
+      : `- "${c.handle}" [${c.group}] ${c.state.replace(/_/g, " ")}${c.reply ? ` ${asOf(c.reply.at, t)}` : ""}, last active ${ago(c.updatedAt, t)}: ${c.summary}${asked(c)}`;
   const starredSnoozed = view.snoozed.filter((s) => s.starred);
   const { focus, shown, heard } = briefed(view, t);
   const left = view.cards.length - shown.length - heard.length;
@@ -68,7 +71,7 @@ export function briefingBlock(view: BriefingView, recent: Recent | null, now: Da
       : `${left} older threads aren't listed here: ${rest}. The backend can list or read any of them.`;
   // 8 November: an overview went back to the first thread every time; what the user has heard about waits until it replies.
   const covered = heard.length
-    ? `Already heard, with nothing new since the user last heard or read it: ${heard.map((c) => `"${c.handle}" [${c.group}]${c.state === "needs_decision" || c.state === "blocked" ? " (still waiting on the user)" : ""}`).join(", ")}. Don't go over these again unless the user asks about one or to hear everything again; the backend can still read any of them.`
+    ? `Already heard, with nothing new since the user last heard or read it: ${heard.map((c) => `"${c.handle}" [${c.group}]${ASKS.has(c.state) ? " (still waiting on the user)" : ""}`).join(", ")}. Don't go over these again unless the user asks about one or to hear everything again; the backend can still read any of them.`
     : "";
   const fresh = shown.filter((c) => c.unread && !told.has(c.itemId));
   const unread = fresh.length
@@ -132,7 +135,7 @@ export const newThreadPromptOf = (v: unknown): NewThreadPrompt => (NEW_THREAD_PR
  */
 function defaultsNote(d: NewThreadDefaults): string {
   if (!hasDefaults(d)) return "";
-  const set = [d.project && `project ${d.project}`, d.machine && `machine ${d.machine}`, d.app && `coding app ${APPS[d.app]}`].filter(Boolean).join("; ");
+  const set = [d.project && `project ${d.project}`, d.machine && `machine ${d.machine}`, d.app && `coding app ${APPS[d.app]}`, d.codingModel && `coding model ${withProvider({ name: d.codingModel, provider: d.codingProvider })}`].filter(Boolean).join("; ");
   return `\n${fill("backend.new-thread.defaults", { defaults: set })}`;
 }
 
@@ -179,12 +182,41 @@ export function frontendInstructions(briefing: string, prompts: Prompts = {}, ke
   return fill("voice", { briefing, keep_replies: keepNote("voice", keep), confirm_levels: confirmNote("voice", confirm), wake, vocabulary: vocabularyNote("voice", words), thread_names: namesNote("voice", names) }, prompts);
 }
 
-/** Where new threads can start, the most recently active first, and the profiles they can start with. */
+/** How many of a coding app's models the launch note names, on one machine; the rest are counted. */
+const MODELS_NAMED = 10;
+
+/**
+ * Where new threads can start, the most recently active first, and the profiles they can start with; and, where any
+ * place offers a choice (docs/launch/thread-model.md), the coding models a new thread can start on, by coding app and
+ * machine: its coding agent's, never 10 & 2's own, so "which model are you?" isn't answered with one.
+ */
 export function launchNote(places: Place[], profiles: LaunchProfile[]): string {
   const recent = [...places].sort((a, b) => (b.activeAt ?? "").localeCompare(a.activeAt ?? "")).slice(0, 15).map((p) => p.name);
   const profile = (p: LaunchProfile, i: number) =>
     `${p.name}${i === 0 ? " (the default)" : ""}: ${p.interactionMode === "plan" ? "plans only" : "does the work"}, ${p.workspace === "worktree" ? "in a new worktree" : "in the project's own checkout"}`;
-  return `New threads can start in these projects (most recently active first): ${recent.length ? recent.join("; ") : "none right now: their machines may be unreachable"}. Launch profiles: ${profiles.map(profile).join("; ")}.`;
+  const note = `New threads can start in these projects (most recently active first): ${recent.length ? recent.join("; ") : "none right now: their machines may be unreachable"}. Launch profiles: ${profiles.map(profile).join("; ")}.`;
+  const models = modelsNote(places);
+  return models ? `${note}\n${models}` : note;
+}
+
+/**
+ * The models places offer, each coding app's on each machine once ("T3 Code on Lattice: A (on Claude, Claude Proxy), B
+ * and C"), a name several providers serve with theirs; none: nothing.
+ */
+function modelsNote(places: Place[]): string {
+  const byApp = new Map<string, Place[]>();
+  for (const p of places) {
+    if (!p.models?.length) continue;
+    const { machine, app } = placeParts(p);
+    const key = `${APPS[app]}${machine ? ` on ${machine}` : ""}`;
+    byApp.set(key, [...(byApp.get(key) ?? []), p]);
+  }
+  const each = [...byApp].map(([app, ps]) => {
+    const names = byName(ps.flatMap((p) => p.models ?? [])).map((n) => (n.providers.length > 1 ? `${n.name} (on ${n.providers.join(", ")})` : n.name));
+    const shown = names.slice(0, MODELS_NAMED);
+    return `${app}: ${names.length > MODELS_NAMED ? `${shown.join(", ")} and ${names.length - MODELS_NAMED} more` : and(shown)}`;
+  });
+  return each.length ? `Coding models a new thread can start on (its coding agent's, not 10 & 2's own), by coding app (pass model only when the user names one, with its provider if they say it): ${each.join("; ")}.` : "";
 }
 
 /**

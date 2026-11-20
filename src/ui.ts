@@ -13,10 +13,23 @@ export const accent = (s: string) => paint("magenta", s);
 /** A command to type, like `10and2 status`. */
 export const cmd = (s: string) => paint("cyan", s);
 
+/**
+ * The marks drawn: Unicode everywhere but the old Windows console, whose fonts (Consolas, Lucida Console) lack the
+ * braille spinner and ✓ ✗ ◉ ❯, so there they're ones it has. Windows Terminal says it's there with WT_SESSION, and VS
+ * Code's terminal with TERM_PROGRAM.
+ */
+export function marks(platform: NodeJS.Platform = process.platform, env: NodeJS.ProcessEnv = process.env) {
+  const unicode = platform !== "win32" || Boolean(env.WT_SESSION) || env.TERM_PROGRAM === "vscode";
+  return unicode
+    ? { spinner: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", ok: "✓", bad: "✗", cursor: "❯", on: "◉", off: "○", left: "◂", right: "▸" }
+    : { spinner: "|/-\\", ok: "√", bad: "×", cursor: ">", on: "●", off: "○", left: "◄", right: "►" };
+}
+const mark = marks();
+
 export const say = (s = "") => console.log(s);
-export const ok = (s: string) => say(`  ${paint("green", "✓")} ${s}`);
+export const ok = (s: string) => say(`  ${paint("green", mark.ok)} ${s}`);
 export const warn = (s: string) => say(`  ${paint("yellow", "!")} ${s}`);
-export const bad = (s: string) => say(`  ${paint("red", "✗")} ${s}`);
+export const bad = (s: string) => say(`  ${paint("red", mark.bad)} ${s}`);
 export const note = (s: string) => say(`    ${s}`);
 
 /** "3 minutes", "2 hours": how long ago an ISO time was. */
@@ -28,7 +41,7 @@ export function ago(iso: string, now = Date.now()): string {
 
 /** A line that spins while something runs, then becomes ✓, ! or ✗ with its outcome. Plain text off a terminal. */
 export function spinner(text: string) {
-  const frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+  const frames = mark.spinner;
   let i = 0;
   let current = text;
   const draw = () => process.stdout.write(`\r\x1b[2K  ${accent(frames[i++ % frames.length])} ${current}`);
@@ -145,13 +158,13 @@ export function listStep(s: ListState, key: ListKey): ListOutcome {
 function drawList(title: string, s: ListState, hint: string): string[] {
   const lines = [`  ${title}`];
   s.rows.forEach((r, i) => {
-    const cursor = i === s.at ? accent("❯") : " ";
+    const cursor = i === s.at ? accent(mark.cursor) : " ";
     if (r.kind === "box") {
-      const mark = r.disabled ? dim("○") : r.on ? paint("green", "◉") : dim("○");
+      const box = r.disabled ? dim(mark.off) : r.on ? paint("green", mark.on) : dim(mark.off);
       const label = r.disabled ? dim(r.label) : r.label;
-      lines.push(`  ${cursor} ${mark} ${label.padEnd(14)}${r.detail ? ` ${dim(r.detail)}` : ""}`);
+      lines.push(`  ${cursor} ${box} ${label.padEnd(14)}${r.detail ? ` ${dim(r.detail)}` : ""}`);
     } else {
-      lines.push(`  ${cursor}   ${r.label}  ${accent(`◂ ${r.options[r.index]} ▸`)}${r.detail ? `  ${dim(r.detail)}` : ""}`);
+      lines.push(`  ${cursor}   ${r.label}  ${accent(`${mark.left} ${r.options[r.index]} ${mark.right}`)}${r.detail ? `  ${dim(r.detail)}` : ""}`);
     }
   });
   lines.push("", `  ${dim(hint)}`);

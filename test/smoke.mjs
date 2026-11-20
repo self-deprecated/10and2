@@ -1,18 +1,31 @@
 // The published file runs on its own: no TypeScript, no node_modules, on whichever Node runs this script.
 // `npm run check` runs it after the build; run it under Node 22 too (`nix shell nixpkgs#nodejs_22 -c node test/smoke.mjs`).
 import { spawn, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { createServer } from "node:net";
+import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 
+const WINDOWS = process.platform === "win32";
+// Windows starts a process several times slower, and scans each.
+const timeout = 10_000 * (WINDOWS ? 3 : 1);
 // The launcher npm puts on PATH (bin/10and2.js), which loads the bundle, with no flags: what a user runs.
-const bin = new URL("../bin/10and2.js", import.meta.url).pathname;
+const bin = fileURLToPath(new URL("../bin/10and2.js", import.meta.url));
 const dir = mkdtempSync(join(tmpdir(), "10and2-smoke-"));
-const env = { HOME: dir, PATH: process.env.PATH, XDG_CONFIG_HOME: join(dir, "c"), XDG_STATE_HOME: join(dir, "s"), XDG_RUNTIME_DIR: dir, TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1" };
-const run = (...args) => spawnSync(process.execPath, [bin, ...args], { env, encoding: "utf8", timeout: 10_000, input: "" });
+// This environment (Windows can't run much without SystemRoot and the like), with nothing of the user's own agents or
+// 10 & 2, no forced colour, and the test's folder as home (HOME, or USERPROFILE on Windows).
+const own = Object.fromEntries(Object.entries(process.env).filter(([k]) => !/^(XDG_|CLAUDE_|CODEX_|PI_|T3|OPENCODE|TENANDTWO_|OPENAI_|DRIVER_|FORCE_COLOR$)/i.test(k)));
+const env = { ...own, HOME: dir, USERPROFILE: dir, XDG_CONFIG_HOME: join(dir, "c"), XDG_STATE_HOME: join(dir, "s"), XDG_RUNTIME_DIR: dir, TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1" };
+const run = (...args) => spawnSync(process.execPath, [bin, ...args], { env, encoding: "utf8", timeout, input: "" });
 try {
+  // Every file the bundled brain reads beside its code is in the package, including any it reads only later, which
+  // starting it below wouldn't show (18 November: the AAC encoder wasn't, and `10and2 brain run` stopped at once).
+  const brainBundle = new URL("../dist/brain/main.js", import.meta.url);
+  for (const [, path] of readFileSync(brainBundle, "utf8").matchAll(/new URL\("([^"]+)", import\.meta\.url\)/g)) {
+    assert.ok(existsSync(new URL(path, brainBundle)), `the bundled brain reads ${path}, which isn't in dist/`);
+  }
   const version = run("version");
   assert.equal(version.status, 0, version.stderr);
   assert.match(version.stdout, /^\d+\.\d+\.\d+\n$/);
@@ -35,15 +48,19 @@ try {
   assert.equal(unpaired.status, 78);
 
   // A brain of your own, from the same package: set up, run, refuse the phone without its code, and link this
-  // computer's connector to it. A fake Claude Code; the AI key is never used (nothing here starts a conversation).
+  // computer's connector to it. A fake Claude Code (on Windows a command script as npm writes one, run as Node and its
+  // script); the AI key is never used (nothing here starts a conversation).
   mkdirSync(join(dir, "bin"));
-  writeFileSync(join(dir, "bin", "claude"), "#!/bin/sh\necho 1.0\n", { mode: 0o755 });
+  if (WINDOWS) {
+    writeFileSync(join(dir, "bin", "claude.mjs"), "console.log('1.0');\n");
+    writeFileSync(join(dir, "bin", "claude.cmd"), `@ECHO off\r\nnode "%~dp0\\claude.mjs" %*\r\n`);
+  } else writeFileSync(join(dir, "bin", "claude"), "#!/bin/sh\necho 1.0\n", { mode: 0o755 });
   // A port nothing else holds, from the OS (a random one collided now and then on a busy machine).
   const port = await new Promise((resolve, reject) => {
     const probe = createServer().once("error", reject).listen(0, "127.0.0.1", () => { const { port } = probe.address(); probe.close(() => resolve(port)); });
   });
-  const brainEnv = { ...env, PATH: `${join(dir, "bin")}:${env.PATH}`, T3_CLI: join(dir, "no-t3"), CLAUDE_CONFIG_DIR: join(dir, "claude") };
-  const setup = spawnSync(process.execPath, [bin, "brain", "setup", "--name=smoke", `--port=${port}`, "--yes"], { env: { ...brainEnv, OPENAI_API_KEY: "sk-smoke" }, encoding: "utf8", timeout: 10_000, input: "" });
+  const brainEnv = { ...env, PATH: [join(dir, "bin"), process.env.PATH].join(delimiter), T3_CLI: join(dir, "no-t3"), CLAUDE_CONFIG_DIR: join(dir, "claude") };
+  const setup = spawnSync(process.execPath, [bin, "brain", "setup", "--name=smoke", `--port=${port}`, "--yes"], { env: { ...brainEnv, OPENAI_API_KEY: "sk-smoke" }, encoding: "utf8", timeout, input: "" });
   assert.equal(setup.status, 0, setup.stdout + setup.stderr);
   const code = /Access code +(\S+)/.exec(setup.stdout)[1];
   // Their output is kept, and shown when something here fails.
@@ -73,8 +90,15 @@ try {
     assert.equal((await fetch(`${origin}/api/state`)).status, 401);
     const state = await until("the brain's state, with the access code", () => fetch(`${origin}/api/state`, { headers: { "x-driver-access": code }, signal: AbortSignal.timeout(2000) }).then((r) => r.ok && r.json()));
     assert.match(state.version.rev, /^10and2-\d/);
-    const status = await until("the connector linked to the brain", async () => { const s = spawnSync(process.execPath, [bin, "status"], { env: brainEnv, encoding: "utf8" }).stdout; return /Connected to your brain at 127\.0\.0\.1/.test(s) && s; });
+    const status = await until("the connector linked to the brain", async () => { const s = spawnSync(process.execPath, [bin, "status"], { env: brainEnv, encoding: "utf8", timeout }).stdout; return /Connected to your brain at 127\.0\.0\.1/.test(s) && s; });
     assert.ok(status);
-  } finally { for (const c of children) c.kill("SIGTERM"); }
+  } finally {
+    // Stopped and waited for: one still writing its state as it went made removing `dir` fail (CI, 20 November).
+    await Promise.all(children.map((c) => c.exitCode !== null || c.signalCode !== null ? null : new Promise((r) => {
+      c.once("exit", r);
+      c.kill("SIGTERM");
+      setTimeout(() => c.kill("SIGKILL"), 5000).unref();
+    })));
+  }
   console.log(`smoke: bin/10and2.js, dist/10and2.js and the brain run on Node ${process.versions.node}`);
-} finally { rmSync(dir, { recursive: true, force: true }); }
+} finally { rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }

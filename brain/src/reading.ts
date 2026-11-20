@@ -5,7 +5,7 @@ import type { AnalyticsSink } from "./analytics.ts";
 import type { PastReply, WorkItem } from "./adapter.ts";
 import type { ReadDeps } from "./reads.ts";
 import { headTail, isNew } from "./briefing.ts";
-import type { Speech } from "./voice/speech.ts";
+import { isReadingOff, type Speech } from "./voice/speech.ts";
 import { describe, limiter, mapLimit, redactWhole } from "./util.ts";
 
 /**
@@ -547,6 +547,6 @@ export async function prepareReply(deps: ReadingDeps, itemId: string, messageId:
  */
 export function warmUp(deps: Pick<ReadDeps, "store" | "log"> & { speech: Speech }, readingId: string, voice: string) {
   for (const s of deps.store.readingSegments(readingId)?.slice(0, 2) ?? []) {
-    deps.speech.audio(s.text, voice).catch((e) => deps.log(`speech: couldn't make a reading's opening ahead (${describe(e)})`));
+    deps.speech.audio(s.text, voice).catch((e) => isReadingOff(e) || deps.log(`speech: couldn't make a reading's opening ahead (${describe(e)})`));
   }
 }

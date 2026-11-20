@@ -1,19 +1,119 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdirSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { Transcript } from "../src/claude/transcript.ts";
-import { pidState, procStart, readRegistry, knownVersion, parsePsStart, darwinIdentity } from "../src/claude/registry.ts";
+import { uptime } from "node:os";
+import { Transcript, projectFolder, t3Cwd } from "../src/claude/transcript.ts";
+import { holderState, pidState, procStart, readRegistry, registrySnapshot, knownVersion, parsePsStart, darwinIdentity, parseTasklist, processImages } from "../src/claude/registry.ts";
 import { harness, until, pause } from "./fixtures/claude/helpers.ts";
+import { assertPrivate } from "./fixtures/platform.ts";
 
 test("registry validates process identity and refuses stale PID reuse", (t) => {
   const h = harness(t), id = randomUUID();
   h.registry(id, "busy");
-  assert.equal(readRegistry(h.config)[0]?.status, ["linux", "darwin"].includes(process.platform) ? "busy" : null);
+  assert.equal(readRegistry(h.config)[0]?.status, ["linux", "darwin", "win32"].includes(process.platform) ? "busy" : null);
+  // Windows tells a reused pid only by its image (below): this test process is node.exe, as a Claude Code can be.
   h.registry(id, "busy", { procStart: process.platform === "darwin" ? "darwin:0" : "0" });
   assert.equal(readRegistry(h.config).length, ["linux", "darwin"].includes(process.platform) ? 0 : 1);
+});
 
+test("on Windows a pid is Claude Code's by its image, from one tasklist that's listed again for a pid it hasn't seen", () => {
+  const listing = (rows: [string, number][]) => rows.map(([image, pid]) => `"${image}","${pid}","Console","1","123,456 K"`).join("\r\n") + "\r\n";
+  assert.deepEqual([...parseTasklist(listing([["Claude.exe", 10], ["node.exe", 11]]) + "garbage\r\n\r\n")], [[10, "claude.exe"], [11, "node.exe"]]);
+  let runs = 0, rows: [string, number][] = [["claude.exe", 101], ["node.exe", 102], ["bun.exe", 103], ["notepad.exe", process.pid]];
+  const images = processImages(() => { runs++; return listing(rows); });
+  // process.kill(pid, 0) must find it alive first: this process stands in for each.
+  const state = (start: string | null, image: string) => pidState(process.pid, start, "win32", undefined, () => image);
+  assert.equal(state("13380000000000000000", "claude.exe"), "verified", "Claude Code's own start (procStartFt) isn't compared");
+  assert.equal(state(null, "node.exe"), "verified");
+  assert.equal(state(null, "bun.exe"), "verified");
+  assert.equal(state(null, "notepad.exe"), "dead", "a pid Windows gave to another program");
+  assert.equal(state("win32:node.exe", "node.exe"), "verified", "a run of Driver's own, by the image it recorded");
+  assert.equal(state("win32:claude.exe", "node.exe"), "dead");
+  assert.equal(pidState(process.pid, null, "win32", undefined, () => undefined), "unverified", "no listing says nothing");
+  assert.equal(pidState(process.pid, null, "win32", undefined, () => null), "dead", "not listed: gone");
+  assert.equal(pidState(process.pid, null, "win32", undefined, images), "dead");
+  assert.equal(images(101), "claude.exe"); assert.equal(runs, 1, "one listing serves every pid for a while");
+  rows = [...rows, ["claude.exe", 104]];
+  assert.equal(images(104), "claude.exe", "a pid started since is listed again"); assert.equal(runs, 2);
+  assert.equal(images(999), null); assert.equal(runs, 3);
+  assert.equal(procStart(104, "win32", images), "win32:claude.exe");
+  assert.equal(procStart(999, "win32", images), null);
+  let failed = 0;
+  const failing = processImages(() => { failed++; return null; });
+  assert.equal(failing(101), undefined); assert.equal(failing(102), undefined);
+  assert.equal(failed, 1, "a listing that failed isn't tried again at once");
+});
+
+test("on Windows an entry from before the computer started is gone", () => {
+  const claude = () => "claude.exe";
+  const boot = Date.now() - uptime() * 1000;
+  // Claude Code's startedAt, as a number or a date: one a reboot left behind is gone whatever its pid now runs.
+  assert.equal(pidState(process.pid, null, "win32", boot - 5 * 60_000, claude), "dead");
+  assert.equal(pidState(process.pid, null, "win32", new Date(boot - 5 * 60_000).toISOString(), claude), "dead");
+  assert.equal(pidState(process.pid, null, "win32", Date.now(), claude), "verified");
+  assert.equal(pidState(process.pid, null, "win32", boot, claude), "verified", "a minute's margin for the clock");
+  assert.equal(pidState(process.pid, null, "win32", undefined, claude), "verified", "no startedAt: its image alone");
+  assert.equal(pidState(process.pid, null, "linux", boot - 5 * 60_000), "unverified", "elsewhere startedAt isn't read so");
+});
+
+test("on Windows a clock that steps forward doesn't make a live session look left behind by a reboot", (t) => {
+  const claude = () => "claude.exe", startedAt = Date.now() - 1000, now = Date.now();
+  // Further ahead than the computer has been up, so a boot worked out from this clock alone is after the session began.
+  t.mock.method(Date, "now", () => now + uptime() * 1000 + 3_600_000);
+  assert.equal(pidState(process.pid, null, "win32", startedAt, claude), "verified");
+  assert.equal(pidState(process.pid, null, "win32", startedAt - uptime() * 1000 - 5 * 60_000, claude), "dead", "one from before it started still isn't");
+});
+
+test("on Windows a Claude Code that refuses the check (an administrator terminal's) still holds its session, where nothing is sent", (t) => {
+  const h = harness(t), id = randomUUID(), claude = () => "claude.exe", kill = process.kill.bind(process);
+  h.registry(id, "busy", { messagingSocketPath: "\\\\.\\pipe\\LOCAL\\cc-msg-0123abcd" });
+  // As Windows answers a process run as administrator, or another account's.
+  t.mock.method(process, "kill", (pid: number, signal?: string | number) => {
+    if (pid === process.pid && signal === 0) throw Object.assign(new Error("kill EPERM"), { code: "EPERM" });
+    return kill(pid, signal);
+  });
+  assert.equal(holderState(process.pid, null, "win32", undefined, claude), "foreign");
+  assert.equal(holderState(process.pid, null, "win32", undefined, () => undefined), "foreign", "no listing: still held");
+  assert.equal(holderState(process.pid, null, "win32", undefined, () => "notepad.exe"), "dead", "a pid Windows gave to another program");
+  assert.equal(holderState(process.pid, null, "win32", undefined, () => null), "dead");
+  assert.equal(holderState(process.pid, null, "win32", Date.now() - uptime() * 1000 - 5 * 60_000, claude), "dead", "left behind by a reboot");
+  assert.equal(pidState(process.pid, "win32:node.exe", "win32", undefined, () => "node.exe"), "dead", "a run of Driver's own answers the check: that pid is another's now");
+  assert.notEqual(holderState(process.pid, null, "linux"), "foreign", "elsewhere it's read as before");
+  assert.notEqual(pidState(process.pid, null, "linux"), "dead");
+  const [held] = registrySnapshot(h.config, undefined, "win32", claude).live;
+  assert.deepEqual({ sessionId: held?.sessionId, foreign: held?.foreign, socket: held?.socket, status: held?.status, verified: held?.verified },
+    { sessionId: id, foreign: true, socket: null, status: null, verified: false }, "no inbox and no status");
+  assert.equal(registrySnapshot(h.config, undefined, "win32", claude).uncertain, false);
+});
+
+test("a follow-up to a session open where 10 & 2 can't reach it is refused in words, with nothing sent or resumed", async (t) => {
+  const h = harness(t), f = h.completed();
+  h.registry(f.id, "busy");
+  await h.adapter.start();
+  const row = (h.adapter as any).rows.get(f.id);
+  const foreign = { ...row.live[0], foreign: true, socket: null, status: null, verified: false };
+  assert.equal((h.adapter as any).followUpRefusal(f.id, { ...row, live: [foreign] }, false), "It's open where 10 & 2 can't reach it, such as an administrator terminal. Answer it there.");
+  assert.match((h.adapter as any).followUpRefusal(f.id, { ...row, live: [{ ...foreign, foreign: false }] }, false), /older Claude Code/, "one without an inbox, as before");
+});
+
+test("Claude Code's folders for transcripts are named by its own rule, on every system", () => {
+  assert.equal(projectFolder("/home/me/my_app.v2"), "-home-me-my-app-v2");
+  assert.equal(projectFolder("/Users/me/My Project"), "-Users-me-My-Project");
+  assert.equal(projectFolder("C:\\Users\\me\\proj"), "C--Users-me-proj");
+  assert.equal(projectFolder("D:\\a\\10and2\\connector"), "D--a-10and2-connector");
+  assert.equal(projectFolder("/" + "a".repeat(199)), "-" + "a".repeat(199));
+  assert.equal(projectFolder("/" + "a".repeat(200)), null, "past 200 Claude Code adds a hash: found by id instead");
+});
+
+test("T3's folders are recognised without regard to case on Windows", () => {
+  assert.equal(t3Cwd("C:\\Users\\Me\\.T3\\worktrees\\x", "win32", "c:\\users\\me"), true);
+  assert.equal(t3Cwd("c:\\users\\me\\.t3", "win32", "C:\\Users\\Me"), true);
+  assert.equal(t3Cwd("C:\\Users\\Me\\Workspaces\\driver\\T3-abc\\src", "win32", "C:\\Users\\Me"), true);
+  assert.equal(t3Cwd("C:\\Users\\Me\\proj", "win32", "C:\\Users\\Me"), false);
+  assert.equal(t3Cwd("/home/me/.T3/x", "linux", "/home/me"), false);
+  assert.equal(t3Cwd("/home/me/.t3/x", "linux", "/home/me"), true);
 });
 
 test("unknown registry versions and missing procStart block writes without guessing a status", async (t) => {
@@ -22,7 +122,8 @@ test("unknown registry versions and missing procStart block writes without guess
   assert.equal((await h.adapter.list())[0]?.status, "idle");
   assert.equal((await h.adapter.list())[0]?.pendingQuestion, false);
   assert.match((await h.adapter.check({ kind: "follow_up", itemId: f.id, message: "x" }))!, /terminal/);
-  h.registry(f.id, "busy", { procStart: null }); assert.equal(readRegistry(h.config)[0]?.status, process.platform === "darwin" ? "busy" : null);
+  // macOS and Windows still know a Claude Code by its program (ps, tasklist); Linux needs its start.
+  h.registry(f.id, "busy", { procStart: null, procStartFt: null }); assert.equal(readRegistry(h.config)[0]?.status, ["darwin", "win32"].includes(process.platform) ? "busy" : null);
 });
 
 test("partial JSONL and split UTF-8 are read only after the newline, and old bytes are not parsed again", (t) => {
@@ -229,7 +330,7 @@ test("overlay persists, repeats do not reset it, newer finished turns wake settl
   h.clock.now += 10_000; f.append({ type: "assistant", uuid: "newer", message: { content: [{ type: "text", text: "Newer reply" }], stop_reason: "end_turn" } });
   assert.equal((await reopened.list())[0]?.snoozedUntil, null);
   await reopened.execute({ kind: "archive", itemId: f.id }, "archive"); assert.deepEqual(await reopened.list(), []);
-  assert.equal(statSync(h.options.db).mode & 0o777, 0o600);
+  assertPrivate(h.options.db);
 });
 
 test("snooze expires and a pending question wakes it without a newer reply", async (t) => {

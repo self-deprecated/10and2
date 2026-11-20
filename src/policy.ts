@@ -62,7 +62,7 @@ export function defaultPolicyPath(env: NodeJS.ProcessEnv = process.env): string 
   return join(configDirectory(env), "connector.json");
 }
 
-const expand = (p: string) => (p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
+const expand = (p: string) => (p === "~" ? homedir() : p.startsWith("~/") || (process.platform === "win32" && p.startsWith("~\\")) ? join(homedir(), p.slice(2)) : p);
 
 /** Resolve missing tails through the nearest existing ancestor, without hiding symlinks or access errors. */
 function real(p: string): string | null {
@@ -104,7 +104,9 @@ export function parsePolicy(text: string): Policy {
   else if (raw.projects !== undefined) {
     if (!Array.isArray(raw.projects) || raw.projects.some((p: unknown) => typeof p !== "string" || !p.trim())) throw bad('projects must be "*" or a list of folders');
     projects = raw.projects.map((p: string) => {
-      if (!isAbsolute(expand(p))) throw bad(`project folder "${p}" must be absolute (or start with ~/)`);
+      if (!isAbsolute(expand(p))) throw bad(`project folder "${p}" must be absolute (or start with ~${sep})`);
+      // On Windows `\home\me\code` counts as absolute, but means that folder on whichever drive is current.
+      if (process.platform === "win32" && !/^([A-Za-z]:[\\/]|[\\/]{2})/.test(expand(p))) throw bad(`project folder "${p}" must start with a drive, such as C:\\`);
       const root = real(p);
       if (root === null) throw bad(`project folder "${p}" cannot be resolved`);
       return root;
@@ -155,16 +157,30 @@ export function parsePolicy(text: string): Policy {
 }
 
 export function loadPolicy(path = defaultPolicyPath()): Policy {
-  return parsePolicy(readFileSync(path, "utf8"));
+  return parsePolicy(readSettings(path));
 }
 
-/** Whether work in this folder may be seen (and so acted on). Resolution errors never grant visibility. */
-export function visible(policy: Policy, folder: string | null | undefined): boolean {
+/**
+ * The text of a settings file the user may have edited, as UTF-8 or UTF-16 with a byte-order mark too: Windows
+ * PowerShell 5.1 writes those (`Set-Content -Encoding UTF8`, `Out-File`), and the file looks fine in an editor.
+ */
+export function readSettings(path: string): string {
+  const bytes = readFileSync(path);
+  const text = bytes[0] === 0xff && bytes[1] === 0xfe ? bytes.toString("utf16le") : bytes.toString("utf8");
+  return text.replace(/^﻿/, "");
+}
+
+/**
+ * Whether work in this folder may be seen (and so acted on). Resolution errors never grant visibility. Windows' folders
+ * ignore case (`c:\users\me` is `C:\Users\Me`), and agents there record whichever the user typed, so it's ignored here too.
+ */
+export function visible(policy: Policy, folder: string | null | undefined, platform: NodeJS.Platform = process.platform): boolean {
   if (!folder) return false;
   const p = real(folder);
   if (p === null) return false;
   if (policy.projects === "*") return true;
-  return policy.projects.some((root) => p === root || p.startsWith(root.endsWith(sep) ? root : root + sep));
+  const key = (s: string) => platform === "win32" ? s.toLowerCase() : s;
+  return policy.projects.some((root) => key(p) === key(root) || key(p).startsWith(key(root.endsWith(sep) ? root : root + sep)));
 }
 
 /** Undoing a snooze or a settle is allowed wherever doing it is: a policy names only the five actions. */

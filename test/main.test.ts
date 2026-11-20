@@ -5,10 +5,13 @@ import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { removeDir, SLOW } from "./fixtures/platform.ts";
 
-const main = new URL("../src/main.ts", import.meta.url);
+const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
+const timeout = 5000 * SLOW;
 test("token prints 32 fresh random bytes and their SHA-256 without requiring configuration", () => {
-  const run = () => spawnSync(process.execPath, [main.pathname, "token"], { encoding: "utf8", timeout: 5000 });
+  const run = () => spawnSync(process.execPath, [main, "token"], { encoding: "utf8", timeout });
   const a = run(); const b = run();
   assert.equal(a.status, 0, a.stderr);
   const token = /^TENANDTWO_TOKEN=(.+)$/m.exec(a.stdout)![1];
@@ -20,11 +23,11 @@ test("token prints 32 fresh random bytes and their SHA-256 without requiring con
 
 test("hooks install, report and uninstall in the Claude Code settings they're pointed at, keeping the user's own", (t) => {
   const dir = mkdtempSync(join(tmpdir(), "connector-hooks-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => removeDir(dir));
   const own = { hooks: { Stop: [{ hooks: [{ type: "command", command: "my-own-hook" }] }] }, theme: "dark" };
   writeFileSync(join(dir, "settings.json"), JSON.stringify(own));
   const env: NodeJS.ProcessEnv = { ...process.env, CLAUDE_CONFIG_DIR: dir };
-  const run = (...args: string[]) => spawnSync(process.execPath, [main.pathname, "hooks", ...args], { env, encoding: "utf8", timeout: 5000 });
+  const run = (...args: string[]) => spawnSync(process.execPath, [main, "hooks", ...args], { env, encoding: "utf8", timeout });
   const installed = run("install");
   assert.equal(installed.status, 0, installed.stderr);
   assert.match(installed.stdout, /are installed/);
@@ -42,36 +45,41 @@ test("hooks install, report and uninstall in the Claude Code settings they're po
 
 test("the hook command is silent and succeeds when no connector is listening", () => {
   const dir = mkdtempSync(join(tmpdir(), "connector-hook-"));
-  const r = spawnSync(process.execPath, [main.pathname, "hook"], {
-    env: { ...process.env, XDG_RUNTIME_DIR: dir }, input: JSON.stringify({ session_id: "00000000-0000-4000-8000-000000000000", hook_event_name: "Stop" }), encoding: "utf8", timeout: 5000,
+  // As src/main.ts's own shebang starts it (the launchers do the same): on Node 22, node:sqlite's experimental notice
+  // would otherwise be the output.
+  const r = spawnSync(process.execPath, ["--disable-warning=ExperimentalWarning", main, "hook"], {
+    env: { ...process.env, XDG_RUNTIME_DIR: dir }, input: JSON.stringify({ session_id: "00000000-0000-4000-8000-000000000000", hook_event_name: "Stop" }), encoding: "utf8", timeout,
   });
-  rmSync(dir, { recursive: true, force: true });
+  removeDir(dir);
   assert.equal(r.status, 0);
   assert.equal(r.stdout + r.stderr, "");
 });
 
 test("no command prints the usage instead of starting a connector", () => {
-  const r = spawnSync(process.execPath, [main.pathname], { encoding: "utf8", timeout: 5000 });
+  const r = spawnSync(process.execPath, [main], { encoding: "utf8", timeout });
   assert.equal(r.status, 0);
   assert.match(r.stdout, /10and2 setup/);
-  const wrong = spawnSync(process.execPath, [main.pathname, "nonsense"], { encoding: "utf8", timeout: 5000 });
+  const wrong = spawnSync(process.execPath, [main, "nonsense"], { encoding: "utf8", timeout });
   assert.equal(wrong.status, 64);
   assert.match(wrong.stderr, /There's no "nonsense" command\. .*10and2 help.* lists them/);
 });
 
 test("a login service started before the keyring opens waits for the credential instead of giving up", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "connector-wait-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
   const config = join(dir, "config", "10and2");
   mkdirSync(config, { recursive: true });
   // Port 9 refuses at once; the link only has to start, not succeed.
   writeFileSync(join(config, "connector.json"), JSON.stringify({ brain: "ws://127.0.0.1:9/connector", projects: "*", actions: [], t3: false, claude: true }));
   const env: NodeJS.ProcessEnv = { ...process.env, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), XDG_RUNTIME_DIR: dir, CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_TOKEN: "" };
-  const child = spawn(process.execPath, [main.pathname, "run", "--wait-for-credential=0.1"], { env, stdio: ["ignore", "pipe", "pipe"] });
-  t.after(() => child.kill("SIGKILL"));
+  const child = spawn(process.execPath, [main, "run", "--wait-for-credential=0.1"], { env, stdio: ["ignore", "pipe", "pipe"] });
+  // Stopped, and waited for, before its folder goes: Windows won't remove a file a running process holds.
+  t.after(async () => {
+    if (child.exitCode === null && child.signalCode === null) await new Promise((r) => { child.once("exit", r); child.kill("SIGKILL"); });
+    removeDir(dir);
+  });
   let out = "";
   const seen = (re: RegExp) => new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`never saw ${re} in:\n${out}`)), 5000);
+    const timer = setTimeout(() => reject(new Error(`never saw ${re} in:\n${out}`)), timeout);
     const check = () => { if (re.test(out)) { clearTimeout(timer); resolve(); } };
     child.stdout.on("data", (d) => { out += d; check(); });
     child.stderr.on("data", (d) => { out += d; check(); });
@@ -85,7 +93,7 @@ test("a login service started before the keyring opens waits for the credential 
 
   // Run by hand (no flag), an unpaired machine is told so and the connector exits.
   rmSync(join(config, "credentials.json"));
-  const once = spawnSync(process.execPath, [main.pathname, "run"], { env, encoding: "utf8", timeout: 5000 });
+  const once = spawnSync(process.execPath, [main, "run"], { env, encoding: "utf8", timeout });
   assert.equal(once.status, 78);
   assert.match(once.stdout + once.stderr, /isn't paired/);
 });

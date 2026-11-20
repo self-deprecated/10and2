@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // Synthetic `pi --mode rpc`: it never calls a model or reads the user's Pi configuration. It keeps sessions the way Pi
-// 1.5.1 does (<agentDir>/sessions/--<cwd>--/<ts>_<id>.jsonl) under $PI_CODING_AGENT_DIR, and records each call in
-// calls.jsonl there. FAKE_PI_NEVER_ECHO=1: takes the prompt but writes nothing. FAKE_PI_HOLD_MS: how long a turn takes.
+// 1.5.1 does (<agentDir>/sessions/--<cwd>--/<ts>_<id>.jsonl) under $PI_CODING_AGENT_DIR, and records each call, title
+// (`set_session_name`) and prompt in calls.jsonl there. FAKE_PI_NEVER_ECHO=1: takes the prompt but writes nothing.
+// FAKE_PI_HOLD_MS: how long a turn takes.
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -16,17 +17,16 @@ const hex = () => randomBytes(4).toString("hex");
 const now = () => new Date().toISOString();
 let file = value("--session"), last = null;
 if (file) {
-  const lines = readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+  const lines = readFileSync(file, "utf8").trim().split(/\r?\n/).map((l) => JSON.parse(l));
   last = lines.at(-1)?.id ?? null;
 } else {
   const id = value("--session-id"), cwd = process.cwd();
-  const folder = join(agent, "sessions", `--${cwd.replace(/^\//, "").replace(/[/\\:]/g, "-")}--`);
+  const folder = join(agent, "sessions", `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`);
   mkdirSync(folder, { recursive: true });
   file = (existsSync(folder) && readdirSync(folder).map((f) => join(folder, f)).find((f) => f.endsWith(`_${id}.jsonl`))) || join(folder, `${now().replace(/[:.]/g, "-")}_${id}.jsonl`);
   if (!existsSync(file)) {
     process.stderr.write(`Warning: No project session found with id '${id}'; creating a new session with that id.\n`);
     appendFileSync(file, JSON.stringify({ type: "session", version: 3, id, timestamp: now(), cwd }) + "\n");
-    if (value("--name")) { last = hex(); appendFileSync(file, JSON.stringify({ type: "session_info", id: last, parentId: null, timestamp: now(), name: value("--name") }) + "\n"); }
   }
 }
 const entry = (e) => { const id = hex(); appendFileSync(file, JSON.stringify({ ...e, id, parentId: last, timestamp: now() }) + "\n"); last = id; };
@@ -37,6 +37,11 @@ process.stdin.on("data", (chunk) => {
   buf += chunk;
   for (let i = buf.indexOf("\n"); i !== -1; i = buf.indexOf("\n")) {
     const cmd = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+    if (cmd.type === "set_session_name") {
+      appendFileSync(join(agent, "calls.jsonl"), JSON.stringify({ name: cmd.name, pid: process.pid }) + "\n");
+      entry({ type: "session_info", name: cmd.name.trim() });
+      out({ id: cmd.id, type: "response", command: "set_session_name", success: true });
+    }
     if (cmd.type !== "prompt") continue;
     appendFileSync(join(agent, "calls.jsonl"), JSON.stringify({ prompt: cmd.message, pid: process.pid }) + "\n");
     out({ id: cmd.id, type: "response", command: "prompt", success: true, data: { disposition: "started" } });

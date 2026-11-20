@@ -134,6 +134,8 @@ export type PurposeDeps = {
    * anything is read for a purpose, so nothing is read or kept for one that can't be written. Without it, always.
    */
   canRun?: () => boolean;
+  /** Threads whose purpose was just written: the briefing judges their cards against it (`Briefing.purposed`). */
+  written?: (ids: string[]) => void;
   now?: () => number;
 };
 
@@ -177,12 +179,13 @@ export class Purposes {
       .sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))
       .slice(0, PASS_MAX);
     let stopped = false;
+    const written: string[] = [];
     await mapLimit(todo, AT_ONCE, async (item) => {
       // Out of credits or past the background safety limit now: the rest wait for a later pass, with nothing read.
       if (!stopped && !this.canRun()) stopped = true;
       if (stopped || this.writing.has(item.id)) return;
       try {
-        await this.write(item, false);
+        if ((await this.write(item, false))?.purpose) written.push(item.id);
       } catch (e) {
         // Most likely the model can't be reached, or the account can't pay for it now: the rest wait for a later pass.
         stopped = true;
@@ -190,6 +193,7 @@ export class Purposes {
         this.d.log(`purposes: couldn't write one (${describe(e)}); the rest wait for a later pass`);
       }
     });
+    if (written.length) this.d.written?.(written);
   }
 
   /** Whether a pass tries `item` now: never tried, an hour after a failure, or once its latest run has changed. */
@@ -217,7 +221,9 @@ export class Purposes {
         const done = this.d.store.purposeOf(item.id);
         if (done?.purpose) return done;
       }
-      return await this.write(item, true);
+      const made = await this.write(item, true);
+      if (made?.purpose) this.d.written?.([item.id]);
+      return made;
     } catch (e) {
       this.d.log(`purposes: couldn't write one now (${describe(e)})`);
       return null;

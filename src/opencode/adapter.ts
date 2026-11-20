@@ -5,7 +5,7 @@
 // it, an operation key is used at most once, and anything refused is said in words.
 import { watch, existsSync, mkdirSync } from "node:fs";
 import type { FSWatcher } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, win32 } from "node:path";
 import { createHash } from "node:crypto";
 import type { Action, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, ceilingFor, steers, visible, withinCeiling } from "../policy.ts";
@@ -28,7 +28,8 @@ export type Options = {
   dataDir?: string;
   /** OpenCode's config folder, where its plugins are (only to say when 10 & 2's isn't installed). */
   configDir?: string;
-  opencodeBin?: string;
+  /** How OpenCode is run: `opencode` on PATH, or a program and its first arguments (tests). */
+  opencodeCommand?: string[];
   now?: () => number;
   /** How long inactive sessions remain in the briefing. Ones a process is running are always included. */
   days?: number;
@@ -86,6 +87,14 @@ export function answersFor(questions: Asked[], words: string): string[][] {
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const untitled = (t: string) => !t.trim() || /^New session - \d{4}-\d\d-\d\dT/.test(t);
+/**
+ * Whether two folders are one. On Windows case is ignored and either slash separates: OpenCode's database, the plugin
+ * and the user may each spell a folder differently there (`C:/Users/Me/proj`, `c:\users\me\proj`).
+ */
+export function sameFolder(a: string | null, b: string | null, platform: NodeJS.Platform = process.platform): boolean {
+  if (!a || !b) return false;
+  return platform === "win32" ? win32.resolve(a).toLowerCase() === win32.resolve(b).toLowerCase() : a === b;
+}
 
 export class OpenCodeAdapter implements Adapter {
   readonly name = "opencode";
@@ -126,7 +135,7 @@ export class OpenCodeAdapter implements Adapter {
     this.dbPath = dbPathFor(opts.dataDir);
     this.liveDir = opts.liveDir ?? defaultLiveDir();
     this.store = new Store(opts.db);
-    this.serve = new Serve({ bin: opts.opencodeBin ?? "opencode", stateDir: opts.stateDir, log: opts.log, permission: serveCeiling(ceilingFor(opts.policy, "opencode")) });
+    this.serve = new Serve({ command: opts.opencodeCommand ?? ["opencode"], stateDir: opts.stateDir, log: opts.log, permission: serveCeiling(ceilingFor(opts.policy, "opencode")) });
   }
 
   async start(): Promise<void> {
@@ -171,8 +180,10 @@ export class OpenCodeAdapter implements Adapter {
 
   /** What the reachable processes are doing right now. */
   private async probe(): Promise<Live> {
-    const ours = this.serve.pid;
-    const plugin = pluginEndpoints(this.liveDir).filter((e) => e.pid !== ours);
+    // Driver's own server loads the plugin too. Its pid can be a launcher's (a Scoop shim's on Windows) rather than the
+    // OpenCode announcing itself, so it's also known by the mark it was started with.
+    const ours = this.serve.pid, mark = this.serve.mark;
+    const plugin = pluginEndpoints(this.liveDir).filter((e) => e.pid !== ours && !(mark && e.driverServe === mark));
     const procs = this.opts.scanProcesses === false ? [] : await processes();
     const endpoints: Endpoint[] = [...plugin];
     const unreachable: Proc[] = [];
@@ -260,10 +271,10 @@ export class OpenCodeAdapter implements Adapter {
       const busyIn = live.busy.get(s.id) ?? null;
       const runner = busyIn?.kind === "run" ? busyIn : null;
       // The process that has it: one running it, else a terminal UI in its folder (one that ran it lately first).
-      const tuis = live.endpoints.filter((e) => e.kind === "tui" && (e.directory === s.directory || e.sessions[s.id]))
+      const tuis = live.endpoints.filter((e) => e.kind === "tui" && (sameFolder(e.directory, s.directory) || e.sessions[s.id]))
         .sort((a, b) => (b.sessions[s.id] ?? 0) - (a.sessions[s.id] ?? 0) || b.startedAt - a.startedAt);
       const holder = busyIn && !runner ? busyIn : pending?.ep ?? tuis[0] ?? null;
-      const unreachable = !holder && !runner && live.unreachable.some((p) => p.directory === s.directory);
+      const unreachable = !holder && !runner && live.unreachable.some((p) => sameFolder(p.directory, s.directory));
       // Unfinished in the database with nothing reachable running it: running in an OpenCode Driver can't reach, or its
       // process died mid-turn (the database then says so forever). Where folders can't be told, a recent write decides.
       const elsewhere = v.outcome === "incomplete" && !busyIn && (unreachable || (!linux && this.now() - s.updatedAt < 10 * 60_000));
@@ -341,7 +352,7 @@ export class OpenCodeAdapter implements Adapter {
     const counts = new Map<string, number>();
     for (const [, root] of roots) counts.set(basename(root), (counts.get(basename(root)) ?? 0) + 1);
     return roots.map(([id, root]) => ({ id, name: basename(root) + ((counts.get(basename(root)) ?? 0) > 1 ? ` (${id})` : ""), folder: folderOf(root),
-      activeAt: [...this.rows.values()].filter((r) => gitRoot(r.s.directory) === root).map((r) => r.item.updatedAt).sort().at(-1) ?? null }));
+      activeAt: [...this.rows.values()].filter((r) => gitRoot(r.s.directory) === root).map((r) => r.item.updatedAt).sort().at(-1) ?? null, models: [] }));
   }
 
   async list(): Promise<WorkItem[]> { await this.fresh(); return [...this.rows.values()].map((r) => ({ ...r.item })); }
@@ -377,6 +388,8 @@ export class OpenCodeAdapter implements Adapter {
     if (action.kind === "start_work") {
       if (!this.roots.has(action.placeId)) return "That project isn't visible to 10 & 2.";
       if (!withinCeiling(this.opts.policy, action.profile, "opencode")) return "That launch profile exceeds this machine's permission ceiling.";
+      // It lists no models to 10 & 2 yet (docs/launch/thread-model.md), so none can be chosen.
+      if (action.model !== undefined) return "OpenCode can't start on a chosen model through 10 & 2 yet.";
       // OpenCode's own worktrees are experimental in 1.19.5 (and outside its session API), so Driver makes a plain one.
       const worktrees = join(this.roots.get(action.placeId)!, ".opencode", "worktrees");
       if (action.profile.workspace === "worktree" && existsSync(worktrees) && !visible(this.opts.policy, worktrees)) return "That project's worktree folder is outside 10 & 2's visible folders.";
@@ -502,7 +515,7 @@ export class OpenCodeAdapter implements Adapter {
   private async serveEndpoint(): Promise<Endpoint> {
     // One started under another ceiling (an earlier policy) is replaced while it has nothing running.
     const permission = serveCeiling(ceilingFor(this.opts.policy, "opencode"));
-    if (!this.serve.matches(permission) && ![...this.live.busy.values(), ...this.live.pending.map((p) => p.ep)].some((e) => e.via === "serve")) this.serve.stop();
+    if (!this.serve.matches(permission) && ![...this.live.busy.values(), ...this.live.pending.map((p) => p.ep)].some((e) => e.via === "serve")) await this.serve.stop();
     return this.serve.ensure();
   }
 
@@ -534,7 +547,7 @@ export class OpenCodeAdapter implements Adapter {
       try { root = await addWorktree(root, join(".opencode", "worktrees"), createHash("sha256").update(key).digest("hex").slice(0, 12), this.opts.policy.worktreeBase ?? "HEAD"); }
       catch (e) { return this.finish(key, { ok: false, error: (e as Error).message }); }
     }
-    const tui = this.live.endpoints.filter((e) => e.kind === "tui" && e.directory === root).sort((a, b) => b.startedAt - a.startedAt)[0];
+    const tui = this.live.endpoints.filter((e) => e.kind === "tui" && sameFolder(e.directory, root)).sort((a, b) => b.startedAt - a.startedAt)[0];
     let ep: Endpoint;
     try { ep = tui ?? await this.serveEndpoint(); }
     catch (e) { this.opts.log(`opencode: ${(e as Error).message}`); return this.finish(key, { ok: false, error: "10 & 2 couldn't start OpenCode on this computer." }); }
@@ -569,7 +582,7 @@ export class OpenCodeAdapter implements Adapter {
   private idleCheck() {
     if (!this.serve.running || this.writes.size) return;
     if ([...this.live.busy.values()].some((e) => e.via === "serve") || this.live.pending.some((p) => p.ep.via === "serve")) return;
-    if (Date.now() - this.serve.lastActive >= (this.opts.idleMs ?? 10 * 60_000)) this.serve.stop();
+    if (Date.now() - this.serve.lastActive >= (this.opts.idleMs ?? 10 * 60_000)) void this.serve.stop();
   }
 
   async close(): Promise<void> {
@@ -590,7 +603,7 @@ export class OpenCodeAdapter implements Adapter {
     if (this.serve.running) {
       const live = await this.probe().catch(() => null);
       const working = !live || [...live.busy.values()].some((e) => e.via === "serve") || live.pending.some((p) => p.ep.via === "serve");
-      if (!working) this.serve.stop();
+      if (!working) await this.serve.stop(false);
       else this.opts.log("opencode: leaving the background OpenCode server to finish its turn");
     }
     this.closed = true; this.loaded = false; this.listeners.clear();

@@ -45,6 +45,13 @@ export type View = {
 const RUN_RULES = JSON.stringify([{ permission: "question", pattern: "*", action: "deny" }, { permission: "plan_enter", pattern: "*", action: "deny" }, { permission: "plan_exit", pattern: "*", action: "deny" }]);
 export const isRunSession = (s: Pick<SessionRow, "permission">) => JSON.stringify(s.permission) === RUN_RULES;
 
+/**
+ * A folder as OpenCode stores it, as OpenCode reads it back (its toPlatform, core/src/database/path.ts): on Windows it
+ * stores `C:/Users/me/proj` and works with `C:\Users\me\proj`, which the plugin and the policy see.
+ */
+export const fromStorage = (p: string, platform: NodeJS.Platform = process.platform) =>
+  platform === "win32" && /^([A-Za-z]:\/|\/\/)/.test(p) ? p.replaceAll("/", "\\") : p;
+
 export const iso = (ms: number | null | undefined) => typeof ms === "number" && Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 const json = (s: unknown) => { try { return typeof s === "string" ? JSON.parse(s) : null; } catch { return null; } };
 
@@ -63,7 +70,7 @@ export function sessions(db: DatabaseSync, since: number, also: string[] = []): 
     ORDER BY s.time_updated DESC`).all(since, JSON.stringify(also)) as any[];
   return rows.map((r) => {
     const permission = json(r.permission);
-    return { id: r.id, projectId: r.project_id, directory: r.directory, title: r.title ?? "", agent: r.agent ?? null,
+    return { id: r.id, projectId: r.project_id, directory: fromStorage(r.directory), title: r.title ?? "", agent: r.agent ?? null,
       permission: isRules(permission) ? permission : null, createdAt: r.time_created, updatedAt: r.time_updated, version: r.version ?? "",
       signature: `${r.time_updated}:${r.m ?? 0}:${r.p ?? 0}` };
   });
@@ -104,7 +111,7 @@ export function userMessageIds(db: DatabaseSync, sessionId: string): Set<string>
 
 /** Projects OpenCode knows in a git checkout: where new work can start. */
 export function projectRoots(db: DatabaseSync): string[] {
-  return (db.prepare("SELECT worktree FROM project WHERE vcs = 'git' AND id != 'global'").all() as any[]).map((r) => r.worktree).filter((w) => typeof w === "string" && w !== "/");
+  return (db.prepare("SELECT worktree FROM project WHERE vcs = 'git' AND id != 'global'").all() as any[]).map((r) => r.worktree).filter((w) => typeof w === "string" && w !== "/").map((w) => fromStorage(w));
 }
 
 export function questionsOf(input: unknown): Asked[] {

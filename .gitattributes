@@ -1,0 +1,2 @@
+# Line endings stay LF on Windows checkouts too: tests compare files byte for byte, and the extensions are copied as they are.
+* text=auto eol=lf

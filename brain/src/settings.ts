@@ -2,8 +2,9 @@
 // Each call takes one snapshot when it starts and keeps it to the end (server.ts `startSession`). Pure: no Node or
 // Cloudflare imports, so the brain, the cloud, the eval runner and Ops all read the same definitions.
 import type { Config } from "./config.ts";
+import type { Served } from "./messages.ts";
 import { PLACEHOLDER, PROMPT_SECTIONS, templateOf, type Prompts } from "./voice/sections.ts";
-import { BACKEND_MODELS, LIVE_MODELS } from "./models.ts";
+import { BACKEND_MODELS, LIVE_MODELS, READING_ENGINES } from "./models.ts";
 import { CONVERSATION_VOICES, VOICE_SAMPLE_TEXT } from "./voice/voices.ts";
 import { FORBIDDEN } from "./user-text.ts";
 
@@ -67,6 +68,11 @@ export type Settings = {
   voice: string;
   /** What every reading voice's sample says (`GET /api/voices/sample`); a change makes each sample again, once. */
   sampleText: string;
+  /**
+   * What reads replies, the briefing, read-backs and voice samples aloud (models.ts `READING_ENGINES`), or "off": the
+   * routes answer 503 and the phones read in their own voice. Read for each segment, not once a call.
+   */
+  readingEngine: string;
   /** How fast things use minutes, and the trial (`MINUTES`). A plan's weekly minutes are its level's (cloud/src/plan.ts). */
   minutes: Minutes;
   allowances: Record<AllowanceLabel, number>;
@@ -83,7 +89,7 @@ export type Settings = {
 };
 
 /** The settings as git has them: config.ts (and its environment) and the constants above. */
-export function defaults(cfg: Pick<Config, "idleMs" | "maxSessionMs" | "liveModel" | "backendModel" | "voice">): Settings {
+export function defaults(cfg: Pick<Config, "idleMs" | "maxSessionMs" | "liveModel" | "backendModel" | "voice"> & Partial<Pick<Config, "ttsModel">>): Settings {
   return {
     speakFirstNew: true,
     idleSeconds: cfg.idleMs / 1000,
@@ -93,6 +99,7 @@ export function defaults(cfg: Pick<Config, "idleMs" | "maxSessionMs" | "liveMode
     backendModel: cfg.backendModel,
     voice: cfg.voice,
     sampleText: VOICE_SAMPLE_TEXT,
+    readingEngine: cfg.ttsModel ?? READING_ENGINES[0],
     minutes: { ...MINUTES },
     allowances: { ...ALLOWANCES },
     backgroundCentsPerDay: BACKGROUND_CENTS_PER_DAY,
@@ -190,6 +197,7 @@ export const SETTINGS: Record<string, { label: string; check: Check; gated?: boo
   liveNotices: { label: "Tell starred threads' replies during a call", check: bool },
   voice: { label: "Conversation voice, unless the phone chose one", check: oneOf(CONVERSATION_VOICES) },
   sampleText: { label: "What each reading voice's sample says", check: sampleText },
+  readingEngine: { label: "What reads replies aloud (off: the phones read in their own voice)", check: oneOf([...READING_ENGINES, "off"]) },
   minutes: {
     label: "How fast minutes are used, and the trial",
     check: fields({ fastPercent: int(100, 400), readingCharsPerSecond: int(10, 200), pickupSeconds: int(0, 60), trialDailySeconds: int(0, 3600), trialDays: int(0, 14) }),
@@ -257,6 +265,9 @@ export type Bundle = {
   audience?: Audience | null;
   /** Template hashes the eval has passed (§5): a brain applies a version's gated settings only if its own hash is here. */
   passing?: string[];
+  /** Messages to users with staff or live (docs/launch/messages.md), and the switch that stops them all. */
+  messages?: Served[];
+  messagesOff?: boolean;
 };
 /** Whom an account counts as, from its server-verified labels. */
 export type Who = { tester: boolean; staff: boolean };
@@ -303,11 +314,13 @@ export function resolve(base: Settings, bundle: Bundle | null, o: Resolving = {}
     if (!o.ungated) problems.push(`its prompt or model settings are inert: no eval pass for them on this brain`);
   }
   const settings = apply(base, overrides, pick.id);
-  // The app's banner and the oldest build allowed are global: always current's, never a candidate's (§4.4).
+  // The app's banner and the oldest build allowed are global: always current's, never a candidate's (§4.4). So is the
+  // reading voice switched off: a kill switch that a candidate tried on staff can't keep on.
   if (pick !== bundle?.current) {
     const current = resolve(base, bundle ? { ...bundle, candidate: null } : null, { passes: o.passes, ungated: o.ungated }).settings;
     settings.banner = current.banner;
     settings.minBuild = current.minBuild;
+    if (current.readingEngine === "off") settings.readingEngine = "off";
   }
   return { settings, problems };
 }

@@ -20,6 +20,11 @@ export type AnalyticsOptions = {
   allowance?: () => string | null;
   /** The account's consent (`ConsentHolder`), shared with its owner, who changes it; a fresh one (sharing) if not given. */
   consent?: ConsentHolder;
+  /**
+   * Told of every event as it happens, sent or not: whatever the account's consent, and with no key. For what the
+   * account's own brain keeps of what it has done (docs/launch/messages.md), which is sent nowhere.
+   */
+  seen?: Track;
   log: (m: string) => void;
   fetch?: typeof fetch;
   /** How long the first queued event waits for others before a batch goes (default 10 s). */
@@ -104,7 +109,7 @@ export class ConsentHolder {
 }
 
 export class Analytics {
-  private readonly o: Required<Omit<AnalyticsOptions, "fetch" | "allowance" | "consent">> & Pick<AnalyticsOptions, "allowance"> & { fetch: typeof fetch };
+  private readonly o: Required<Omit<AnalyticsOptions, "fetch" | "allowance" | "consent" | "seen">> & Pick<AnalyticsOptions, "allowance" | "seen"> & { fetch: typeof fetch };
   /** The distinct id the phone gave last (`x-driver-analytics`). */
   private phoneId: string | null = null;
   /** The account's consent, read at each event (`ConsentHolder`): its owner changes it, never this. */
@@ -145,6 +150,7 @@ export class Analytics {
   }
 
   readonly track: Track = (event, props = {}) => {
+    this.o.seen?.(event, props);
     const who = this.person;
     // The account's consent as it is now, when the event is recorded (`person`): the one check (contracts §5).
     if (!this.enabled || !who) return;

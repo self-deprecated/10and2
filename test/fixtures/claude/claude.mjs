@@ -6,6 +6,8 @@ import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 
 const args = process.argv.slice(2);
+// Claude Code's own name for a working folder's transcripts (kept apart from the connector's, which the tests check).
+const folderOf = (cwd) => cwd.replace(/[^a-zA-Z0-9]/g, "-");
 const value = (flag) => args[args.indexOf(flag) + 1];
 const bg = process.env.FAKE_CLAUDE_BG === "1";
 if (args.includes("--help")) { console.log(`-w, --worktree [name]${bg ? "\n  --bg, --background  Start the session in the background" : ""}`); process.exit(0); }
@@ -18,25 +20,48 @@ if (args.includes("--bg")) {
   if (process.env.FAKE_CLAUDE_BG_REFUSE === "1") { console.error("Workspace not trusted"); process.exit(1); }
   const id = args.includes("--resume") ? value("--resume") : randomUUID();
   const where = args.includes("--worktree") ? join(process.cwd(), ".claude", "worktrees", value("--worktree")) : process.cwd();
-  const folder = join(config, "projects", where.replace(/[/.]/g, "-"));
+  const folder = join(config, "projects", folderOf(where));
   mkdirSync(folder, { recursive: true });
   const message = args[args.indexOf("--") + 1];
   if (process.env.FAKE_CLAUDE_NEVER_ECHO !== "1") appendFileSync(join(folder, `${id}.jsonl`), JSON.stringify({ type: "user", sessionId: id, cwd: where, entrypoint: "cli", origin: { kind: "human" }, timestamp: new Date().toISOString(), version: "2.1.321", permissionMode: value("--permission-mode"), uuid: randomUUID(), message: { role: "user", content: message } }) + "\n");
   console.log(`backgrounded · ${id.slice(0, 8)}${args.includes("--name") ? ` · ${value("--name")}` : ""}`);
   process.exit(0);
 }
+if (args.includes("-p") && !args.includes("--permission-mode") && !args.includes("--session-id") && !args.includes("--resume")) {
+  // Asked only to initialize (the connector's models read): answers with its `/model` list, and the account, which the
+  // connector must not keep, then waits to be stopped. Kept apart from calls.jsonl, which holds the runs.
+  appendFileSync(join(config, "probes.jsonl"), JSON.stringify({ args, cwd: process.cwd(), pid: process.pid }) + "\n");
+  const models = process.env.FAKE_CLAUDE_MODELS ? JSON.parse(process.env.FAKE_CLAUDE_MODELS) : [
+    { value: "default", resolvedModel: "claude-opus-5-5", displayName: "Default (recommended)", description: "Opus 5.5 · Best for everyday, complex tasks" },
+    { value: "opus[1m]", resolvedModel: "claude-opus-5-5", displayName: "Opus (1M context)" },
+    { value: "opus", resolvedModel: "claude-opus-5-5", displayName: "Opus" },
+    { value: "claude-fable-5-2[1m]", resolvedModel: "claude-fable-5-2", displayName: "Fable" },
+    { value: "sonnet", resolvedModel: "claude-sonnet-5-5", displayName: "Sonnet" },
+    { value: "haiku", resolvedModel: "claude-haiku-4-5-20251001", displayName: "Haiku" },
+  ];
+  for await (const line of createInterface({ input: process.stdin })) {
+    const r = JSON.parse(line);
+    if (r.type !== "control_request" || r.request?.subtype !== "initialize") continue;
+    if (process.env.FAKE_CLAUDE_NO_MODELS === "1") process.exit(1);
+    console.log(JSON.stringify({ type: "control_response", response: { subtype: "success", request_id: r.request_id, response: { commands: [], models, account: { email: "someone@example.com", subscriptionType: "max" } } } }));
+  }
+  process.exit(0);
+}
 if (!args.includes("-p") || !args.includes("--permission-mode")) process.exit(2);
 const id = args.includes("--resume") ? value("--resume") : value("--session-id");
 const cwd = args.includes("--worktree") ? join(process.cwd(), ".claude", "worktrees", value("--worktree")) : process.cwd();
 if (args.includes("--worktree")) { mkdirSync(join(cwd, ".git"), { recursive: true }); process.chdir(cwd); }
-const dir = join(config, "projects", cwd.replace(/[/.]/g, "-"));
+// FAKE_CLAUDE_FOLDER: the folder named from the cwd as Claude Code saw it, unlike the one it was given.
+const dir = join(config, "projects", process.env.FAKE_CLAUDE_FOLDER ?? folderOf(cwd));
 mkdirSync(dir, { recursive: true }); mkdirSync(join(config, "sessions"), { recursive: true });
 const transcript = join(dir, `${id}.jsonl`), registry = join(config, "sessions", `${process.pid}.json`);
 appendFileSync(join(config, "calls.jsonl"), JSON.stringify({ args, cwd, id, pid: process.pid }) + "\n");
 if (args.includes("--session-id") && existsSync(transcript)) { console.error("Session ID is already in use"); process.exit(1); }
-const start = process.platform === "linux" ? readFileSync(`/proc/${process.pid}/stat`, "utf8").slice(readFileSync(`/proc/${process.pid}/stat`, "utf8").lastIndexOf(")") + 1).trim().split(/\s+/)[19] : null;
+// Its start as Claude Code records it: /proc's start ticks on Linux, a FILETIME (procStartFt) on Windows.
+const start = process.platform === "linux" ? { procStart: readFileSync(`/proc/${process.pid}/stat`, "utf8").slice(readFileSync(`/proc/${process.pid}/stat`, "utf8").lastIndexOf(")") + 1).trim().split(/\s+/)[19] }
+  : process.platform === "win32" ? { procStartFt: String(BigInt(Math.round(Date.now() - process.uptime() * 1000)) * 10000n + 116444736000000000n) } : { procStart: null };
 const stamp = () => new Date().toISOString();
-function register(status) { writeFileSync(registry, JSON.stringify({ pid: process.pid, sessionId: id, cwd, procStart: start, version: "2.1.310", kind: "interactive", entrypoint: "sdk-cli", status, statusUpdatedAt: Date.now() })); }
+function register(status) { writeFileSync(registry, JSON.stringify({ pid: process.pid, sessionId: id, cwd, ...start, version: "2.1.310", kind: "interactive", entrypoint: "sdk-cli", status, statusUpdatedAt: Date.now() })); }
 function record(r) { appendFileSync(transcript, JSON.stringify({ sessionId: id, cwd, entrypoint: "sdk-cli", timestamp: stamp(), version: "2.1.310", ...r }) + "\n"); }
 function clean() { try { unlinkSync(registry); } catch {} }
 process.on("SIGINT", () => { record({ type: "user", interruptedByShutdown: true }); clean(); process.exit(0); });

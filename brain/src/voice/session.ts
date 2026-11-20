@@ -792,6 +792,11 @@ export class VoiceSession {
   private flaggedTurn = -1;
   /** Driver flagged a moment and asked what went wrong: the user's next turn says, and is added to the flag. */
   private issueAsked = false;
+  /** The user turn that said what went wrong (`counts.userTurns` then): it's in that flag, not a new one. */
+  private explainedTurn = -1;
+  /** The user turn the backend was last handed (`counts.userTurns` at `session.delegation.created`), and when. */
+  private delegatedTurn = -1;
+  private handedAt = -Infinity;
   /** What the user last told of what went wrong, and when Driver began to answer it (`ACCOUNT_LATE_MS`). */
   private account = { said: "", at: -Infinity };
   /**
@@ -1260,6 +1265,8 @@ export class VoiceSession {
       }
       case "session.delegation.created":
         this.endUserTurn();
+        this.delegatedTurn = this.counts.userTurns;
+        this.handedAt = this.clock.now();
         this.dictateAsked = null;
         this.backendBusy = true;
         this.delegatedAt = this.clock.now();
@@ -1462,7 +1469,7 @@ export class VoiceSession {
     this.dictateAsked = null;
     if (!asked || asked.turn !== this.counts.userTurns || this.ended || this.endState.closing || this.endState.endRequestedAt) return;
     if (this.backendBusy || this.toolsRunning > 0 || this.pending.size > 0 || this.voiceSaid.includes("?")) return;
-    const args = { handle: null, project: null, profile: null };
+    const args = { handle: null, project: null, profile: null, model: null };
     const about: About[] = [];
     this.toolsRunning++;
     try {
@@ -1569,6 +1576,7 @@ export class VoiceSession {
     }
     if (answer) {
       this.issueAsked = false;
+      this.explainedTurn = this.counts.userTurns;
       void this.explainFlag(spokenWords(said));
     }
     if (!this.deps.flags || !said.trim() || !asksToFlag(said)) return;
@@ -1608,6 +1616,16 @@ export class VoiceSession {
     });
   }
 
+  /**
+   * The backend's tool call is about the user's answer to "what went wrong?", which is in the flag already: it was handed
+   * that answer, as the answer ended (`ACCOUNT_LATE_MS`), even if the answer's last words have since come in as a turn
+   * of their own (speech-to-text lags the hand-off). Not a later hand-off: one made before its own words have come in
+   * still counts the answer as the latest turn, and may be a new complaint.
+   */
+  private answeredIssue(): boolean {
+    return this.explainedTurn >= 0 && this.explainedTurn === this.delegatedTurn && this.handedAt - this.account.at <= ACCOUNT_LATE_MS;
+  }
+
   /** What the user said went wrong, when Driver asked after a flag: added to the flag's file. */
   private async explainFlag(issue: string) {
     const path = await this.deps.flags!.explain(this.ids.sessionId, issue);
@@ -1619,12 +1637,18 @@ export class VoiceSession {
    * The backend's `flag`: the user asked, in words the matcher didn't take. A turn the brain flagged already isn't
    * flagged twice; the voice model has been told of that one. Driver asks what went wrong unless the user's turn says
    * it (`issueIn`) or the backend's note is plainly their words (`noteIsTheirs`): a note may be the backend's guess from
-   * the call. Asking again what they said is the lesser fault: the flag keeps their turn either way.
+   * the call. Asking again what they said is the lesser fault: the flag keeps their turn either way. Nor is the user's
+   * answer to "what went wrong?" flagged: it's in the flag it answers. On 20 November the backend flagged that answer
+   * (a complaint, so it took it for "something went wrong"), which made a second flag of it, and the user's next turn,
+   * about something else, went into that one as what went wrong.
    */
   private async flagFromTool(note: string | null): Promise<ToolResult> {
     if (!this.deps.flags) return { error: "The app can't flag moments here. Say so in a few words." };
     if (this.flaggedTurn === this.counts.userTurns) {
       return { flagged: true, already: true, result: "The app already flagged this moment.", instruction: "The app already flagged it and has told the voice model to say so: don't say \"Flagged.\" or call flag again. Answer anything else they said, or reply with nothing." };
+    }
+    if (this.answeredIssue()) {
+      return { flagged: true, already: true, result: "What they just said is in the flag already, as what went wrong.", instruction: "Don't call flag again. Say only that you've added it (\"Got it, I've added that.\"), then answer anything else they said." };
     }
     const user = spokenWords(this.deps.conversations.lastUserTurn(this.ids.conversationId).text);
     const noted = note?.trim().slice(0, 500) ?? "";

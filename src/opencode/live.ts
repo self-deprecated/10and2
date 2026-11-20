@@ -1,13 +1,13 @@
-// Reaching a running OpenCode: the processes 10 & 2's plugin announces (a unix socket each), terminal UIs started with
-// --port, and Driver's own `opencode serve`. Busy state, questions and permission requests live only in the memory of
-// the process running a session, so they're asked of it over its HTTP API (the v1 routes; never /api/*, a separate
-// runtime that doesn't share their history).
+// Reaching a running OpenCode: the processes 10 & 2's plugin announces (a unix socket each, or on Windows 127.0.0.1
+// with a token), terminal UIs started with --port, and Driver's own `opencode serve`. Busy state, questions and
+// permission requests live only in the memory of the process running a session, so they're asked of it over its HTTP
+// API (the v1 routes; never /api/*, a separate runtime that doesn't share their history).
 import { request as httpRequest } from "node:http";
 import type { IncomingMessage } from "node:http";
-import { execFile } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { join, posix, win32 } from "node:path";
+import { execFileCommand } from "../command.ts";
 
 export const defaultLiveDir = (env: NodeJS.ProcessEnv = process.env) => env.TENANDTWO_OPENCODE_DIR
   || join(env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "10and2", "opencode", "live");
@@ -22,12 +22,20 @@ export type Endpoint = {
   /** Sessions this process ran lately, by when (the plugin keeps these). */
   sessions: Record<string, number>;
   startedAt: number;
+  /** For a process the plugin announced inside one of Driver's own servers: that server's mark (serve.ts). */
+  driverServe?: string;
 };
 export const endpointKey = (e: Endpoint) => `${e.via}:${e.pid}:${e.socket ?? e.url}:${e.directory ?? ""}`;
 
-export const alive = (pid: unknown): boolean => {
+/**
+ * Whether a process is running. A pid that refuses the check (EPERM) is another account's, or one run as administrator.
+ * Elsewhere that's still running; on Windows it counts as gone. Windows hands pids out again quickly, and an announce an
+ * OpenCode left behind, whose pid another account's process now has, would otherwise send the token and the user's
+ * words to whatever that account listens with on its port. An OpenCode run as administrator is left out with it.
+ */
+export const alive = (pid: unknown, platform: NodeJS.Platform = process.platform): boolean => {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }
+  try { process.kill(pid, 0); return true; } catch (e) { return platform !== "win32" && (e as NodeJS.ErrnoException).code === "EPERM"; }
 };
 
 /** A call that failed: `sent` false means it never reached the process, so nothing can have happened. */
@@ -59,17 +67,28 @@ export function call(ep: Endpoint, method: string, path: string, opts: { body?: 
   });
 }
 
-/** The processes 10 & 2's plugin announced that are still running and still have their socket. */
-export function pluginEndpoints(dir: string): Endpoint[] {
+// Where the plugin serves on Windows: this computer only, with the token it made.
+const LOOPBACK = /^http:\/\/127\.0\.0\.1:\d{1,5}$/;
+const BEARER = /^Bearer [A-Za-z0-9._~+/=-]+$/;
+
+/**
+ * The processes 10 & 2's plugin announced that are still running and can still be reached: by their socket, or on
+ * Windows (where Bun's socket is a kind Node can't open) at 127.0.0.1 with their token.
+ */
+export function pluginEndpoints(dir: string, platform: NodeJS.Platform = process.platform): Endpoint[] {
   let files: string[] = [];
   try { files = readdirSync(dir).filter((f) => /^\d+-\d+\.json$/.test(f)); } catch { return []; }
   const out: Endpoint[] = [];
   for (const f of files) {
     try {
       const a = JSON.parse(readFileSync(join(dir, f), "utf8"));
-      if (!alive(a.pid) || typeof a.socket !== "string" || !existsSync(a.socket) || typeof a.directory !== "string") continue;
-      out.push({ via: "plugin", kind: ["tui", "serve", "run"].includes(a.kind) ? a.kind : "other", pid: a.pid, socket: a.socket, directory: a.directory,
-        sessions: a.sessions && typeof a.sessions === "object" ? a.sessions : {}, startedAt: typeof a.startedAt === "number" ? a.startedAt : 0 });
+      if (!alive(a.pid, platform) || typeof a.directory !== "string") continue;
+      const where = platform !== "win32" && typeof a.socket === "string" && existsSync(a.socket) ? { socket: a.socket as string }
+        : typeof a.url === "string" && LOOPBACK.test(a.url) && typeof a.auth === "string" && BEARER.test(a.auth) ? { url: a.url as string, auth: a.auth as string } : null;
+      if (!where) continue;
+      out.push({ via: "plugin", kind: ["tui", "serve", "run"].includes(a.kind) ? a.kind : "other", pid: a.pid, ...where, directory: a.directory,
+        sessions: a.sessions && typeof a.sessions === "object" ? a.sessions : {}, startedAt: typeof a.startedAt === "number" ? a.startedAt : 0,
+        ...typeof a.driverServe === "string" ? { driverServe: a.driverServe as string } : {} });
     } catch { /* being written, or not ours: the next read */ }
   }
   return out;
@@ -80,11 +99,15 @@ export type Proc = { pid: number; kind: Kind; port: number | null; host: string;
 const COMMANDS = new Set(["acp", "mcp", "attach", "run", "debug", "auth", "agent", "upgrade", "uninstall", "serve", "web", "models", "stats", "export", "import", "github", "pr", "session", "db", "plugin", "completion", "generate"]);
 const VALUED = new Set(["--port", "--hostname", "-m", "--model", "--agent", "-s", "--session", "--prompt", "--log-level", "--mdns-domain", "--cors"]);
 
+/**
+ * An `opencode` process from its command line, as `ps` gives it: POSIX paths, so they're resolved as such whatever
+ * this system is; a Windows path (`C:\...\opencode.exe ..\other`) is resolved as Windows does.
+ */
 export function parseProc(pid: number, args: string, cwd: string | null): Proc | null {
   const words = args.trim().split(/\s+/);
   let i = 0;
-  if (/(^|\/)(node|bun)$/.test(words[0] ?? "")) i = 1;
-  if (!/(^|\/)opencode(\.exe)?$/.test(words[i] ?? "")) return null;
+  if (/(^|[\\/])(node|bun)(\.exe)?$/i.test(words[0] ?? "")) i = 1;
+  if (!/(^|[\\/])opencode(\.exe)?$/i.test(words[i] ?? "")) return null;
   const rest = words.slice(i + 1);
   let positional: string | null = null;
   for (let j = 0; j < rest.length; j++) {
@@ -96,19 +119,24 @@ export function parseProc(pid: number, args: string, cwd: string | null): Proc |
   const flag = (name: string) => { const k = rest.findIndex((w) => w === name || w.startsWith(name + "=")); return k < 0 ? null : rest[k]!.includes("=") ? rest[k]!.split("=")[1]! : rest[k + 1] ?? null; };
   const port = Number(flag("--port") ?? 0) || null;
   const h = flag("--hostname") ?? "127.0.0.1";
-  const project = kind === "tui" && positional ? (isAbsolute(positional) ? positional : cwd ? resolve(cwd, positional) : null) : null;
+  const paths = /^[A-Za-z]:[\\/]|^\\\\/.test(cwd ?? positional ?? "") ? win32 : posix;
+  const project = kind === "tui" && positional ? (paths.isAbsolute(positional) ? positional : cwd ? paths.resolve(cwd, positional) : null) : null;
   return { pid, kind, port, host: h === "0.0.0.0" || h === "::" ? "127.0.0.1" : h, directory: project ?? cwd };
 }
 
-/** This user's `opencode` processes. Their working folder is read on Linux only (elsewhere it's unknown, null). */
+/**
+ * This user's `opencode` processes. Their working folder is read on Linux only (elsewhere it's unknown, null). None on
+ * Windows, which has no `ps`: there only the plugin's processes are reached (as on a Mac, a terminal UI without it is
+ * one 10 & 2 can't tell is open).
+ */
 export function processes(): Promise<Proc[]> {
   const uid = process.getuid?.();
-  if (uid === undefined) return Promise.resolve([]);
+  if (process.platform === "win32" || uid === undefined) return Promise.resolve([]);
   return new Promise((resolvePromise) => {
-    execFile("ps", ["-U", String(uid), "-o", "pid=,args="], { timeout: 3000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
+    execFileCommand("ps", ["-U", String(uid), "-o", "pid=,args="], { timeout: 3000, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
       if (err && !stdout) return resolvePromise([]);
       const out: Proc[] = [];
-      for (const line of String(stdout).split("\n")) {
+      for (const line of stdout.split("\n")) {
         const m = /^\s*(\d+)\s+(.*)$/.exec(line);
         if (!m || !/opencode/.test(m[2]!) || Number(m[1]) === process.pid) continue;
         let cwd: string | null = null;

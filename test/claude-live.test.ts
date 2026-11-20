@@ -7,15 +7,15 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { ClaudeAdapter, sessionForKey } from "../src/claude/adapter.ts";
 import { readRegistry } from "../src/claude/registry.ts";
+import { projectFolder } from "../src/claude/transcript.ts";
 import { until, pause } from "./fixtures/claude/helpers.ts";
 
-test("live Claude: cold follow-up and deterministic new work have positive acceptance evidence", { skip: process.env.DRIVER_LIVE_CLAUDE !== "1", timeout: 90_000 }, async (t) => {
+// Opt-in (it calls the real model), and Unix only: it finds claude with `which` and makes its project with jj.
+test("live Claude: cold follow-up and deterministic new work have positive acceptance evidence", { skip: process.env.DRIVER_LIVE_CLAUDE !== "1" || process.platform === "win32", timeout: 90_000 }, async (t) => {
   const cwd = mkdtempSync(join(tmpdir(), "driver-claude-live-"));
   const configDir = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
-  const project = join(configDir, "projects", cwd.replace(/[/.]/g, "-"));
+  const encoded = projectFolder(cwd)!, project = join(configDir, "projects", encoded);
   const binary = execFileSync("which", ["claude"], { encoding: "utf8" }).trim();
-  const wrapper = join(cwd, "haiku-claude");
-  writeFileSync(wrapper, `#!/bin/sh\nexec '${binary.replace(/'/g, "'\\''")}' --model haiku "$@"\n`, { mode: 0o700 });
   let adapter: ClaudeAdapter | undefined;
   t.after(async () => {
     if (adapter) await adapter.close();
@@ -25,7 +25,6 @@ test("live Claude: cold follow-up and deterministic new work have positive accep
     await pause(100);
     // The encoded directory belongs only to the unique scratch project, never to a user's project.
     assert.ok(cwd.startsWith(join(tmpdir(), "driver-claude-live-")));
-    const encoded = cwd.replace(/[/.]/g, "-");
     for (const dir of readdirSync(join(configDir, "projects"))) if (dir === encoded || dir.startsWith(encoded + "-")) rmSync(join(configDir, "projects", dir), { recursive: true, force: true });
     rmSync(cwd, { recursive: true, force: true });
   });
@@ -39,7 +38,7 @@ test("live Claude: cold follow-up and deterministic new work have positive accep
     // Quota errors are turn outcomes, not failures to accept the initial prompt. Require its persisted record.
     if (!readFileSync(join(project, `${initialId}.jsonl`), "utf8").includes('"type":"user"')) throw e;
   }
-  adapter = new ClaudeAdapter({ configDir, db: join(cwd, "overlay.sqlite"), stateDir: join(cwd, "runs"), hookSocketPath: join(cwd, "runs", "hooks.sock"), claudeBin: wrapper,
+  adapter = new ClaudeAdapter({ configDir, db: join(cwd, "overlay.sqlite"), stateDir: join(cwd, "runs"), hookSocketPath: join(cwd, "runs", "hooks.sock"), claudeCommand: [binary, "--model", "haiku"],
     log: (message) => t.diagnostic(message), policy: { brain: "wss://unused.invalid/connector", projects: [cwd], claude: true,
       actions: ["follow_up", "start_work"], maxRuntimeMode: "approval-required", t3: false, codex: false, opencode: false, pi: false, steer: true, answer: true, limits: {}, worktreeBase: "HEAD" } });
   await adapter.start();

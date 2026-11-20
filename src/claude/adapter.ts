@@ -1,33 +1,41 @@
-import { watch, existsSync, readdirSync, readFileSync, statSync, mkdirSync, openSync, closeSync, readSync, chmodSync, unlinkSync } from "node:fs";
+import { watch, existsSync, readdirSync, readFileSync, statSync, mkdirSync, openSync, closeSync, readSync, chmodSync, unlinkSync, writeFileSync } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
-import { createHash, randomUUID } from "node:crypto";
-import { spawn, execFile } from "node:child_process";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { createConnection, createServer } from "node:net";
 import type { Server } from "node:net";
-import type { Action, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import type { Action, Adapter, FirstAsk, CodingModel, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, ceilingFor, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy, RuntimeMode } from "../policy.ts";
 import { iso, pidState, procStart, readRegistry, registrySnapshot, sessionId, versionAtLeast } from "./registry.ts";
+import { modelKey } from "../util.ts";
 import type { Live } from "./registry.ts";
-import { Transcript, t3Cwd, typedUser } from "./transcript.ts";
+import { Transcript, projectFolder, t3Cwd, typedUser } from "./transcript.ts";
 import { Store } from "./store.ts";
 import { firstAsk, folderOf, gitRoot, group } from "../work.ts";
 import { attestedMode, envelope, heldFor, peerToken, post } from "./inbox.ts";
+import { execFileCommand, spawnCommand, which } from "../command.ts";
+import { proof, randomHex, replaceFile } from "../util.ts";
 import { asked } from "./transcript.ts";
 import type { Asked } from "./transcript.ts";
 import type { Socket } from "node:net";
 
 export type Options = {
-  configDir?: string; policy: Policy; db: string; claudeBin?: string; stateDir: string; log: (m: string) => void; now?: () => number;
+  configDir?: string; policy: Policy; db: string; stateDir: string; log: (m: string) => void; now?: () => number;
+  /** How to run Claude Code: `claude` on PATH, or a program and its first arguments (`[node, fake.mjs]` in tests). */
+  claudeCommand?: string[];
   /** How long inactive sessions remain in the briefing. Live holders are always included. */
   days?: number;
   /** Tests and slow machines can adjust the bounded acceptance wait; never causes a resend. */
   acceptanceTimeoutMs?: number;
   /** How old a scan reads may reuse (1 s); file events and the periodic rescan keep it current. Tests use 0. */
   readCacheMs?: number;
-  /** Local override for isolated installations/tests; defaults to the standard runtime socket. */
+  /**
+   * Local override for isolated installations/tests; defaults to the standard runtime socket, or on Windows a pipe with a
+   * new random name at each start. On Windows the adapter writes the pipe's name to hooks.pipe in `stateDir`.
+   */
   hookSocketPath?: string;
   /** False keeps starts and follow-ups headless (`claude -p`) even where background sessions are available. */
   background?: boolean;
@@ -39,6 +47,11 @@ export function sessionForKey(key: string): string {
   const h = bytes.toString("hex");
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
+/**
+ * A project's place id, from its checkout's folder. Windows folders ignore case, and a session started from another
+ * shell can record `c:\` for `C:\`, so there it's the same place whatever the case.
+ */
+export const placeId = (root: string, platform: NodeJS.Platform = process.platform) => hash(platform === "win32" ? root.toLowerCase() : root).slice(0, 12);
 export const permissionMode = (mode: RuntimeMode): string => ({ "approval-required": "default", "auto-accept-edits": "acceptEdits", auto: "auto", "full-access": "bypassPermissions" })[mode];
 /** How much each Claude Code permission mode lets a run do unasked. `plan` changes nothing; `dontAsk` refuses what isn't pre-approved. */
 const REACH: Record<string, number> = { plan: 0, default: 1, dontAsk: 1, acceptEdits: 2, auto: 3, bypassPermissions: 4 };
@@ -57,9 +70,16 @@ const HEAD_BYTES = 512 * 1024;
 const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whether Claude received that. 10 & 2 won't send it again." };
 /** A live session without an inbox: Claude Code before 2.1.224, or one started bare. */
 const HELD = "It's open in a terminal in an older Claude Code, so 10 & 2 can't send to it. Updating Claude Code fixes that.";
+/** A live session 10 & 2 can't reach (Windows: run as administrator, or another account's): never resumed beside it. */
+const FOREIGN = "It's open where 10 & 2 can't reach it, such as an administrator terminal. Answer it there.";
+/** Why a session that's open, but with no inbox 10 & 2 can use, takes no follow-up. */
+const unreachable = (live: Live[]) => live.some((l) => l.foreign) ? FOREIGN : HELD;
 /** A live session, on a machine whose policy doesn't let Driver steer open sessions. */
 const NO_STEERING = "It's open in a terminal, and this computer doesn't let 10 & 2 send to open sessions.";
 const NOT_DELIVERED = "That session didn't take the message. 10 & 2 won't send it again.";
+/** A session on Windows whose inbox key 10 & 2 can't find: its inbox would drop the message unread. */
+const NO_KEY = "That session wouldn't take a message from 10 & 2, so nothing was sent. Try reopening it in Claude Code.";
+const NOT_INSTALLED = "Claude couldn't be started. Check that it's installed on this machine.";
 const AWAITING_OK = "It's waiting for your OK in that session's terminal. 10 & 2 won't send it again.";
 /**
  * An open AskUserQuestion that 10 & 2's PermissionRequest hook is holding for Driver (hooks.ts): the terminal shows the
@@ -88,11 +108,88 @@ export function answersFor(questions: Asked[], words: string): Record<string, st
 }
 type Row = { transcript: Transcript; cwd: string; live: Live[]; item: WorkItem };
 
+/** How often Claude Code's models are read again besides at start: they change with its releases. */
+const MODELS_MS = 6 * 3600_000;
+/** How soon after a read that failed, doubling while they fail, to `MODELS_MS`: until one works, none to choose. */
+const MODELS_RETRY_MS = 5 * 60_000;
+const NO_SUCH_MODEL = "Claude Code doesn't offer that model now.";
+
+/**
+ * The models a new session can start on, from Claude Code's `/model` list (`initialize`'s `models`): not "default"
+ * (its own, which a start with no model gets), each named as it's said ("Claude Opus 5.5", from the model it resolves
+ * to, a date never read as a version), else as Claude Code shows it; once per name, the plain value before one with a
+ * suffix ("[1m]"). The id is what `--model` takes.
+ */
+export function claudeModels(list: unknown): CodingModel[] {
+  const out: CodingModel[] = [];
+  const suffixed = (id: string) => /\[[^\]]*\]$/.test(id);
+  for (const m of Array.isArray(list) ? list : []) {
+    const value = m?.value;
+    if (typeof value !== "string" || !value || value === "default" || value.length > 200 || value.trim() !== value) continue;
+    const v = typeof m.resolvedModel === "string" ? /^claude-([a-z]+)-(\d+)(?:-(\d{1,2}))?(?!\d)/.exec(m.resolvedModel) : null;
+    const name = v ? `Claude ${v[1]![0]!.toUpperCase()}${v[1]!.slice(1)} ${v[2]}${v[3] ? `.${v[3]}` : ""}` : typeof m.displayName === "string" ? m.displayName.trim() : "";
+    if (!name) continue;
+    const same = out.findIndex((o) => modelKey(o.name) === modelKey(name));
+    if (same === -1) out.push({ id: value, name });
+    else if (suffixed(out[same]!.id) && !suffixed(value)) out[same] = { id: value, name };
+  }
+  return out;
+}
+
+/**
+ * Asks a `claude -p` only to initialize, which lists its models without calling one (about 0.3 s), and stops it as soon
+ * as it answers, or after `timeoutMs`. Its answer also carries the user's account: only `models` is read, and nothing of
+ * it is logged. Null when it doesn't answer. Without the user's hooks and MCP servers: a session they never started
+ * mustn't run their SessionStart and SessionEnd hooks, nor wait on them (initialize does), nor start their servers.
+ */
+export function listClaudeModels(command: string[], env: NodeJS.ProcessEnv, cwd: string, signal: AbortSignal, timeoutMs = 10_000): Promise<CodingModel[] | null> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve(null);
+    const id = randomUUID();
+    let done = false, buffer = "";
+    let child: ChildProcess | undefined;
+    // The adapter's signal lives as long as it does: its listener goes with each read (spawn's own would stay on it
+    // for a `claude` that isn't there, which never exits).
+    const stop = () => finish(null);
+    const finish = (models: CodingModel[] | null) => {
+      if (done) return;
+      done = true; clearTimeout(timer); signal.removeEventListener("abort", stop); child?.kill(); resolve(models);
+    };
+    const timer = setTimeout(stop, timeoutMs);
+    signal.addEventListener("abort", stop, { once: true });
+    try {
+      const [bin = "claude", ...first] = command;
+      child = spawnCommand(bin, [...first, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--strict-mcp-config",
+        "--settings", JSON.stringify({ disableAllHooks: true })], { cwd, env, stdio: ["pipe", "pipe", "ignore"] });
+    } catch { finish(null); return; }
+    child.on("error", () => finish(null));
+    child.on("close", () => finish(null));
+    child.stdin!.on("error", () => {});
+    child.stdout!.on("data", (b: Buffer) => {
+      buffer += b.toString();
+      for (let at = buffer.indexOf("\n"); at !== -1; at = buffer.indexOf("\n")) {
+        const line = buffer.slice(0, at);
+        buffer = buffer.slice(at + 1);
+        let r: any;
+        try { r = JSON.parse(line); } catch { continue; }
+        if (r?.type === "control_response" && r.response?.request_id === id) return finish(r.response.subtype === "success" ? claudeModels(r.response.response?.models) : null);
+      }
+      if (buffer.length > 4 << 20) finish(null);
+    });
+    child.stdin!.write(JSON.stringify({ type: "control_request", request_id: id, request: { subtype: "initialize" } }) + "\n");
+  });
+}
+
 export class ClaudeAdapter implements Adapter {
   readonly name = "claude";
   readonly actions = ["follow_up", "settle", "snooze", "archive", "start_work", "unsnooze", "unsettle"] as const;
   readonly configDir: string;
   readonly socketPath: string;
+  /**
+   * What the hook socket proves itself with, to a hook that sends a nonce first (hooks.ts reach): new at each start, and
+   * written beside the pipe's name in hooks.pipe on Windows, where a pipe's name alone proves nothing.
+   */
+  readonly hookSecret = randomHex();
   private readonly opts: Options;
   private readonly store: Store;
   private readonly now: () => number;
@@ -120,11 +217,19 @@ export class ClaudeAdapter implements Adapter {
   private asks = new Map<string, Ask>();
   /** Transcripts left out on their first records, by path, with the inode they had (a new file is read again). */
   private skipped = new Map<string, number | bigint>();
+  /** What a new session can start on (`claudeModels`), as Claude Code last said. */
+  private models: CodingModel[] = [];
+  private modelsTimer: NodeJS.Timeout | null = null;
+  /** How long until the next read after one that failed (`MODELS_RETRY_MS`, doubling); the log says so the first time. */
+  private modelsRetry = 0;
+  /** Stops a models read under way when the adapter closes. */
+  private readonly stopping = new AbortController();
 
   constructor(opts: Options) {
     this.opts = opts; this.now = opts.now ?? Date.now;
     this.configDir = resolve(opts.configDir ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"));
-    this.socketPath = opts.hookSocketPath ?? join(process.env.XDG_RUNTIME_DIR ? join(process.env.XDG_RUNTIME_DIR, "10and2") : opts.stateDir, "hooks.sock");
+    this.socketPath = opts.hookSocketPath ?? (process.platform === "win32" ? `\\\\.\\pipe\\10and2-hooks-${randomBytes(16).toString("hex")}`
+      : join(process.env.XDG_RUNTIME_DIR ? join(process.env.XDG_RUNTIME_DIR, "10and2") : opts.stateDir, "hooks.sock"));
     this.store = new Store(opts.db);
   }
 
@@ -141,16 +246,36 @@ export class ClaudeAdapter implements Adapter {
       try { if (statSync(path).mtimeMs < this.now() - 7 * 86_400_000) unlinkSync(path); }
       catch { /* A missing or inaccessible old log must not prevent startup. */ }
     }
-    await this.probeWorktrees();
+    // Its models are read beside its version, so the first view has them.
+    await Promise.all([this.probeWorktrees(), this.probeModels()]);
     if (this.closed || this.closing) throw new Error("Claude adapter is closed");
     this.scan(); this.loaded = true;
     this.rescan = setInterval(() => this.safeScan(), 30_000); this.rescan.unref();
     await this.listenHooks();
   }
+  /**
+   * Reads Claude Code's models, keeping the last list when it doesn't answer; the brain is told when they change. Read
+   * again in 6 hours, or 5 minutes after a read that failed (a slow start at boot), then 10, 20…, up to 6 hours.
+   */
+  private async probeModels() {
+    if (this.closed || this.closing) return;
+    const models = await listClaudeModels(this.opts.claudeCommand ?? ["claude"], this.childEnv(), this.opts.stateDir, this.stopping.signal);
+    if (this.closed || this.closing) return;
+    if (!models && !this.modelsRetry) this.opts.log("claude: couldn't read Claude Code's models; new work starts on its own");
+    this.modelsRetry = models ? 0 : Math.min(this.modelsRetry ? this.modelsRetry * 2 : MODELS_RETRY_MS, MODELS_MS);
+    this.modelsTimer = setTimeout(() => void this.probeModels(), this.modelsRetry || MODELS_MS); this.modelsTimer.unref();
+    if (!models) return;
+    if (JSON.stringify(models) === JSON.stringify(this.models)) return;
+    this.models = models;
+    for (const listener of this.listeners) listener([], false);
+  }
   private async probeWorktrees() {
+    // Claude Code on Windows is a 370 MB program its antivirus scans as it starts: 3 s wasn't always enough there.
+    const timeout = process.platform === "win32" ? 10_000 : 3000;
     const output = (flag: string) => new Promise<string>((resolve) => {
-      execFile(this.opts.claudeBin ?? "claude", [flag], { timeout: 3000, maxBuffer: 1024 * 1024,
-        env: this.childEnv() }, (err, stdout) => resolve(err ? "" : stdout));
+      let command: [string, string[]];
+      try { command = this.claude([flag]); } catch { resolve(""); return; }
+      execFileCommand(...command, { timeout, maxBuffer: 1024 * 1024, env: this.childEnv() }, (err, stdout) => resolve(err ? "" : stdout));
     });
     const [version, help] = await Promise.all([output("--version"), output("--help")]);
     // Headless worktrees were measured starting at 2.1.310; require the flag as well.
@@ -168,6 +293,18 @@ export class ClaudeAdapter implements Adapter {
     if (process.env.CLAUDE_CONFIG_DIR || this.configDir !== resolve(join(homedir(), ".claude"))) return { ...process.env, CLAUDE_CONFIG_DIR: this.configDir };
     return process.env;
   }
+  /**
+   * The `claude` command with these arguments, found on PATH now. On Windows a bare name is looked for in the child's
+   * folder (a project, which could hold a claude.exe of its own) before PATH, so one that isn't on PATH isn't run at all:
+   * it throws ENOENT, as starting it would elsewhere.
+   */
+  private claude(args: string[]): [string, string[]] {
+    const [bin = "claude", ...first] = this.opts.claudeCommand ?? ["claude"];
+    const found = process.platform === "win32" ? which(bin, this.childEnv()) : bin;
+    if (!found) throw Object.assign(new Error(`spawn ${bin} ENOENT`), { code: "ENOENT" });
+    return [found, [...first, ...args]];
+  }
+  private spawnClaude(args: string[], options: SpawnOptions): ChildProcess { return spawnCommand(...this.claude(args), options); }
   get isLoaded(): boolean { return this.loaded; }
   connected(): boolean { return this.loaded && !this.closed && !this.closing && this.opts.policy.claude && existsSync(join(this.configDir, "projects")); }
   private schedule = () => {
@@ -305,7 +442,7 @@ export class ClaudeAdapter implements Adapter {
     for (const cwd of [...[...this.rows.values()].map((r) => r.cwd), ...this.trustedFolders()]) {
       const root = gitRoot(cwd);
       // A visible subfolder must not grant a launch into its hidden repository parent.
-      if (root && visible(this.opts.policy, root)) this.roots.set(hash(root).slice(0, 12), root);
+      if (root && visible(this.opts.policy, root)) this.roots.set(placeId(root), root);
     }
   }
   private trusted: { mtimeMs: number; folders: string[] } | null = null;
@@ -330,7 +467,7 @@ export class ClaudeAdapter implements Adapter {
     const counts = new Map<string, number>();
     for (const [, root] of roots) counts.set(basename(root), (counts.get(basename(root)) ?? 0) + 1);
     return roots.map(([id, root]) => ({ id, name: basename(root) + ((counts.get(basename(root)) ?? 0) > 1 ? ` (${id})` : ""), folder: folderOf(root),
-      activeAt: [...this.rows.values()].filter((r) => gitRoot(r.cwd) === root).map((r) => r.item.updatedAt).sort().at(-1) ?? null }));
+      activeAt: [...this.rows.values()].filter((r) => { const g = gitRoot(r.cwd); return g !== null && placeId(g) === id; }).map((r) => r.item.updatedAt).sort().at(-1) ?? null, models: this.models }));
   }
   async list(): Promise<WorkItem[]> { this.fresh(); return [...this.rows.values()].map((r) => ({ ...r.item })); }
   private row(id: string): Row {
@@ -364,6 +501,8 @@ export class ClaudeAdapter implements Adapter {
       if (action.title?.trimStart().startsWith("-")) return "A session title must not start with a dash.";
       if (!this.roots.has(action.placeId)) return "That project isn't visible to 10 & 2.";
       if (!withinCeiling(this.opts.policy, action.profile, "claude")) return "That launch profile exceeds this machine's permission ceiling.";
+      // Claude Code takes any `--model` and fails only once the session calls it, after it counts as started.
+      if (action.model !== undefined && !this.models.some((m) => m.id === action.model)) return NO_SUCH_MODEL;
       if (action.profile.workspace === "worktree" && !this.worktrees) return "10 & 2 hasn't verified headless Claude worktrees with this Claude version. Choose the project checkout profile.";
       if (action.profile.workspace === "worktree") {
         const root = this.roots.get(action.placeId)!;
@@ -381,7 +520,7 @@ export class ClaudeAdapter implements Adapter {
     // A question Claude asked that the hook holds takes the answer; a live session (a terminal, a background session,
     // Driver's own run) takes the message in its inbox, between steps or as its next turn.
     if (this.asks.has(id)) return null;
-    if (row.live.length) return !steers(this.opts.policy, "claude") ? NO_STEERING : row.live.some((l) => l.socket) ? null : HELD;
+    if (row.live.length) return !steers(this.opts.policy, "claude") ? NO_STEERING : row.live.some((l) => l.socket) ? null : unreachable(row.live);
     if (this.store.run(id)) return "10 & 2 is already running that session, or can't yet verify that its previous run ended.";
     if (holdersUncertain) return "10 & 2 can't verify whether a terminal holds that session right now.";
     if (row.transcript.unknown) return "This session uses a Claude transcript version 10 & 2 doesn't understand yet.";
@@ -429,9 +568,10 @@ export class ClaudeAdapter implements Adapter {
       const target = live.filter((l) => l.socket).sort((a, b) => (b.statusUpdatedAt ?? "").localeCompare(a.statusUpdatedAt ?? ""))[0];
       if (live.length && !steers(this.opts.policy, "claude")) return { ok: false, error: NO_STEERING };
       if (target) return this.tracked(this.message(action, key, digest, target));
-      if (live.length) return { ok: false, error: HELD };
+      if (live.length) return { ok: false, error: unreachable(live) };
     }
-    if (holders.live.some((l) => l.sessionId === id)) return { ok: false, error: HELD };
+    const held = holders.live.filter((l) => l.sessionId === id);
+    if (held.length) return { ok: false, error: unreachable(held) };
     if (action.kind === "follow_up" && holders.uncertain) return { ok: false, error: "10 & 2 can't verify whether a terminal holds that session right now." };
     if (this.store.run(id)) return { ok: false, error: "10 & 2 is already running that session." };
     if (!this.store.begin(key, digest, id)) {
@@ -464,18 +604,23 @@ export class ClaudeAdapter implements Adapter {
     const sessionMode = row?.transcript.permissionMode ?? null;
     const mode = attestedMode(sessionMode, ceilingFor(this.opts.policy, "claude"));
     const content = envelope(action.message, mode), uuid = randomUUID();
-    const path = row?.transcript.path || join(this.configDir, "projects", target.cwd.replace(/[/.]/g, "-"), `${id}.jsonl`);
+    let path = row?.transcript.path || this.transcriptOf(id, target.cwd);
     let baseline = 0;
-    try { baseline = statSync(path).size; } catch { /* No transcript yet: everything in it is new. */ }
-    if (!(await post(target.socket!, peerToken(this.configDir, target.pid), id, uuid, content))) {
+    try { if (path) baseline = statSync(path).size; } catch { /* No transcript yet: everything in it is new. */ }
+    const token = peerToken(this.configDir, target.pid, target.socket!, target.procStart);
+    // Claude Code on Windows reads nothing on its inbox before the token, and would drop the message unread.
+    if (!token && process.platform === "win32") return this.store.finish(key, { ok: false, error: NO_KEY });
+    if (!(await post(target.socket!, token, id, uuid, content))) {
       return this.store.finish(key, { ok: false, error: "10 & 2 couldn't reach that session. Is it still open?" });
     }
-    const lines = new TranscriptLines(path, baseline);
+    let lines = path ? new TranscriptLines(path, baseline) : null;
     // One Claude Code will hold for the user's approval needs no long wait (unless its settings accept every message).
     const held = heldFor(sessionMode, mode);
     const deadline = Date.now() + Math.min(this.opts.acceptanceTimeoutMs ?? 15_000, held ? 3000 : Infinity);
     while (Date.now() < deadline) {
-      for (const r of lines.read()) {
+      // A transcript that wasn't there before the message is new: all of it counts.
+      if (!lines && (path = this.findTranscript(id))) lines = new TranscriptLines(path);
+      for (const r of lines?.read() ?? []) {
         const queued = r.type === "queue-operation" && r.operation === "enqueue" && r.content === content;
         if (queued || (r.type === "user" && r.uuid === uuid)) { this.schedule(); return this.store.finish(key, { ok: true }); }
       }
@@ -520,17 +665,17 @@ export class ClaudeAdapter implements Adapter {
     // worktree before its first edit, a user's own session included.
     const args = ["--bg", "--permission-mode", mode, ...(name ? ["--name", name] : []),
       ...(worktree ? ["--worktree", worktree] : ["--settings", JSON.stringify({ worktree: { bgIsolation: "none" } })]),
-      ...(starting ? [] : ["--resume", id]), "--", action.message];
+      ...(starting && action.model ? ["--model", action.model] : []), ...(starting ? [] : ["--resume", id]), "--", action.message];
     this.store.markStarted(id);
     const previous = starting ? undefined : this.rows.get(id)?.transcript;
     const baseline = previous?.offset ?? 0;
     const ran = await new Promise<{ code: number | null; out: string }>((resolve) => {
       let out = "";
       try {
-        const child = spawn(this.opts.claudeBin ?? "claude", args, { cwd, detached: true, env: this.childEnv(), stdio: ["ignore", "pipe", "pipe"] });
+        const child = this.spawnClaude(args, { cwd, detached: true, env: this.childEnv(), stdio: ["ignore", "pipe", "pipe"] });
         const timer = setTimeout(() => resolve({ code: null, out }), 30_000);
-        child.stdout.on("data", (b) => { out += b.toString(); });
-        child.stderr.on("data", (b) => { out += b.toString(); });
+        child.stdout!.on("data", (b) => { out += b.toString(); });
+        child.stderr!.on("data", (b) => { out += b.toString(); });
         child.on("error", () => { clearTimeout(timer); resolve({ code: -1, out }); });
         child.on("exit", (code) => { clearTimeout(timer); resolve({ code, out }); });
       } catch { resolve({ code: -1, out }); }
@@ -565,6 +710,11 @@ export class ClaudeAdapter implements Adapter {
     }
     return finish(UNKNOWN);
   }
+  /** Where a session's transcript is (or will be): in its folder's, or past Claude Code's name length, wherever it is. */
+  private transcriptOf(id: string, cwd: string): string | null {
+    const folder = projectFolder(cwd);
+    return folder ? join(this.configDir, "projects", folder, `${id}.jsonl`) : this.findTranscript(id);
+  }
   /** The transcript of a session whose id starts with `short`, in any project folder. */
   private findTranscript(short: string): string | null {
     const projects = join(this.configDir, "projects");
@@ -586,6 +736,8 @@ export class ClaudeAdapter implements Adapter {
     if (action.kind === "start_work" && action.title) args.push(`--name=${action.title}`);
     const worktreeName = action.kind === "start_work" && action.profile.workspace === "worktree" ? `10and2-${id.slice(0, 13)}` : null;
     if (worktreeName) args.push("--worktree", worktreeName);
+    // A refused background start comes here too, so the model it asked for goes with it.
+    if (action.kind === "start_work" && action.model) args.push("--model", action.model);
     // Driver's own headless records follow in this transcript; the session stays listed as Driver's whatever they say.
     this.store.markStarted(id);
     const messageId = randomUUID();
@@ -605,13 +757,13 @@ export class ClaudeAdapter implements Adapter {
     const previous = this.rows.get(id)?.transcript;
     const baseline = previous?.offset ?? 0;
     const runCwd = worktreeName ? join(cwd, ".claude", "worktrees", worktreeName) : cwd;
-    const transcriptPath = previous?.path || join(this.configDir, "projects", runCwd.replace(/[/.]/g, "-"), `${id}.jsonl`);
+    let transcriptPath = previous?.path || this.transcriptOf(id, runCwd);
     let child;
     try {
-      child = spawn(this.opts.claudeBin ?? "claude", args, { cwd, detached: true, env: this.childEnv(), stdio: ["pipe", out, err] });
-    } catch {
+      child = this.spawnClaude(args, { cwd, detached: true, env: this.childEnv(), stdio: ["pipe", out, err] });
+    } catch (e) {
       closeSync(out); closeSync(err); this.store.ended(id);
-      return finish({ ok: false, error: "10 & 2 couldn't start Claude on this machine." });
+      return finish({ ok: false, error: (e as NodeJS.ErrnoException).code === "ENOENT" ? NOT_INSTALLED : "10 & 2 couldn't start Claude on this machine." });
     }
     closeSync(out); closeSync(err);
     const pid = child.pid;
@@ -624,7 +776,8 @@ export class ClaudeAdapter implements Adapter {
     child.stdin?.end(JSON.stringify({ type: "user", uuid: messageId, session_id: id, message: { role: "user", content: action.message } }) + "\n");
     child.unref();
     // Observe files instead of piping output, so detached Claude can continue if the connector exits.
-    const output = new TranscriptLines(stdoutPath), transcript = new TranscriptLines(transcriptPath, baseline);
+    const output = new TranscriptLines(stdoutPath);
+    let transcript = transcriptPath ? new TranscriptLines(transcriptPath, baseline) : null, searched = 0;
     let init = false, replay = false, recorded = false;
     const deadline = Date.now() + (this.opts.acceptanceTimeoutMs ?? 15_000);
     while (Date.now() < deadline) {
@@ -632,25 +785,37 @@ export class ClaudeAdapter implements Adapter {
         if (r.type === "system" && r.subtype === "init" && r.session_id === id) init = true;
         if (r.type === "user" && r.session_id === id && r.uuid === messageId && typedUser(r) === action.message) replay = true;
       }
-      for (const r of transcript.read()) if (r.sessionId === id && r.uuid === messageId && typedUser(r) === action.message) recorded = true;
+      // Claude Code names the folder from the cwd as it sees it, which can differ from the one given (a Windows drive's
+      // case, a resolved link): until the transcript is where expected, it's looked for by id every half second.
+      if ((!transcriptPath || (!previous?.path && !existsSync(transcriptPath))) && Date.now() - searched >= 500) {
+        searched = Date.now();
+        const found = this.findTranscript(id);
+        if (found && found !== transcriptPath) { transcriptPath = found; transcript = new TranscriptLines(found); }
+      }
+      for (const r of transcript?.read() ?? []) if (r.sessionId === id && r.uuid === messageId && typedUser(r) === action.message) recorded = true;
       if ((init && replay) || recorded) {
         const receipt: Receipt = action.kind === "start_work" ? { ok: true, itemId: id } : { ok: true };
         finish(receipt); this.scan(); return receipt;
       }
-      if (failed) return finish({ ok: false, error: "Claude couldn't be started. Check that it's installed on this machine." });
+      if (failed) return finish({ ok: false, error: NOT_INSTALLED });
       // Even an exited process can have an asynchronous transcript flush in flight. Keep waiting for evidence.
       await new Promise((resolve) => setTimeout(resolve, exited ? 40 : 25));
     }
     return finish(UNKNOWN);
   }
 
+  /** Where `10and2 hook` finds this adapter's pipe on Windows (paths.ts hookSocket). */
+  private get pipeFile() { return join(this.opts.stateDir, "hooks.pipe"); }
   private async listenHooks() {
-    if (process.platform === "win32") return;
-    try { mkdirSync(dirname(this.socketPath), { recursive: true, mode: 0o700 }); }
-    catch { this.opts.log("claude: hook socket unavailable; using filesystem watches"); return; }
+    // On Windows it's a named pipe, not a file: there's no folder to make, nothing a crash leaves to remove, and no mode.
+    const pipe = process.platform === "win32";
+    if (!pipe) {
+      try { mkdirSync(dirname(this.socketPath), { recursive: true, mode: 0o700 }); }
+      catch { this.opts.log("claude: hook socket unavailable; using filesystem watches"); return; }
+    }
     // Never unlink a socket another connector may own; one nobody answers on was left by a crash and is replaced.
     // Polling remains available if this one cannot bind.
-    if (existsSync(this.socketPath)) {
+    if (!pipe && existsSync(this.socketPath)) {
       const answered = await new Promise<boolean>((resolve) => {
         const probe = createConnection(this.socketPath);
         probe.once("connect", () => { probe.destroy(); resolve(true); });
@@ -660,7 +825,7 @@ export class ClaudeAdapter implements Adapter {
       try { unlinkSync(this.socketPath); } catch { /* bind below reports it */ }
     }
     const server = createServer((socket) => {
-      socket.setTimeout(500, () => socket.destroy()); let text = "";
+      socket.setTimeout(500, () => socket.destroy()); let text = "", proved = false;
       socket.on("error", () => {});
       socket.on("data", (chunk) => {
         if (text.includes("\n")) return;
@@ -669,6 +834,11 @@ export class ClaudeAdapter implements Adapter {
         if (!text.includes("\n")) return;
         try {
           const event = JSON.parse(text.slice(0, text.indexOf("\n")));
+          // A hook that has the secret (Windows) asks this to prove it first, once, and sends its event after.
+          if (!proved && typeof event?.nonce === "string") {
+            proved = true; text = "";
+            socket.write(proof(this.hookSecret, event.nonce) + "\n"); return;
+          }
           if (event.hook_event_name === "PermissionRequest" && sessionId(event.session_id) && this.hold(event.session_id, socket, event)) return;
           // Payloads never set status or supply reply text. Only a fresh filesystem read may do that.
           if (sessionId(event.session_id) && ["SessionStart", "SessionEnd", "Stop", "Notification"].includes(event.hook_event_name)) this.schedule();
@@ -681,6 +851,15 @@ export class ClaudeAdapter implements Adapter {
       server.on("error", () => { this.opts.log("claude: hook socket unavailable; using filesystem watches"); resolve(); });
       server.listen(this.socketPath, () => {
         this.ownsSocket = true;
+        if (pipe) {
+          // Its name, and the secret it proves itself with: hooks.pipe is in the user's own profile, where only they can
+          // read it, but other accounts can list pipes' names and take this one once it's gone.
+          try {
+            const tmp = `${this.pipeFile}.${randomUUID()}`;
+            writeFileSync(tmp, `${this.socketPath}\n${this.hookSecret}\n`, { mode: 0o600 }); replaceFile(tmp, this.pipeFile); server.unref();
+          } catch { server.close(); this.opts.log("claude: couldn't name the hook pipe; using filesystem watches"); }
+          resolve(); return;
+        }
         try { chmodSync(this.socketPath, 0o600); server.unref(); }
         catch { server.close(); this.opts.log("claude: couldn't make hook socket private; using filesystem watches"); }
         resolve();
@@ -722,6 +901,8 @@ export class ClaudeAdapter implements Adapter {
   }
   private async stop(): Promise<void> {
     if (this.rescan) clearInterval(this.rescan);
+    if (this.modelsTimer) clearTimeout(this.modelsTimer);
+    this.stopping.abort();
     if (this.debounce) clearTimeout(this.debounce);
     for (const watcher of this.watchers.values()) watcher.close(); this.watchers.clear();
     // Finish acceptance bookkeeping; the child itself stays detached and keeps its log descriptors.
@@ -729,7 +910,10 @@ export class ClaudeAdapter implements Adapter {
     this.closed = true; this.loaded = false; this.listeners.clear();
     for (const ask of this.asks.values()) ask.socket.end(); this.asks.clear();
     this.socket?.close();
-    if (this.ownsSocket) { try { unlinkSync(this.socketPath); } catch { /* Server may already have removed it. */ } }
+    if (this.ownsSocket && process.platform === "win32") {
+      // The pipe goes with its server; its name goes too, unless a newer connector has written its own.
+      try { if (readFileSync(this.pipeFile, "utf8").split(/\r?\n/)[0] === this.socketPath) unlinkSync(this.pipeFile); } catch { /* already gone */ }
+    } else if (this.ownsSocket) { try { unlinkSync(this.socketPath); } catch { /* Server may already have removed it. */ } }
     this.store.close();
   }
 }

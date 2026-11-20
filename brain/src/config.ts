@@ -1,7 +1,7 @@
 // Configuration from the environment. Secrets come only from the environment, never from files here.
 import { parseConnectors } from "./connectors.ts";
 import type { LaunchProfile } from "./adapter.ts";
-import { BACKEND_MODELS, LIVE_MODELS } from "./models.ts";
+import { BACKEND_MODELS, LIVE_MODELS, READING_ENGINES } from "./models.ts";
 
 const env = process.env;
 
@@ -98,8 +98,8 @@ export function loadConfig(o: { cloud?: boolean } = {}) {
     classifyModel: env.DRIVER_CLASSIFY_MODEL ?? "gpt-6-luna",
     openerModel: env.DRIVER_OPENER_MODEL ?? "gpt-6-luna",
     voice: env.DRIVER_VOICE ?? "marin",
-    /** Reading replies aloud: the text-to-speech model, and how long and how much of its audio is kept. */
-    ttsModel: env.DRIVER_TTS_MODEL ?? "gpt-4o-mini-tts",
+    /** Reading replies aloud: the engine (models.ts `READING_ENGINES`), and how long and how much of its audio is kept. */
+    ttsModel: env.DRIVER_TTS_MODEL ?? READING_ENGINES[0],
     /** Rewrites replies for listening, when the phone asks for that. */
     rewriteModel: env.DRIVER_REWRITE_MODEL ?? "gpt-6-luna",
     /** A reply longer than this is rewritten in parts of about this size, at once; 0 rewrites it in one call. */

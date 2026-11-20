@@ -1,18 +1,37 @@
 // 10 & 2's Pi extension (extensions/pi/10and2.ts): copied into Pi's own extensions folder, where every Pi finds it. It
 // gives each open Pi a private socket and a registry entry, so Driver can tell a session is open and reach it there.
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, posix, resolve, win32 } from "node:path";
+import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
+import { replaceFile } from "../util.ts";
 
 /** The first line of 10 & 2's copy: a file without it is someone else's and is never replaced or removed. */
 export const MARKER = "// 10and2 Pi extension (installed by `10and2 pi install`)";
 
+/**
+ * A folder as Pi reads one from its settings and environment (its normalizePath): `~`, `~/` (and `~\` on Windows) in
+ * the home folder, a `file://` URL as its path, and on Windows a Git Bash, Cygwin or WSL drive path (`/c/Users/me`,
+ * `/mnt/c/…`, `/cygdrive/c/…`) as `C:\Users\me`. Not resolved: a relative one is relative to wherever Pi starts.
+ */
+export function piPath(value: string, home = homedir(), platform: NodeJS.Platform = process.platform): string {
+  const windows = platform === "win32";
+  let path = value;
+  if (windows && path.startsWith("/") && !path.startsWith("//") && !path.includes("\\")) {
+    const drive = /^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i.exec(path);
+    if (drive) path = `${drive[1]!.toUpperCase()}:\\${drive[2]?.replaceAll("/", "\\") ?? ""}`;
+  }
+  if (path === "~") return home;
+  if (path.startsWith("~/") || (windows && path.startsWith("~\\"))) return (windows ? win32 : posix).join(home, path.slice(2));
+  if (path.startsWith("file://")) return fileURLToPath(path, { windows });
+  return path;
+}
+
 /** Pi's agent folder: $PI_CODING_AGENT_DIR, else ~/.pi/agent. */
 export function piAgentDir(env: NodeJS.ProcessEnv = process.env): string {
   const dir = env.PI_CODING_AGENT_DIR;
-  if (!dir) return join(homedir(), ".pi", "agent");
-  return resolve(dir === "~" ? homedir() : dir.startsWith("~/") ? join(homedir(), dir.slice(2)) : dir);
+  return dir ? resolve(piPath(dir)) : join(homedir(), ".pi", "agent");
 }
 
 /**
@@ -55,7 +74,7 @@ export function installPiExtension(agentDir: string): { state: PiExtensionState;
     mkdirSync(join(agentDir, "extensions"), { recursive: true, mode: 0o700 });
     const tmp = `${path}.10and2-${randomUUID()}`;
     writeFileSync(tmp, source, { mode: 0o644 });
-    renameSync(tmp, path);
+    replaceFile(tmp, path);
   }
   return { state: "installed", path };
 }

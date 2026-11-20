@@ -1,9 +1,9 @@
 // 10and2 Pi extension (installed by `10and2 pi install`)
 /**
  * Lets 10 & 2's connector see and reach this Pi (measured on Pi 1.5.1). Inside every interactive (TUI) or RPC Pi
- * process it listens on a private unix socket and keeps a registry file beside it:
- *   <agentDir>/10and2/<sessionId>.sock
- *   <agentDir>/10and2/<sessionId>.json  { sessionId, sessionFile, cwd, name, pid, mode, status, prompt, questions, piVersion, updatedAt }
+ * process it listens on a private local socket and keeps a registry file saying where:
+ *   <agentDir>/10and2/<sessionId>.sock  (on Windows a named pipe, \\.\pipe\10and2-pi-<random uuid>, new each time)
+ *   <agentDir>/10and2/<sessionId>.json  { sessionId, sessionFile, cwd, name, pid, mode, status, prompt, questions, socket, piVersion, updatedAt }
  * Print and JSON runs belong to whoever started them, so they get neither.
  *
  * Wire protocol: newline-delimited JSON, one object per line, both directions.
@@ -18,6 +18,7 @@
  *   → {"type":"answer","questionId":"…","value":"SQLite"}   ← {"type":"ack","delivered":"answer"}  (first answer wins)
  * status: "idle" | "busy" | "waiting" (Pi is blocked on any extension's dialog; `prompt` says which, and since when).
  */
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
@@ -25,6 +26,21 @@ import { getAgentDir, VERSION, type ExtensionAPI, type ExtensionContext } from "
 
 type Status = "idle" | "busy" | "waiting";
 type Question = { title: string; options: string[]; answer: (value: string) => void };
+
+// Node's local sockets on Windows are named pipes. A pipe isn't a file: it can't be chmod-ed, removed or checked for
+// without connecting to it, and it goes when its Pi does. Its default security lets other accounts only read it, which
+// gets them nothing here; its random name can't be taken first by one of them.
+const WINDOWS = process.platform === "win32";
+const PIPE = /^\\\\\.\\pipe\\10and2-pi-[0-9a-f-]{36}$/i;
+
+function alive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (e) {
+		return (e as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
 
 export default function (pi: ExtensionAPI) {
 	let server: net.Server | undefined;
@@ -52,6 +68,7 @@ export default function (pi: ExtensionAPI) {
 			status,
 			prompt: prompt ?? null,
 			questions: [...questions].map(([questionId, q]) => ({ questionId, title: q.title, options: q.options })),
+			socket: sockPath,
 			piVersion: VERSION,
 			updatedAt: new Date().toISOString(),
 		};
@@ -59,12 +76,41 @@ export default function (pi: ExtensionAPI) {
 
 	function writeRegistry() {
 		if (!regPath) return;
+		const tmp = `${regPath}.${process.pid}.tmp`;
 		try {
-			const tmp = `${regPath}.${process.pid}.tmp`;
-			fs.writeFileSync(tmp, JSON.stringify(snapshot()) + "\n", { mode: 0o600 });
-			fs.renameSync(tmp, regPath);
+			const text = JSON.stringify(snapshot()) + "\n";
+			fs.writeFileSync(tmp, text, { mode: 0o600 });
+			replace(tmp, regPath, text);
 		} catch {
 			// The registry is a convenience for the connector; Pi carries on without it.
+			try {
+				fs.rmSync(tmp, { force: true });
+			} catch {
+				// A leftover temporary file is harmless.
+			}
+		}
+	}
+
+	// Windows won't replace a file another program (antivirus, the search indexer) briefly has open: it's tried again
+	// for about a tenth of a second, then written in place. The connector reads a half-written entry again on its next
+	// scan, where a stale one would mislead it.
+	function replace(from: string, to: string, text: string) {
+		for (let attempt = 0; ; attempt++) {
+			try {
+				return fs.renameSync(from, to);
+			} catch (e) {
+				const code = (e as NodeJS.ErrnoException).code ?? "";
+				if (!WINDOWS || !["EPERM", "EACCES", "EBUSY"].includes(code)) throw e;
+				if (attempt >= 4) {
+					fs.rmSync(from, { force: true });
+					return fs.writeFileSync(to, text, { mode: 0o600 });
+				}
+				try {
+					Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10 * (attempt + 1));
+				} catch {
+					// No blocking wait here: try again at once.
+				}
+			}
 		}
 	}
 
@@ -192,7 +238,7 @@ export default function (pi: ExtensionAPI) {
 			srv.once("error", () => resolve(false));
 			srv.listen(p, () => {
 				try {
-					fs.chmodSync(p, 0o600);
+					if (!WINDOWS) fs.chmodSync(p, 0o600);
 				} catch {
 					srv.close();
 					return resolve(false);
@@ -203,16 +249,41 @@ export default function (pi: ExtensionAPI) {
 		});
 	}
 
-	// A socket file left by a crashed Pi refuses connections; a live owner accepts them.
+	// A socket file left by a crashed Pi refuses connections, and a gone Pi's pipe isn't there; a live owner accepts them.
+	// One that's there but doesn't answer within a second (a pipe whose every instance is busy waits up to 30 s) is
+	// still someone's.
 	function ownerAlive(p: string): Promise<boolean> {
 		return new Promise((resolve) => {
 			const c = net.connect(p);
-			c.once("connect", () => {
+			const done = (owned: boolean) => {
+				clearTimeout(timer);
 				c.destroy();
-				resolve(true);
-			});
-			c.once("error", () => resolve(false));
+				resolve(owned);
+			};
+			const timer = setTimeout(() => done(true), 1000);
+			c.once("connect", () => done(true));
+			c.once("error", () => done(false));
 		});
+	}
+
+	// Whether another Pi has this session open: on Windows its registry entry says where its pipe is, and it counts
+	// while its process is alive and the pipe answers; elsewhere its socket file answers. A socket file nobody answers
+	// on is removed.
+	async function openElsewhere(): Promise<boolean> {
+		if (!WINDOWS) {
+			if (!fs.existsSync(sockPath)) return false;
+			if (await ownerAlive(sockPath)) return true;
+			fs.rmSync(sockPath, { force: true });
+			return false;
+		}
+		let entry: any;
+		try {
+			entry = JSON.parse(fs.readFileSync(regPath, "utf8"));
+		} catch {
+			return false;
+		}
+		if (!Number.isInteger(entry?.pid) || !alive(entry.pid)) return false;
+		return typeof entry.socket === "string" && PIPE.test(entry.socket) && (await ownerAlive(entry.socket));
 	}
 
 	pi.on("session_start", async (_event, c) => {
@@ -220,20 +291,17 @@ export default function (pi: ExtensionAPI) {
 		ctx = c;
 		status = c.isIdle() ? "idle" : "busy";
 		const id = c.sessionManager.getSessionId();
-		sockPath = path.join(dir(), `${id}.sock`);
+		sockPath = WINDOWS ? `\\\\.\\pipe\\10and2-pi-${randomUUID()}` : path.join(dir(), `${id}.sock`);
 		regPath = path.join(dir(), `${id}.json`);
 		try {
 			fs.mkdirSync(dir(), { recursive: true, mode: 0o700 });
-			if (fs.existsSync(sockPath)) {
-				if (await ownerAlive(sockPath)) {
-					// Another Pi has this session open and stays the one Driver talks to. Both would write to the same
-					// file and split it into branches, so the user hears about it.
-					if (c.hasUI) c.ui.notify("This session is already open in another Pi. Close one of them, or your messages will end up on separate branches.", "warning");
-					sockPath = regPath = "";
-					ctx = undefined;
-					return;
-				}
-				fs.rmSync(sockPath, { force: true });
+			if (await openElsewhere()) {
+				// Another Pi has this session open and stays the one Driver talks to. Both would write to the same
+				// file and split it into branches, so the user hears about it.
+				if (c.hasUI) c.ui.notify("This session is already open in another Pi. Close one of them, or your messages will end up on separate branches.", "warning");
+				sockPath = regPath = "";
+				ctx = undefined;
+				return;
 			}
 		} catch {
 			sockPath = regPath = "";
@@ -277,7 +345,7 @@ export default function (pi: ExtensionAPI) {
 		subscribers.clear();
 		await new Promise<void>((r) => (server ? server.close(() => r()) : r()));
 		server = undefined;
-		if (sockPath) fs.rmSync(sockPath, { force: true });
+		if (sockPath && !WINDOWS) fs.rmSync(sockPath, { force: true });
 		if (regPath) fs.rmSync(regPath, { force: true });
 		sockPath = regPath = "";
 		ctx = undefined;

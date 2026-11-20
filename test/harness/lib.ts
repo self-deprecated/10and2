@@ -20,7 +20,7 @@ export async function until(what: string, test: () => boolean | Promise<boolean>
   throw new Error(`timed out waiting for ${what}`);
 }
 
-export type Mock = { url: string; port: number; requests: () => { path: string; texts: string[] }[]; saw: (text: string) => boolean; close: () => void };
+export type Mock = { url: string; port: number; requests: () => { path: string; model: string | null; texts: string[] }[]; saw: (text: string) => boolean; close: () => void };
 
 /** The fake model, on a free port, logging every request it answers. */
 export async function mockModel(t: TestContext): Promise<Mock> {

@@ -2,28 +2,43 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { addMachine, machines, readBrainEnv, removeMachine, writeBrainEnv } from "../src/brain.ts";
 import { BRAIN, launchAgent, systemdUnit } from "../src/service.ts";
+import { assertPrivate, removeDir, WINDOWS } from "./fixtures/platform.ts";
 
-const main = new URL("../src/main.ts", import.meta.url).pathname;
+const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
 const KEY = "sk-test-key-that-must-never-be-printed";
 
 function temp(t: { after: (f: () => void) => void }) {
   const dir = mkdtempSync(join(tmpdir(), "brain-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.after(() => removeDir(dir));
   return dir;
 }
 
-/** A home with Claude Code "installed" (a fake `claude` on PATH), no service manager and a file credential store. */
+/**
+ * A home with Claude Code "installed" (a fake `claude` on PATH: on Windows a command script as npm writes one, run as
+ * Node and its script), no service manager and a file credential store. The rest of this environment stays (Windows
+ * can't run much without SystemRoot and the like), but nothing of the user's own agents or 10 & 2, and no colour
+ * (`node --test` forces it at a terminal).
+ */
 function home(dir: string): NodeJS.ProcessEnv {
   const bin = join(dir, "bin");
   mkdirSync(bin, { recursive: true });
-  writeFileSync(join(bin, "claude"), "#!/bin/sh\necho 1.0\n", { mode: 0o755 });
-  return { HOME: dir, PATH: `${bin}:/usr/bin:/bin`, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), T3_CLI: join(dir, "no-t3"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1" };
+  if (WINDOWS) {
+    writeFileSync(join(bin, "claude.mjs"), "console.log('1.0');\n");
+    writeFileSync(join(bin, "claude.cmd"), `@ECHO off\r\nnode "%~dp0\\claude.mjs" %*\r\n`);
+  } else writeFileSync(join(bin, "claude"), "#!/bin/sh\necho 1.0\n", { mode: 0o755 });
+  const env = { ...process.env };
+  for (const k of Object.keys(env)) if (/^(XDG_|CLAUDE_|CODEX_|PI_|T3|OPENCODE|TENANDTWO_|OPENAI_|DRIVER_|FORCE_COLOR$)/i.test(k)) delete env[k];
+  return {
+    ...env, HOME: dir, USERPROFILE: dir, PATH: [bin, ...(WINDOWS ? [] : ["/usr/bin", "/bin"])].join(delimiter),
+    XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), T3_CLI: join(dir, "no-t3"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1",
+  };
 }
 
 function cli(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: number | null; out: string }> {
@@ -43,7 +58,7 @@ test("the brain's settings are a private file whose JSON values survive the roun
   const path = join(temp(t), "c", "brain.env");
   const vars = addMachine({ OPENAI_API_KEY: KEY, DRIVER_PORT: "8790" }, { name: "lattice", tokenSha256: "A".repeat(64), local: true });
   writeBrainEnv(vars, path);
-  assert.equal(statSync(path).mode & 0o777, 0o600);
+  assertPrivate(path);
   const back = readBrainEnv(path)!;
   assert.equal(back.OPENAI_API_KEY, KEY);
   assert.deepEqual(machines(back), [{ name: "lattice", tokenSha256: "a".repeat(64), local: true }]);
@@ -64,8 +79,8 @@ test("a brain accepts a computer once, by a name it can say and a token's hash; 
 });
 
 test("the brain's login service runs `brain run` under its own name, beside the connector's", () => {
-  const l = { node: "/usr/bin/node", script: "/opt/10and2/dist/10and2.js", path: "/usr/bin" };
-  assert.match(systemdUnit(l, BRAIN), /^ExecStart=\/usr\/bin\/node \/opt\/10and2\/dist\/10and2.js brain run$/m);
+  const l = { program: ["/usr/local/bin/10and2"], path: "/usr/bin" };
+  assert.match(systemdUnit(l, BRAIN), /^ExecStart=\/usr\/local\/bin\/10and2 brain run$/m);
   assert.match(systemdUnit(l, BRAIN), /^Description=10and2 brain/m);
   const plist = launchAgent(l, "/Users/x/Library/Logs/10and2-brain.log", BRAIN);
   assert.match(plist, /<key>Label<\/key><string>com\.selfdeprecated\.10and2\.brain<\/string>/);
@@ -78,7 +93,7 @@ test("brain setup links this computer to a brain of its own, and another compute
   const setup = await cli(["brain", "setup", "--name=desk", "--port=18799", "--yes"], env);
   assert.equal(setup.status, 0, setup.out);
   const vars = readBrainEnv(config(env, "brain.env"))!;
-  assert.equal(statSync(config(env, "brain.env")).mode & 0o777, 0o600);
+  assertPrivate(config(env, "brain.env"));
   assert.equal(vars.OPENAI_API_KEY, KEY);
   assert.equal(vars.DRIVER_PORT, "18799");
   assert.ok(vars.DRIVER_ACCESS_CODE.length >= 12);

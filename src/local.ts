@@ -1,7 +1,8 @@
 // Several work systems on this machine. T3 keeps its old ids; the others own a prefix, so adding an adapter never
 // changes existing stars or operation keys. Policy is checked here even when a caller skips the voice-side check.
 import type { Action, ActionKind, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "./contract.ts";
-import { allows, withinCeiling, type Policy } from "./policy.ts";
+import { allows, withinCeiling, type Agent, type Policy } from "./policy.ts";
+import { NAMES } from "./agents.ts";
 import type { Refusals } from "./view.ts";
 
 export type LocalAdapter = {
@@ -12,6 +13,16 @@ export type LocalAdapter = {
 };
 
 const target = (a: Action) => a.kind === "start_work" ? a.placeId : a.itemId;
+
+/**
+ * Why a start can't run on the model it names, said as "<place> said: …": Pi and OpenCode offer none through 10 & 2
+ * yet; the others offer what their place lists now (docs/launch/thread-model.md).
+ */
+export function modelRefusal(app: string): string {
+  const name = NAMES[app as Agent] ?? "That coding app";
+  if (app === "pi" || app === "opencode") return `${name} can't start on a chosen model through 10 & 2 yet.`;
+  return `${name} doesn't offer that model ${app === "t3" ? "for this project " : ""}now.`;
+}
 
 export class Local implements Adapter {
   readonly name = "local";
@@ -86,7 +97,14 @@ export class Local implements Adapter {
     if (a.kind === "start_work" && !withinCeiling(this.policy, a.profile)) return `The ${a.profile.name} profile asks for more access than this machine allows.`;
     const r = this.route(target(a));
     if (!r.e.adapter.actions.includes(a.kind)) return `This work system can't ${a.kind.replaceAll("_", " ")}.`;
-    return r.e.adapter.check?.(this.action(a, r.id)) ?? null;
+    const why = await r.e.adapter.check?.(this.action(a, r.id)) ?? null;
+    if (why) return why;
+    // A model the place doesn't list now would start on something nobody chose, or not at all: nothing is sent.
+    if (a.kind === "start_work" && a.model !== undefined) {
+      const { adapter } = r.e;
+      if (!adapter.places?.().find((p) => p.id === r.id)?.models?.some((m) => m.id === a.model)) return modelRefusal(adapter.name);
+    }
+    return null;
   }
   async execute(a: Action, key: string): Promise<Receipt> {
     const reason = await this.check(a);

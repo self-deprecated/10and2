@@ -9,6 +9,9 @@ export const CONVERSATION_VOICES = [
 /** OpenAI's text-to-speech voices; it recommends marin and cedar. */
 export const READING_VOICES = ["marin", "cedar", "alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse"] as const;
 
+/** The reading voices the Realtime engine has (models.ts `REALTIME_READER`): the rest (fable, nova, onyx) read in marin. */
+export const REALTIME_READING_VOICES: readonly string[] = ["marin", "cedar", "alloy", "ash", "ballad", "coral", "echo", "sage", "shimmer", "verse"];
+
 /**
  * What every reading voice's sample says (`GET /api/voices/sample`) by default, so voices are heard side by side: a
  * reply as the reader would read one. Ops can change it (`sampleText` in settings.ts); new words make each sample

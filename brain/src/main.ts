@@ -1,5 +1,6 @@
 // Wires the brain together: store, machine connectors, briefing, proposals, voice server,
 // and demo mode beside them (or instead of them, with DRIVER_DEMO=only).
+import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { loadConfig } from "./config.ts";
 import { Store } from "./store.ts";
@@ -62,7 +63,9 @@ const files = dirFiles(state);
 // expire even with recording turned off.
 const recordings = new Recordings(files, { days: cfg.recordingDays, maxMb: cfg.recordingsMaxMb, log });
 // Replies read aloud: their audio next to the database, and their prepared text for a month.
-const speech = new Speech(files, { synthesize: openAiSpeech(cfg.apiKey, cfg.ttsModel, (u) => spent({ op: "speech", model: cfg.ttsModel, ...u })), model: cfg.ttsModel, days: cfg.speechDays, maxMb: cfg.speechMaxMb, log });
+// The engine is DRIVER_TTS_MODEL (Lattice reads no Ops settings); the Realtime one encodes with aac.wasm.
+const reader = { openSocket: nodeSocket, aac: new WebAssembly.Module(readFileSync(new URL("./voice/aac/aac.wasm", import.meta.url))) };
+const speech = new Speech(files, { synthesize: openAiSpeech(cfg.apiKey, (u) => spent({ op: "speech", ...u }), reader), engine: () => cfg.ttsModel, days: cfg.speechDays, maxMb: cfg.speechMaxMb, log });
 // Old recordings and audio go now and every hour, whatever else the brain is doing.
 const prune = () => void Promise.all([recordings.prune(), speech.prune(), Promise.resolve().then(() => store.pruneCosts(dayOf(Date.now() - COST_DAYS * 86_400_000)))]);
 prune();

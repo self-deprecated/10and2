@@ -8,11 +8,11 @@
 // Codex has no command ids that dedupe, so every write is at most once: the operation store reserves the key first,
 // and an outcome Driver can't confirm stays unknown and is never sent again.
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
-import type { Action, Adapter, FirstAsk, ItemStatus, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import { Duplex } from "node:stream";
+import type { Action, Adapter, FirstAsk, ItemStatus, CodingModel, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, ceilingFor, RUNTIME_MODES, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy, RuntimeMode } from "../policy.ts";
 import { Store } from "../claude/store.ts";
@@ -21,14 +21,21 @@ import { goAhead } from "../claude/adapter.ts";
 import { titleFrom } from "../t3/adapter.ts";
 import { addWorktree, firstAsk, folderOf, gitRoot, group } from "../work.ts";
 import { VERSION } from "../protocol.ts";
-import { CodexRpc, ConnectionError } from "./rpc.ts";
+import { execFileCommand, spawnCommand } from "../command.ts";
+import { CodexRpc, ConnectionError, RpcError } from "./rpc.ts";
 import type { ServerRequest } from "./rpc.ts";
 
 export type Options = {
   policy: Policy;
   /** Codex's home ($CODEX_HOME, else ~/.codex). */
   codexHome?: string;
-  codexBin?: string;
+  /** How Codex is run: `codex` on PATH, or a program and its first arguments (tests). */
+  codexCommand?: string[];
+  /**
+   * How the daemon is reached: its socket (macOS, Linux), or Codex's own relay to it, `codex app-server proxy` (Windows,
+   * where the socket is a kind Node can't open).
+   */
+  transport?: "socket" | "proxy";
   /** Driver's own records for Codex: settle, snooze, archive, and every write's outcome. */
   db: string;
   /** Not used yet: Codex keeps its own state. Accepted so every adapter is set up alike. */
@@ -43,6 +50,12 @@ export type Options = {
   autoStart?: boolean;
   /** How often the thread list is read again besides the daemon's notifications (30 s). */
   refreshMs?: number;
+  /** Through the proxy: how often the connection is checked for a daemon that went away (15 s). */
+  heartbeatMs?: number;
+  /** How long connecting to Codex may take before it's given up on (10 s). */
+  connectTimeoutMs?: number;
+  /** The system, for what differs on Windows: its sandbox, and folders whatever their case (tests set it). */
+  platform?: NodeJS.Platform;
 };
 
 /** A thread as `thread/list` and `thread/read` give it: only the fields used here. */
@@ -65,8 +78,12 @@ const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whethe
 const NO_STEERING = "It's open in Codex, and this computer doesn't let 10 & 2 send to open sessions.";
 const NO_ANSWERS = "Codex is asking a question, and this computer doesn't let 10 & 2 answer them. Answer it in Codex.";
 const NOT_CONNECTED = "Codex isn't connected right now.";
+const NO_SUCH_MODEL = "Codex doesn't offer that model now.";
+/** How often Codex's models are read again besides at each connect. */
+const MODELS_MS = 3600_000;
 const REUSED = "That operation key was already used for different words or settings.";
 const REFUSED = "Codex didn't take that. Nothing was sent.";
+const NO_SANDBOX = "Codex can't edit on its own here until its Windows sandbox is set up. Set it up in Codex, then try again.";
 
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 /** A UUID made from the operation key, as the message's `clientUserMessageId`: how its turn is found again. */
@@ -164,6 +181,16 @@ export function daemonDisabled(configToml: string): boolean {
   }
   return false;
 }
+/**
+ * Whether Codex's config sets up its Windows sandbox: `sandbox = "elevated"` or `"unelevated"` under [windows] (a
+ * profile's too), or one of its older switches under [features]. Without it, Codex on Windows runs workspace-write as
+ * read-only, asking before every edit. Set anywhere counts: in a profile not in use, Codex only does what it did before.
+ */
+export function windowsSandbox(configToml: string): boolean {
+  const mode = /(?:^|[\s.{,])sandbox\s*=\s*["'](?:elevated|unelevated)["']/;
+  const legacy = /(?:^|[\s.{,])(?:experimental_windows_sandbox|elevated_windows_sandbox|enable_experimental_windows_sandbox)\s*=\s*true\b/;
+  return configToml.split("\n").some((line) => !/^\s*#/.test(line) && (mode.test(line) || legacy.test(line)));
+}
 
 export class CodexAdapter implements Adapter {
   readonly name = "codex";
@@ -173,6 +200,7 @@ export class CodexAdapter implements Adapter {
   private readonly opts: Options;
   private readonly store: Store;
   private readonly now: () => number;
+  private readonly platform: NodeJS.Platform;
   private rpc: CodexRpc | null = null;
   private loaded = false;
   private closed = false;
@@ -196,9 +224,12 @@ export class CodexAdapter implements Adapter {
   private readonly writes = new Set<Promise<unknown>>();
   private readonly stale = new Set<string>();
   private turnsTimer: NodeJS.Timeout | null = null;
+  /** What a new thread can start on (`model/list`, less hidden ones), as Codex last said. */
+  private models: CodingModel[] = [];
+  private modelsTimer: NodeJS.Timeout | null = null;
 
   constructor(opts: Options) {
-    this.opts = opts; this.now = opts.now ?? Date.now;
+    this.opts = opts; this.now = opts.now ?? Date.now; this.platform = opts.platform ?? process.platform;
     this.codexHome = resolve(opts.codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex"));
     this.socketPath = join(this.codexHome, "app-server-control", "app-server-control.sock");
     this.store = new Store(opts.db);
@@ -209,6 +240,7 @@ export class CodexAdapter implements Adapter {
     if (this.closed) throw new Error("Codex adapter is closed");
     await this.connect();
     this.refreshTimer = setInterval(() => void this.refresh(), this.opts.refreshMs ?? 30_000); this.refreshTimer.unref();
+    this.modelsTimer = setInterval(() => void this.readModels(), MODELS_MS); this.modelsTimer.unref();
   }
   get isLoaded(): boolean { return this.loaded; }
   connected(): boolean { return this.loaded && !this.closed && this.rpc !== null && !this.rpc.closed && this.opts.policy.codex; }
@@ -227,7 +259,11 @@ export class CodexAdapter implements Adapter {
     try {
       rpc = await this.open();
     } catch (e) {
-      const missing = ["ENOENT", "ECONNREFUSED"].includes((e as NodeJS.ErrnoException)?.code ?? "");
+      // Through the proxy, a socket file with no daemon behind it (on Windows it stays after a restart) ends the proxy as
+      // either a refused connection or a hang-up, whichever Node sees first: either is a daemon to start, which Codex
+      // answers cheaply ("alreadyRunning") if there is one after all.
+      const missing = ["ENOENT", "ECONNREFUSED"].includes((e as NodeJS.ErrnoException)?.code ?? "")
+        || (this.proxy && !(e instanceof RpcError) && !(e instanceof ConnectionError));
       if (missing && await this.startDaemon()) return this.attempt();
       this.opts.log(`codex: can't reach Codex (${missing ? "its daemon isn't running" : (e as Error).message}); retrying in ${this.retryMs / 1000}s`);
       this.retry();
@@ -246,16 +282,46 @@ export class CodexAdapter implements Adapter {
       this.recompute();
       this.retry();
     });
+    // Not waited for: Codex may fetch its catalog online first, and a write reconciling waits on this connect.
+    void this.readModels();
     await this.refresh();
   }
+  private get proxy() { return (this.opts.transport ?? (process.platform === "win32" ? "proxy" : "socket")) === "proxy"; }
   private open(): Promise<CodexRpc> {
-    return CodexRpc.connect(this.socketPath, {
-      clientName: "10and2", clientTitle: "10 & 2", version: VERSION,
+    // The proxy would only say it can't connect: no socket is no daemon, which starts it (attempt).
+    if (this.proxy && !existsSync(this.socketPath)) return Promise.reject(Object.assign(new Error("its daemon isn't running"), { code: "ENOENT" }));
+    return CodexRpc.connect(this.proxy ? () => this.proxied() : this.socketPath, {
+      clientName: "10and2", clientTitle: "10 & 2", version: VERSION, heartbeatMs: this.proxy ? this.opts.heartbeatMs ?? 15_000 : undefined, timeoutMs: this.opts.connectTimeoutMs,
       optOut: ["item/agentMessage/delta", "item/reasoning/textDelta", "item/reasoning/summaryTextDelta", "item/commandExecution/outputDelta",
         "item/fileChange/outputDelta", "item/plan/delta", "thread/tokenUsage/updated", "account/rateLimits/updated"],
       onNotification: (m, p) => this.onNotification(m, p),
       onRequest: (r) => this.onRequest(r),
     });
+  }
+  private get env() { return { ...process.env, CODEX_HOME: this.codexHome }; }
+  private codex(args: string[]): [string, string[]] {
+    const [bin, ...first] = this.opts.codexCommand ?? ["codex"];
+    return [bin!, [...first, ...args]];
+  }
+  /** `codex app-server proxy`, which relays its stdin and stdout to the daemon's socket, as the connection's stream. */
+  private proxied(): Duplex {
+    const child = spawnCommand(...this.codex(["app-server", "proxy"]), { stdio: ["pipe", "pipe", "pipe"], env: this.env });
+    let said = "";
+    child.stderr!.on("data", (d) => { said = (said + d).slice(-1000); });
+    // Node takes its own streams here too (its types name only web streams).
+    const stream = Duplex.from({ readable: child.stdout!, writable: child.stdin! } as any) as Duplex;
+    // What ws and http ask of a socket.
+    Object.assign(stream, { setTimeout: () => stream, setNoDelay: () => stream, setKeepAlive: () => stream });
+    const gone = (e: Error & { code?: string }) => { e.code ??= "ECONNREFUSED"; stream.destroy(e); };
+    // A connection given up on (terminated mid-handshake) ends the stream with an error nobody else waits for.
+    stream.on("error", () => {});
+    child.on("error", gone);
+    child.on("exit", (code) => gone(new Error(`Codex's proxy stopped (${code})${said.trim() ? `: ${said.trim().split("\n").at(-1)}` : ""}`)));
+    // The proxy outlives both its input ending and the daemon going away: once this side is done with it, it's stopped.
+    const stop = () => { child.stdin!.destroy(); if (child.exitCode === null) child.kill(); };
+    stream.on("finish", stop);
+    stream.on("close", stop);
+    return stream;
   }
   private retry() {
     if (this.closed || this.retryTimer) return;
@@ -273,17 +339,47 @@ export class CodexAdapter implements Adapter {
     try { config = readFileSync(join(this.codexHome, "config.toml"), "utf8"); } catch { /* none: defaults */ }
     if (daemonDisabled(config)) return false;
     this.startedDaemonAt = this.now();
-    const out = await new Promise<string>((done) => {
-      execFile(this.opts.codexBin ?? "codex", ["app-server", "daemon", "start"], { timeout: 30_000, maxBuffer: 1024 * 1024, env: { ...process.env, CODEX_HOME: this.codexHome } },
-        (err, stdout) => done(err ? "" : stdout));
+    const { out, said } = await new Promise<{ out: string; said: string }>((done) => {
+      execFileCommand(...this.codex(["app-server", "daemon", "start"]), { timeout: 30_000, maxBuffer: 1024 * 1024, env: this.env },
+        (err, stdout, stderr) => done({ out: err ? "" : stdout, said: err ? stderr || err.message : "" }));
     });
     const status = out.trim().split("\n").map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((o) => o && typeof o.status === "string")?.status;
     if (status === "started" || status === "alreadyRunning" || status === "running") { this.opts.log(`codex: started Codex's daemon (${status})`); return true; }
-    this.opts.log("codex: couldn't start Codex's daemon");
+    // Codex says why, such as Windows' "start the Windows daemon from a non-elevated terminal".
+    this.opts.log(`codex: couldn't start Codex's daemon${said.trim() ? ` (${said.trim().split("\n").at(-1)})` : ""}`);
     return false;
   }
 
   // --- Reading ----------------------------------------------------------------------------------------------------
+
+  /**
+   * The models a new thread can start on, from `model/list` (Codex's picker's: it may fetch its catalog online once),
+   * a few pages at most, less hidden ones. A failure keeps the last list; the brain is told when it changes.
+   */
+  private async readModels() {
+    const rpc = this.rpc;
+    if (!rpc || !this.opts.policy.codex) return;
+    const models: CodingModel[] = [];
+    try {
+      let cursor: string | null = null;
+      for (let page = 0; page < 5; page++) {
+        const r: any = await rpc.request("model/list", { limit: 100, ...(cursor ? { cursor } : {}) });
+        for (const m of r?.data ?? []) {
+          if (m?.hidden || typeof m?.id !== "string" || !m.id || m.id.length > 200 || m.id.trim() !== m.id || models.some((o) => o.id === m.id)) continue;
+          const name = typeof m.displayName === "string" && m.displayName.trim() ? m.displayName.trim() : m.id;
+          models.push({ id: m.id, name });
+        }
+        cursor = typeof r?.nextCursor === "string" ? r.nextCursor : null;
+        if (!cursor) break;
+      }
+    } catch (e) {
+      if (!(e instanceof ConnectionError)) this.opts.log(`codex: couldn't read Codex's models (${(e as Error).message}); new work starts on its own`);
+      return;
+    }
+    if (this.rpc !== rpc || this.closed || JSON.stringify(models) === JSON.stringify(this.models)) return;
+    this.models = models;
+    for (const l of this.listeners) l([], false);
+  }
 
   /** Reads the thread list again (and the newest turns of whatever changed). One at a time; a call meanwhile runs once more after. */
   private refresh(): Promise<void> {
@@ -440,12 +536,27 @@ export class CodexAdapter implements Adapter {
       return this.trusted.folders;
     } catch { return []; }
   }
+  /**
+   * On Windows, whether work that writes in its workspace would run read-only, asking before every edit with no one to
+   * answer: Codex's config doesn't set up its Windows sandbox. Read at each ask, as the user may have just set it up.
+   */
+  private sandboxMissing(workspaceWrite: boolean): boolean {
+    if (this.platform !== "win32" || !workspaceWrite) return false;
+    let config = "";
+    try { config = readFileSync(join(this.codexHome, "config.toml"), "utf8"); } catch { /* none: defaults */ }
+    return !windowsSandbox(config);
+  }
+  /** A project folder as a place's key: on Windows a folder is the same whatever its case (Codex lower-cases those it trusts). */
+  private placeKey(root: string) { return this.platform === "win32" ? root.toLowerCase() : root; }
   private refreshPlaces() {
     this.roots.clear();
     if (!allows(this.opts.policy, "start_work", "codex")) return;
+    // Threads' folders first, so a place is named as the user spelled it rather than as Codex's trust list keeps it.
     for (const cwd of [...[...this.rows.values()].map((r) => r.thread.cwd), ...this.trustedFolders()]) {
       const root = gitRoot(cwd);
-      if (root && visible(this.opts.policy, root) && !t3Cwd(root)) this.roots.set(hash(root).slice(0, 12), root);
+      if (!root || !visible(this.opts.policy, root) || t3Cwd(root)) continue;
+      const id = hash(this.placeKey(root)).slice(0, 12);
+      if (!this.roots.has(id)) this.roots.set(id, root);
     }
   }
   places(): Place[] {
@@ -454,7 +565,8 @@ export class CodexAdapter implements Adapter {
     const counts = new Map<string, number>();
     for (const [, root] of roots) counts.set(basename(root), (counts.get(basename(root)) ?? 0) + 1);
     return roots.map(([id, root]) => ({ id, name: basename(root) + ((counts.get(basename(root)) ?? 0) > 1 ? ` (${id})` : ""), folder: folderOf(root),
-      activeAt: [...this.rows.values()].filter((r) => gitRoot(r.thread.cwd) === root).map((r) => r.item.updatedAt).sort().at(-1) ?? null }));
+      activeAt: [...this.rows.values()].filter((r) => { const own = gitRoot(r.thread.cwd); return own !== null && this.placeKey(own) === this.placeKey(root); })
+        .map((r) => r.item.updatedAt).sort().at(-1) ?? null, models: this.models }));
   }
 
   async list(): Promise<WorkItem[]> { return [...this.rows.values()].map((r) => ({ ...r.item })); }
@@ -541,7 +653,7 @@ export class CodexAdapter implements Adapter {
         if (!now) {
           // Answered: by Driver (whose answer is then what cleared it) or in Codex.
           const h = this.held.get(id!);
-          if (h) { this.held.delete(id!); this.resolved.get(h)?.(); }
+          if (h) { this.held.delete(id!); this.resolved.get(id!)?.(); }
           if (was) void this.release(id!, "question");
         }
         this.touch(id!);
@@ -559,7 +671,7 @@ export class CodexAdapter implements Adapter {
         return;
       case "serverRequest/resolved": {
         const h = id ? this.held.get(id) : undefined;
-        if (h && h.id === p.requestId && h.rpc === this.rpc) { this.held.delete(id!); this.resolved.get(h)?.(); this.recompute(); }
+        if (h && h.id === p.requestId && h.rpc === this.rpc) { this.held.delete(id!); this.resolved.get(id!)?.(); this.recompute(); }
         return;
       }
       case "turn/completed": case "turn/started":
@@ -567,7 +679,11 @@ export class CodexAdapter implements Adapter {
         return;
     }
   }
-  private readonly resolved = new Map<Held, () => void>();
+  /**
+   * An answer waiting for Codex to say its question is resolved, by thread. By thread, not by request: a thread this
+   * connection subscribes to again has its question replayed under a new id, which replaces the one held when answered.
+   */
+  private readonly resolved = new Map<string, () => void>();
   private onRequest(r: ServerRequest) {
     const rpc = this.rpc;
     if (!rpc) return;
@@ -631,6 +747,9 @@ export class CodexAdapter implements Adapter {
       if (!this.loaded) return NOT_CONNECTED;
       if (!this.roots.has(action.placeId)) return "That project isn't visible to 10 & 2.";
       if (!withinCeiling(this.opts.policy, action.profile, "codex")) return "That launch profile exceeds this machine's permission ceiling.";
+      // Codex takes any model on thread/start and fails only when the turn runs, after it counts as started.
+      if (action.model !== undefined && !this.models.some((m) => m.id === action.model)) return NO_SUCH_MODEL;
+      if (this.sandboxMissing(SETTINGS[action.profile.runtimeMode].sandbox === "workspace-write")) return NO_SANDBOX;
       const worktrees = join(this.roots.get(action.placeId)!, ".codex", "worktrees");
       if (action.profile.workspace === "worktree" && existsSync(worktrees) && !visible(this.opts.policy, worktrees)) return "That project's worktree folder is outside 10 & 2's visible folders.";
       return this.connected() ? null : NOT_CONNECTED;
@@ -748,7 +867,10 @@ export class CodexAdapter implements Adapter {
       const status = resumed?.thread?.status?.type;
       if ((open || status === "active") && !steers(this.opts.policy, "codex")) return { ok: false, error: NO_STEERING };
       const ceiling = ceilingFor(this.opts.policy, "codex");
-      const capped = above(reachOf(resumed?.approvalPolicy, resumed?.sandbox, resumed?.approvalsReviewer), ceiling) ? turnSettings(ceiling) : {};
+      const over = above(reachOf(resumed?.approvalPolicy, resumed?.sandbox, resumed?.approvalsReviewer), ceiling);
+      const capped = over ? turnSettings(ceiling) : {};
+      // It runs with the ceiling's settings when capped, else the thread's own; nothing was sent yet.
+      if (this.sandboxMissing(over ? SETTINGS[ceiling].sandbox === "workspace-write" : resumed?.sandbox?.type === "workspaceWrite")) return { ok: false, error: NO_SANDBOX };
       // A thread in plan mode stays in it, unless the words just say to go ahead with the plan.
       const plan = resumed?.collaborationMode?.mode === "plan" && goAhead(message) && typeof resumed?.model === "string"
         ? { collaborationMode: { mode: "default", settings: { model: resumed.model, reasoning_effort: null, developer_instructions: null } } } : {};
@@ -799,9 +921,9 @@ export class CodexAdapter implements Adapter {
     const a = answersFor(held.params?.questions ?? [], words);
     if ("error" in a) return { ok: false, error: a.error };
     const done = new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => { this.resolved.delete(held); resolve(false); }, timeout);
-      this.resolved.set(held, () => { clearTimeout(timer); this.resolved.delete(held); resolve(true); });
-      held.rpc.onClose(() => { clearTimeout(timer); this.resolved.delete(held); resolve(false); });
+      const timer = setTimeout(() => { this.resolved.delete(id); resolve(false); }, timeout);
+      this.resolved.set(id, () => { clearTimeout(timer); this.resolved.delete(id); resolve(true); });
+      held.rpc.onClose(() => { clearTimeout(timer); this.resolved.delete(id); resolve(false); });
     });
     if (!held.rpc.respond(held.id, { answers: a.answers })) return { ok: false, error: NOT_CONNECTED };
     if (!await done) return { ok: false, unknown: true, error: "Codex may have had its answer already. 10 & 2 won't send it again." };
@@ -828,7 +950,8 @@ export class CodexAdapter implements Adapter {
     if (!rpc) return { ok: false, error: NOT_CONNECTED };
     let started: any;
     try {
-      started = await rpc.request("thread/start", { cwd, approvalPolicy: s.approvalPolicy, sandbox: s.sandbox, approvalsReviewer: s.approvalsReviewer, threadSource: "10and2" }, timeout);
+      // A plan follows the model the thread started on (`started.model`, below).
+      started = await rpc.request("thread/start", { cwd, approvalPolicy: s.approvalPolicy, sandbox: s.sandbox, approvalsReviewer: s.approvalsReviewer, threadSource: "10and2", ...(action.model ? { model: action.model } : {}) }, timeout);
     } catch (e) {
       if (e instanceof ConnectionError) return UNKNOWN;
       this.opts.log(`codex: thread/start refused (${(e as Error).message})`);
@@ -871,6 +994,7 @@ export class CodexAdapter implements Adapter {
     this.closed = true; this.loaded = false;
     if (this.retryTimer) clearTimeout(this.retryTimer);
     if (this.refreshTimer) clearInterval(this.refreshTimer);
+    if (this.modelsTimer) clearInterval(this.modelsTimer);
     if (this.turnsTimer) clearTimeout(this.turnsTimer);
     this.listeners.clear();
     const rpc = this.rpc; this.rpc = null;

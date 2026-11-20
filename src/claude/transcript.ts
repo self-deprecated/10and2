@@ -1,13 +1,25 @@
 import { openSync, closeSync, readSync, fstatSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve, sep } from "node:path";
+import { posix, win32 } from "node:path";
 import type { ItemStatus, PastReply } from "../contract.ts";
 import { iso, knownVersion } from "./registry.ts";
 import { limited } from "../work.ts";
 
-export function t3Cwd(cwd: string): boolean {
-  const p = resolve(cwd);
-  return p === join(homedir(), ".t3") || p.startsWith(join(homedir(), ".t3") + sep) || /[/\\]workspaces[/\\][^/\\]+[/\\]t3-[^/\\]+(?:[/\\]|$)/.test(p);
+/** Whether a folder is T3 Code's (under ~/.t3, or a T3 workspace's thread checkout); without regard to case on Windows. */
+export function t3Cwd(cwd: string, platform: NodeJS.Platform = process.platform, home = homedir()): boolean {
+  const path = platform === "win32" ? win32 : posix, key = (s: string) => platform === "win32" ? s.toLowerCase() : s;
+  const p = key(path.resolve(cwd)), t3 = key(path.join(home, ".t3"));
+  return p === t3 || p.startsWith(t3 + path.sep) || /[/\\]workspaces[/\\][^/\\]+[/\\]t3-[^/\\]+(?:[/\\]|$)/.test(p);
+}
+
+/**
+ * The folder under projects/ where Claude Code keeps a working folder's transcripts: every character but a letter or a
+ * digit made "-" (`/home/me/my_app` is `-home-me-my-app`, `C:\Users\me\proj` is `C--Users-me-proj`). Past 200
+ * characters Claude Code cuts it and adds a hash of its own, so there it's null: find the session by its id instead.
+ */
+export function projectFolder(cwd: string): string | null {
+  const name = cwd.replace(/[^a-zA-Z0-9]/g, "-");
+  return name.length > 200 ? null : name;
 }
 
 export function typedUser(r: any): string | null {
