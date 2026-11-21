@@ -6,19 +6,19 @@
 // be looked up (stat, realpath), so the policy sees it.
 import { execFile } from "node:child_process";
 import { homedir } from "node:os";
-import { basename, join, relative, isAbsolute } from "node:path";
+import { basename, posix } from "node:path";
 
-/** The folders macOS asks about, under the home folder, and the name System Settings gives each. */
+/** The folders macOS asks about, under the home folder, and the name System Settings gives each. Paths are macOS's (POSIX) wherever this runs. */
 const PROTECTED: [string, string][] = [
-  ["Desktop", "Desktop Folder"], ["Documents", "Documents Folder"], ["Downloads", "Downloads Folder"], [join("Library", "Mobile Documents"), "iCloud Drive"],
+  ["Desktop", "Desktop Folder"], ["Documents", "Documents Folder"], ["Downloads", "Downloads Folder"], ["Library/Mobile Documents", "iCloud Drive"],
 ];
 
 /** The protected folder `dir` is in, or null (and always null off macOS). */
 export function protectedFolder(dir: string, home = homedir(), platform = process.platform): { root: string; name: string } | null {
   if (platform !== "darwin") return null;
   for (const [sub, name] of PROTECTED) {
-    const root = join(home, sub), rel = relative(root, dir);
-    if (rel === "" || (rel && !rel.startsWith("..") && !isAbsolute(rel))) return { root, name };
+    const root = posix.join(home, sub), rel = posix.relative(root, dir);
+    if (rel === "" || (rel && !rel.startsWith("..") && !posix.isAbsolute(rel))) return { root, name };
   }
   return null;
 }

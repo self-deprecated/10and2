@@ -121,6 +121,8 @@ export class AcpAdapter implements Adapter {
   private rescan: NodeJS.Timeout | null = null;
   private debounce: NodeJS.Timeout | null = null;
   private modelsTimer: NodeJS.Timeout | null = null;
+  /** The agent last asked for its models: stopped at close, as it runs in the adapter's own folder. */
+  private modelsClient: AcpClient | null = null;
   private writes = new Set<Promise<Receipt>>();
   private scannedAt = 0;
   private models: CodingModel[] = [];
@@ -178,7 +180,7 @@ export class AcpAdapter implements Adapter {
     let failed = false;
     try {
       mkdirSync(dir, { recursive: true, mode: 0o700 });
-      const client = new AcpClient(this.source.command, dir, this.source.env());
+      const client = this.modelsClient = new AcpClient(this.source.command, dir, this.source.env());
       const timer = setTimeout(() => client.child.kill(), 60_000);
       try {
         await client.initialize();
@@ -192,7 +194,7 @@ export class AcpAdapter implements Adapter {
       } finally { clearTimeout(timer); client.stop(); }
     } catch (e) {
       failed = true;
-      this.opts.log(`${this.name}: couldn't read ${this.source.name}'s models (${describe(e)}); new work starts on its own`);
+      if (!this.closing) this.opts.log(`${this.name}: couldn't read ${this.source.name}'s models (${describe(e)}); new work starts on its own`);
     }
     if (this.closed || this.closing) return;
     this.modelsTimer = setTimeout(() => void this.readModels(), failed ? 5 * 60_000 : this.opts.modelsEveryMs ?? 6 * 3_600_000);
@@ -490,6 +492,7 @@ export class AcpAdapter implements Adapter {
       if (this.debounce) clearTimeout(this.debounce);
       if (this.modelsTimer) clearTimeout(this.modelsTimer);
       for (const watcher of this.watchers.values()) watcher.close(); this.watchers.clear();
+      await this.modelsClient?.kill();
       await Promise.allSettled([...this.writes]);
       this.closed = true; this.loaded = false; this.listeners.clear();
       this.store.close();

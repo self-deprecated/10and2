@@ -2,7 +2,7 @@
 // (fixtures/acp/agent.mjs) continuing and starting sessions through the detached runner, and what a launch sets.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -16,6 +16,7 @@ import { AGENT, CopilotSource, PLAN } from "../src/copilot/source.ts";
 import { copilotExtensionStatus, installCopilotExtension, MARKER, uninstallCopilotExtension, updateCopilotExtension } from "../src/copilot/extension.ts";
 import { readLive } from "../src/copilot/bridge.ts";
 import { createServer } from "node:net";
+import type { ChildProcess } from "node:child_process";
 import type { Action, LaunchProfile } from "../src/contract.ts";
 import type { Policy } from "../src/policy.ts";
 import { nodeCommand, removeDir, SLOW } from "./fixtures/platform.ts";
@@ -322,4 +323,55 @@ test("through 10 & 2's Copilot extension, an open session is sent to (steered wh
   entry({}); (policy as any).steer = false;
   assert.match(await adapter.check(follow(id, "x")) ?? "", /doesn't let 10 & 2 send to open sessions/);
   assert.equal(got.length, 3);
+});
+
+test("closing stops an agent still being asked for its models, so nothing of the adapter's runs on in its folder", async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "acp-close-")));
+  // An agent that never answers: unless closing stops it, it runs on (in the adapter's state folder) for the read's minute.
+  const command = [process.execPath, "-e", "setInterval(() => {}, 1000)"];
+  const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [home], actions: [], maxRuntimeMode: "approval-required",
+    claude: false, t3: false, codex: false, opencode: false, pi: false, copilot: true, steer: false, answer: false, limits: {}, worktreeBase: "HEAD" };
+  const adapter = new AcpAdapter({ policy, source: new CopilotSource({ dir: home, command }), db: join(home, "c.db"), stateDir: join(home, "state"), log: () => {}, readCacheMs: 0 });
+  await adapter.start();
+  const agent: ChildProcess = (adapter as any).modelsClient.child;
+  assert.ok(agent.pid);
+  await adapter.close();
+  assert.ok(agent.exitCode !== null || agent.signalCode !== null, "the agent has exited");
+  removeDir(home);
+});
+
+test("closing also stops a worker the agent's launcher started, as Gemini's does on Windows", async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "acp-close-")));
+  const pidFile = join(home, "worker.pid");
+  // A launcher that runs the agent as a process of its own, sharing its input, and writes the worker's pid.
+  const worker = `process.stdin.resume(); process.stdin.on("end", () => process.exit(0)); setInterval(() => {}, 1000);`;
+  const launcher = `const w = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(worker)}], { stdio: "inherit" }); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(w.pid)); w.on("exit", (c) => process.exit(c ?? 0));`;
+  const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [home], actions: [], maxRuntimeMode: "approval-required",
+    claude: false, t3: false, codex: false, opencode: false, pi: false, copilot: true, steer: false, answer: false, limits: {}, worktreeBase: "HEAD" };
+  const adapter = new AcpAdapter({ policy, source: new CopilotSource({ dir: home, command: [process.execPath, "-e", launcher] }), db: join(home, "c.db"), stateDir: join(home, "state"), log: () => {}, readCacheMs: 0 });
+  await adapter.start();
+  for (let i = 0; i < 100 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 50));
+  const pid = Number(readFileSync(pidFile, "utf8"));
+  await adapter.close();
+  const gone = () => { try { process.kill(pid, 0); return false; } catch { return true; } };
+  for (let i = 0; i < 40 && !gone(); i++) await new Promise((r) => setTimeout(r, 50));
+  assert.ok(gone(), "the worker has exited");
+  removeDir(home);
+});
+
+test("closing doesn't wait for good on an agent that ignores SIGTERM", { skip: process.platform === "win32" && "Windows ends a process whatever it handles" }, async () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "acp-close-")));
+  const ready = join(home, "ready");
+  const command = [process.execPath, "-e", `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(ready)}, ""); setInterval(() => {}, 1000);`];
+  const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [home], actions: [], maxRuntimeMode: "approval-required",
+    claude: false, t3: false, codex: false, opencode: false, pi: false, copilot: true, steer: false, answer: false, limits: {}, worktreeBase: "HEAD" };
+  const adapter = new AcpAdapter({ policy, source: new CopilotSource({ dir: home, command }), db: join(home, "c.db"), stateDir: join(home, "state"), log: () => {}, readCacheMs: 0 });
+  await adapter.start();
+  const agent: ChildProcess = (adapter as any).modelsClient.child;
+  for (let i = 0; i < 100 && !existsSync(ready); i++) await new Promise((r) => setTimeout(r, 50));
+  const started = Date.now();
+  await adapter.close();
+  assert.ok(Date.now() - started < 5000, `closed in ${Date.now() - started} ms`);
+  assert.equal(agent.signalCode, "SIGKILL");
+  removeDir(home);
 });

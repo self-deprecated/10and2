@@ -209,7 +209,12 @@ export class CursorAdapter implements Adapter {
     for (const path of wanted) {
       if (this.watchers.has(path)) continue;
       try {
-        const watcher = watch(path, { persistent: false }, this.schedule);
+        const watcher = watch(path, { persistent: false }, (event) => {
+          // A folder that's gone is let go, and watched again by a scan once it's back. On Windows its watcher would
+          // report it gone without end, a busy loop that keeps the process up (measured on Windows 10, Node 26).
+          if (event === "rename" && !existsSync(path)) { watcher.close(); this.watchers.delete(path); }
+          this.schedule();
+        });
         watcher.on("error", () => { watcher.close(); this.watchers.delete(path); this.schedule(); });
         this.watchers.set(path, watcher);
       } catch { /* the periodic scan covers it */ }

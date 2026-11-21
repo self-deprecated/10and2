@@ -446,7 +446,8 @@ test("on Windows: permission rules match as OpenCode's do there, without case an
 });
 
 test("on Windows the plugin serves OpenCode on 127.0.0.1 behind a token (elsewhere on a private socket), and announces it", async (t) => {
-  const root = mkdtempSync(join(tmpdir(), "driver-opencode-plugin-live-")), dir = join(root, "proj");
+  // A short name: on macOS the temporary folder alone is ~49 characters, and a socket's path must fit in 104 bytes there.
+  const root = mkdtempSync(join(tmpdir(), "oc-live-")), dir = join(root, "proj");
   const bun = fakeBun(await freePort());
   t.after(async () => { await bun.close(); removeDir(root); });
   const seen: Request[] = [];

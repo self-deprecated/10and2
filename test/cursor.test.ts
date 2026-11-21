@@ -3,7 +3,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -15,7 +15,7 @@ import { isCursor, openChats } from "../src/cursor/open.ts";
 import { chatSettings, parseModels, runArgs } from "../src/cursor/cli.ts";
 import type { Policy, RuntimeMode } from "../src/policy.ts";
 import type { Action, LaunchProfile } from "../src/contract.ts";
-import { nodeCommand, removeDir } from "./fixtures/platform.ts";
+import { nodeCommand, removeDir, SLOW, WINDOWS } from "./fixtures/platform.ts";
 
 const fake = resolve(import.meta.dirname, "fixtures", "cursor", "cursor.mjs");
 const build: LaunchProfile = { name: "Build", runtimeMode: "full-access", workspace: "root", interactionMode: "default" };
@@ -23,7 +23,6 @@ const build: LaunchProfile = { name: "Build", runtimeMode: "full-access", worksp
 function harness(t: TestContext, o: { ceiling?: RuntimeMode; open?: Set<string>; models?: boolean } = {}) {
   // Resolved: a Mac's temp folder is behind a symlink, and Cursor records the folder as the process sees it.
   const root = realpathSync(mkdtempSync(join(tmpdir(), "10and2-cursor-")));
-  t.after(() => removeDir(root));
   const config = join(root, "cursor"), project = join(root, "project"), state = join(root, "state"), log = join(root, "runs.jsonl");
   mkdirSync(project, { recursive: true });
   execFileSync("git", ["init", "-q", project]);
@@ -33,9 +32,13 @@ function harness(t: TestContext, o: { ceiling?: RuntimeMode; open?: Set<string>;
   const prior = { ...process.env };
   Object.assign(process.env, { FAKE_CURSOR_LOG: log });
   t.after(() => { for (const k of ["FAKE_CURSOR_LOG", "FAKE_CURSOR_FAIL"]) if (prior[k] === undefined) delete process.env[k]; });
+  // Every scan asks which chats are open: how many there have been.
+  let scans = 0;
   const adapter = new CursorAdapter({ policy, db: join(state, "cursor.db"), stateDir: state, log: () => {}, configDir: config, dataDir: config,
-    cursorCommand: nodeCommand(fake), readCacheMs: 0, acceptanceTimeoutMs: 10_000, openChats: () => open, readModels: o.models ?? false });
-  t.after(() => adapter.close());
+    cursorCommand: nodeCommand(fake), readCacheMs: 0, acceptanceTimeoutMs: 10_000, openChats: () => { scans++; return open; }, readModels: o.models ?? false });
+  // Closed before its folder is removed: Windows can't remove a folder while a file in it (its cursor.db) is open, and
+  // node:test runs none of a test's later after hooks once one fails.
+  t.after(async () => { await adapter.close(); removeDir(root); });
   /** A chat as Cursor leaves it: its meta.json, and its transcript's lines. */
   const chat = (lines: object[], meta: Record<string, unknown> = {}, cwd = project) => {
     const id = randomUUID(), dir = join(config, "chats", bucketOf(cwd), id);
@@ -47,17 +50,20 @@ function harness(t: TestContext, o: { ceiling?: RuntimeMode; open?: Set<string>;
     return { id, dir, path };
   };
   const runs = () => { try { return readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
-  return { root, config, project, policy, adapter, chat, open, runs };
+  return { root, config, project, policy, adapter, chat, open, runs, scans: () => scans };
 }
 const user = (text: string, at = "Saturday, Nov 21, 2026, 12:38 PM (UTC+1)") => ({ role: "user", message: { content: [{ type: "text", text: `<timestamp>${at}</timestamp>\n<user_query>\n${text}\n</user_query>` }] } });
 const assistant = (text: string, tools: string[] = []) => ({ role: "assistant", message: { content: [...(text ? [{ type: "text", text }] : []), ...tools.map((name) => ({ type: "tool_use", name, input: {} }))] } });
 const ended = (status = "success") => ({ type: "turn_ended", status });
 
 test("paths are Cursor's own: the folder's MD5 for chats, its slug for transcripts", () => {
-  assert.equal(bucketOf("/home/me/proj"), "1c76789e4940e3a34113521951d8a1ae");
-  assert.equal(bucketOf("/home/me/proj/"), bucketOf("/home/me/proj"));
+  // The MD5 of the folder as resolved: on Windows a folder has a drive (there "/home/me/proj" is the current drive's).
+  const [folder, md5] = WINDOWS ? ["C:\\home\\me\\proj", "e3e164de514d700f6d3dd135e008acb8"] : ["/home/me/proj", "1c76789e4940e3a34113521951d8a1ae"];
+  assert.equal(bucketOf(folder), md5);
+  assert.equal(bucketOf(folder + sep), bucketOf(folder));
   assert.equal(slugOf("/home/me/my.proj/x"), "home-me-my-proj-x");
-  assert.deepEqual(transcriptPaths("/c", "/home/me/proj", "abc"), ["/c/projects/home-me-proj/agent-transcripts/abc/abc.jsonl", "/c/projects/home-me-proj/agent-transcripts/abc.jsonl"]);
+  // Windows joins them with "\": the same layout.
+  assert.deepEqual(transcriptPaths("/c", "/home/me/proj", "abc").map((p) => p.replaceAll(sep, "/")), ["/c/projects/home-me-proj/agent-transcripts/abc/abc.jsonl", "/c/projects/home-me-proj/agent-transcripts/abc.jsonl"]);
   assert.equal(asked("<user_info>OS</user_info>\n<user_query>\nFix it\n</user_query>"), "Fix it");
   assert.equal(asked("Plain words"), "Plain words");
 });
@@ -206,6 +212,27 @@ test("settle, snooze and archive are kept here", async (t) => {
   assert.equal((await h.adapter.list())[0]!.settled, true);
   assert.deepEqual(await h.adapter.execute({ kind: "archive", itemId: c.id }, "t2"), { ok: true });
   assert.equal((await h.adapter.list()).length, 0);
+});
+
+test("a chats folder that's removed is let go, and watched again once it's made again", async (t) => {
+  const h = harness(t);
+  h.chat([user("Start"), assistant("Started"), ended()]);
+  await h.adapter.start();
+  const chats = join(h.config, "chats"), heard = new Set<string>();
+  h.adapter.watch((ids) => { for (const id of ids) heard.add(id); });
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms * SLOW));
+  removeDir(chats);
+  await wait(500);
+  const scans = h.scans();
+  await wait(500);
+  assert.equal(h.scans(), scans, "once it's read as gone, nothing more is read (Windows reported a removed folder without end)");
+  mkdirSync(chats);
+  await h.adapter.list();
+  // The scans its making brings have run: the new chat is heard of only if the folder itself is watched.
+  await wait(500);
+  const c = h.chat([user("Again"), assistant("Back"), ended()]);
+  for (const end = Date.now() + 5000 * SLOW; !heard.has(c.id) && Date.now() < end;) await new Promise((r) => setTimeout(r, 50));
+  assert.ok(heard.has(c.id), "a new chat there is heard of at once, not at the next periodic scan");
 });
 
 test("open chats are the ones with SQLite's WAL beside their store.db, while Cursor runs", (t) => {

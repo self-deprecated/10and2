@@ -4,7 +4,7 @@
 // prompt. The agent's own requests are answered here: a permission is never granted (the policy's rule for every agent),
 // and its file-system and terminal requests are refused, as initialize offers neither.
 import type { ChildProcess } from "node:child_process";
-import { spawnCommand } from "../command.ts";
+import { execFileCommand, spawnCommand } from "../command.ts";
 
 export class AcpError extends Error {
   readonly code: number;
@@ -138,5 +138,29 @@ export class AcpClient {
     try { this.child.stdin!.end(); } catch { /* gone */ }
     const child = this.child;
     setTimeout(() => { if (child.exitCode === null && child.signalCode === null) child.kill(); }, 2000).unref();
+  }
+  /**
+   * Ends the agent now, resolving once it has exited (on Windows, the folder it runs in can't be removed until then).
+   * Its input is closed first, which an ACP agent ends on, and so does a worker it started. On Windows its whole tree is
+   * ended (Gemini's launcher runs its worker as a process of its own); elsewhere SIGTERM, then SIGKILL after 3 s. It
+   * never waits more than 6 s, so closing can't hang on it.
+   */
+  kill(): Promise<void> {
+    const child = this.child;
+    if (!child.pid || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+    return new Promise((resolve) => {
+      let exited = false, tree = process.platform !== "win32";
+      const timers: NodeJS.Timeout[] = [];
+      const finish = () => { if (!exited || !tree) return; for (const t of timers) clearTimeout(t); resolve(); };
+      child.once("exit", () => { exited = true; finish(); });
+      try { child.stdin!.end(); } catch { /* gone */ }
+      if (process.platform === "win32") {
+        execFileCommand("taskkill", ["/pid", String(child.pid), "/T", "/F"], { timeout: 5000 }, (err) => { if (err) child.kill(); tree = true; finish(); });
+      } else {
+        child.kill();
+        timers.push(setTimeout(() => { try { child.kill("SIGKILL"); } catch { /* gone */ } }, 3000));
+      }
+      timers.push(setTimeout(() => { exited = tree = true; finish(); }, 6000));
+    });
   }
 }
