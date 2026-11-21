@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer, type IncomingMessage } from "node:http";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -185,7 +185,8 @@ test("login services run what they're given with setup's PATH, and don't restart
 
 // macOS's and Linux's login services; Windows' entry runs `10and2` from the PATH at sign-in instead (service.ts runEntry).
 test("a login service runs the 10and2 on PATH when it's this install, by the path PATH names (npm, Nix), else this node and script", { skip: WINDOWS && "macOS's and Linux's login services" }, (t) => {
-  const root = mkdtempSync(join(tmpdir(), "launch-"));
+  // Resolved: macOS's temporary folder is a link (/var to /private/var), and launchFor names resolved paths.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "launch-")));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const file = (p: string) => { mkdirSync(join(p, ".."), { recursive: true }); writeFileSync(p, "#!/usr/bin/env node\n"); chmodSync(p, 0o755); return p; };
   // npm: <prefix>/bin/10and2 links to the package's bin/10and2.js; the script is that link as run.
@@ -229,7 +230,7 @@ test("login services get setup's agent folders, Node's certificates and proxy, n
 });
 
 test("fnm's per-terminal folder is written as fnm's default alias, Volta's shim is kept, and npx's copy is temporary", { skip: WINDOWS && "macOS's and Linux's login services" }, (t) => {
-  const root = mkdtempSync(join(tmpdir(), "managers-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "managers-")));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const file = (p: string) => { mkdirSync(join(p, ".."), { recursive: true }); writeFileSync(p, "#!/usr/bin/env node\n"); chmodSync(p, 0o755); return p; };
   // fnm: /run/user/…/fnm_multishells/<pid>/ links to one Node's installation; aliases/default links to the same one.
@@ -262,7 +263,7 @@ test("fnm's per-terminal folder is written as fnm's default alias, Volta's shim 
   assert.match(new Service({ platform: "linux", env: {} }).unavailable(viaNpx) ?? "", /npm i -g 10and2/);
 });
 
-test("on Linux, lingering is turned on for a login with no desktop, said when refused, and turned off again with the last service", async (t) => {
+test("on Linux, lingering is turned on for a login with no desktop, said when refused, and turned off again with the last service", { skip: WINDOWS && "a systemctl found on a Unix PATH" }, async (t) => {
   const home = mkdtempSync(join(tmpdir(), "linger-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const bin = join(home, "bin");
