@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
 import { Credentials, parseCredential, powershellArgs, type Runner } from "../src/credential.ts";
 import { Expired, linkUrl, originOf, pair } from "../src/pair.ts";
-import { launchAgent, launchFor, Service, systemdUnit } from "../src/service.ts";
+import { carried, launchAgent, launchFor, NO_SYSTEMD, Service, systemdUnit, temporary } from "../src/service.ts";
 import { assertPrivate, removeDir, WINDOWS } from "./fixtures/platform.ts";
 
 const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
@@ -193,18 +193,118 @@ test("a login service runs the 10and2 on PATH when it's this install, by the pat
   file(join(prefix, "lib/node_modules/10and2/bin/10and2.js"));
   mkdirSync(join(prefix, "bin"));
   symlinkSync("../lib/node_modules/10and2/bin/10and2.js", join(prefix, "bin/10and2"));
-  assert.deepEqual(launchFor(join(prefix, "bin/10and2"), "/nix/store/x-node/bin/node", `/nowhere:${join(prefix, "bin")}`),
-    { program: [join(prefix, "bin/10and2")], path: `/nowhere:${join(prefix, "bin")}` });
+  assert.deepEqual(launchFor(join(prefix, "bin/10and2"), "/nix/store/x-node/bin/node", { PATH: `/nowhere:${join(prefix, "bin")}` }),
+    { program: [join(prefix, "bin/10and2")], path: `/nowhere:${join(prefix, "bin")}`, env: {}, left: [] });
   // Nix: the profile's bin/10and2 links to <out>/bin/10and2, a wrapper running <out>/lib/10and2/dist/10and2.js.
   const out = join(root, "store/abc-10and2-0.10.1");
   file(join(out, "bin/10and2"));
   const bundle = file(join(out, "lib/10and2/dist/10and2.js"));
   mkdirSync(join(root, "profile/bin"), { recursive: true });
   symlinkSync(join(out, "bin/10and2"), join(root, "profile/bin/10and2"));
-  assert.deepEqual(launchFor(bundle, "/x/node", join(root, "profile/bin")).program, [join(root, "profile/bin/10and2")]);
+  assert.deepEqual(launchFor(bundle, "/x/node", { PATH: join(root, "profile/bin") }).program, [join(root, "profile/bin/10and2")]);
   // Another install's 10and2 on PATH, or none: this node and this script, resolved.
-  assert.deepEqual(launchFor(bundle, "/x/node", join(prefix, "bin")).program, ["/x/node", bundle]);
-  assert.deepEqual(launchFor(join(prefix, "bin/10and2"), "/x/node", "/nowhere").program, ["/x/node", join(prefix, "lib/node_modules/10and2/bin/10and2.js")]);
+  assert.deepEqual(launchFor(bundle, "/x/node", { PATH: join(prefix, "bin") }).program, ["/x/node", bundle]);
+  assert.deepEqual(launchFor(join(prefix, "bin/10and2"), "/x/node", { PATH: "/nowhere" }).program, ["/x/node", join(prefix, "lib/node_modules/10and2/bin/10and2.js")]);
+});
+
+test("login services get setup's agent folders, Node's certificates and proxy, never a proxy password", () => {
+  const env = {
+    PATH: "/usr/bin", CLAUDE_CONFIG_DIR: "/home/u/work-claude", CODEX_HOME: "/home/u/.codex-work", XDG_STATE_HOME: "/home/u/state",
+    NODE_EXTRA_CA_CERTS: "/etc/corp/ca.pem", HTTPS_PROXY: "http://proxy.corp:3128", NO_PROXY: "localhost,.corp", http_proxy: "http://jane:s3cret@proxy.corp:3128",
+    OPENAI_API_KEY: "sk-nope", TENANDTWO_TOKEN: "nope", HOME: "/home/u", T3CODE_HOME: "~/t3 100%",
+  };
+  const { env: vars, left } = carried(env);
+  assert.deepEqual(left, ["http_proxy"]);
+  assert.deepEqual(Object.keys(vars).sort(), ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "HTTPS_PROXY", "NODE_EXTRA_CA_CERTS", "NO_PROXY", "T3CODE_HOME", "XDG_STATE_HOME"]);
+  const l = { program: ["/usr/bin/10and2"], path: "/usr/bin", env: vars };
+  const unit = systemdUnit(l);
+  assert.match(unit, /^Environment=CLAUDE_CONFIG_DIR=\/home\/u\/work-claude$/m);
+  assert.match(unit, /^Environment=HTTPS_PROXY=http:\/\/proxy.corp:3128$/m);
+  assert.match(unit, /^Environment="T3CODE_HOME=~\/t3 100%%"$/m, "systemd's specifiers escaped");
+  assert.doesNotMatch(unit, /sk-nope|s3cret|TENANDTWO_TOKEN/);
+  const plist = launchAgent(l, "/l");
+  assert.match(plist, /<key>NODE_EXTRA_CA_CERTS<\/key><string>\/etc\/corp\/ca.pem<\/string>/);
+  assert.match(plist, /<key>PATH<\/key><string>\/usr\/bin<\/string>/);
+  assert.doesNotMatch(plist, /sk-nope|s3cret/);
+});
+
+test("fnm's per-terminal folder is written as fnm's default alias, Volta's shim is kept, and npx's copy is temporary", { skip: WINDOWS && "macOS's and Linux's login services" }, (t) => {
+  const root = mkdtempSync(join(tmpdir(), "managers-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const file = (p: string) => { mkdirSync(join(p, ".."), { recursive: true }); writeFileSync(p, "#!/usr/bin/env node\n"); chmodSync(p, 0o755); return p; };
+  // fnm: /run/user/…/fnm_multishells/<pid>/ links to one Node's installation; aliases/default links to the same one.
+  const fnm = join(root, "fnm"), install = join(fnm, "node-versions/v24.1.0/installation");
+  const script = file(join(install, "lib/node_modules/10and2/bin/10and2.js"));
+  mkdirSync(join(install, "bin"), { recursive: true });
+  symlinkSync("../lib/node_modules/10and2/bin/10and2.js", join(install, "bin/10and2"));
+  mkdirSync(join(root, "run/fnm_multishells"), { recursive: true });
+  const shell = join(root, "run/fnm_multishells/123_456");
+  symlinkSync(install, shell);
+  mkdirSync(join(fnm, "aliases"), { recursive: true });
+  symlinkSync(install, join(fnm, "aliases/default"));
+  const l = launchFor(join(shell, "bin/10and2"), join(shell, "bin/node"), { PATH: `${join(shell, "bin")}:/usr/bin`, FNM_DIR: fnm });
+  assert.deepEqual(l.program, [join(fnm, "aliases/default/bin/10and2")]);
+  assert.equal(l.path, `${join(fnm, "aliases/default/bin")}:/usr/bin`);
+  assert.equal(l.env?.FNM_DIR, undefined, "FNM_DIR isn't carried: nothing in the service reads it");
+  // Without the alias (another default), that Node's own folder, which outlives the terminal.
+  assert.deepEqual(launchFor(script, "/x/node", { PATH: join(shell, "bin") }).program, [join(install, "bin/10and2")]);
+  // Volta: ~/.volta/bin/10and2 links to volta-shim, which runs the package Volta keeps under tools/image/packages.
+  const volta = join(root, ".volta");
+  file(join(volta, "bin/volta-shim"));
+  symlinkSync("volta-shim", join(volta, "bin/10and2"));
+  const voltaScript = file(join(volta, "tools/image/packages/10and2/lib/node_modules/10and2/bin/10and2.js"));
+  assert.deepEqual(launchFor(voltaScript, join(volta, "tools/image/node/24.1.0/bin/node"), { PATH: join(volta, "bin") }).program, [join(volta, "bin/10and2")]);
+  // npx: its cache isn't somewhere a login service can rely on.
+  const npx = file(join(root, ".npm/_npx/8a1f/node_modules/10and2/bin/10and2.js"));
+  const viaNpx = launchFor(npx, "/usr/bin/node", { PATH: `${join(root, ".npm/_npx/8a1f/node_modules/.bin")}:/usr/bin` });
+  assert.equal(temporary(viaNpx), true);
+  assert.equal(viaNpx.path, "/usr/bin");
+  assert.match(new Service({ platform: "linux", env: {} }).unavailable(viaNpx) ?? "", /npm i -g 10and2/);
+});
+
+test("on Linux, lingering is turned on for a login with no desktop, said when refused, and turned off again with the last service", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "linger-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const bin = join(home, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "systemctl"), "");
+  chmodSync(join(bin, "systemctl"), 0o755);
+  const calls: string[] = [];
+  let linger = "no", allowed = true;
+  const runner: Runner = async (command, args) => {
+    calls.push(`${command} ${args.join(" ")}`);
+    if (command === "loginctl" && args[0] === "show-user") return `${linger}\n`;
+    if (command === "loginctl" && args[0] === "enable-linger") { if (!allowed) return null; linger = "yes"; return ""; }
+    if (command === "loginctl" && args[0] === "disable-linger") { linger = "no"; return ""; }
+    if (args.includes("is-active")) return "active\n";
+    return "";
+  };
+  const env = { PATH: bin, XDG_CONFIG_HOME: join(home, ".config"), XDG_STATE_HOME: join(home, "state"), XDG_RUNTIME_DIR: "/run/user/1", SSH_CONNECTION: "1 2 3 4", TENANDTWO_SYSTEMD_DIR: home };
+  const l = { program: ["/usr/bin/10and2"], path: "/usr/bin" };
+  const s = await new Service({ platform: "linux", home, env, runner, sleep: async () => {} }).install(l);
+  assert.match(s.note ?? "", /Keeps running after you log out/);
+  assert.equal(linger, "yes");
+  // Already on: nothing said, nothing changed.
+  assert.equal((await new Service({ platform: "linux", home, env, runner, sleep: async () => {} }).install(l)).note, undefined);
+  // The brain's service is still there: lingering stays on until it goes too.
+  writeFileSync(join(home, ".config/systemd/user/10and2-brain.service"), "");
+  await new Service({ platform: "linux", home, env, runner, sleep: async () => {} }).uninstall();
+  assert.equal(linger, "yes");
+  rmSync(join(home, ".config/systemd/user/10and2-brain.service"));
+  await new Service({ platform: "linux", home, env, runner, sleep: async () => {} }).uninstall();
+  assert.equal(linger, "no");
+  // Refused: what to run.
+  allowed = false;
+  const refused = await new Service({ platform: "linux", home, env, runner, sleep: async () => {} }).install(l);
+  assert.match(refused.note ?? "", /sudo loginctl enable-linger \S+/);
+  // With a desktop it's left alone, as a LaunchAgent stops at logout too.
+  calls.length = 0;
+  await new Service({ platform: "linux", home, env: { ...env, SSH_CONNECTION: undefined, WAYLAND_DISPLAY: "wayland-0" }, runner, sleep: async () => {} }).install(l);
+  assert.ok(!calls.some((c) => c.startsWith("loginctl")));
+  // No systemd: said before anything is written, with what to do instead.
+  const none = new Service({ platform: "linux", home, env: { ...env, TENANDTWO_SYSTEMD_DIR: join(home, "nowhere") }, runner });
+  assert.equal(none.unavailable(l), NO_SYSTEMD);
+  await assert.rejects(none.install(l), /doesn't run systemd/);
 });
 
 test("a login service whose program is gone is stale (systemd and launchd), and one whose program is there isn't", (t) => {
@@ -377,4 +477,31 @@ test("run refuses with 78 when the machine isn't paired, or its credentials file
   assert.equal(open.status, 78);
   assert.match(open.out, /mode 0600/);
   assert.ok(!open.out.includes("private-token"));
+});
+
+test("uninstall removes everything 10and2 added, and leaves what isn't its own", async (t) => {
+  const dir = temp(t, "uninstall-");
+  const claude = join(dir, "claude"), pi = join(dir, "pi");
+  const env = testEnv(dir, { PATH: join(dir, "nonexistent"), XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: claude, PI_CODING_AGENT_DIR: pi, TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1", TENANDTWO_COMMAND: "10and2" });
+  mkdirSync(claude, { recursive: true });
+  // The user's own hook, beside 10and2's, stays.
+  writeFileSync(join(claude, "settings.json"), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "say done" }] }] } }));
+  for (const args of [["hooks", "install"], ["pi", "install"], ["opencode", "install"]]) assert.equal((await cli(args, env)).status, 0, args.join(" "));
+  mkdirSync(join(dir, "config", "10and2"), { recursive: true });
+  writeFileSync(join(dir, "config", "10and2", "connector.json"), JSON.stringify({ brain: "wss://127.0.0.1:1/connector", projects: "*" }));
+  mkdirSync(join(dir, "state", "10and2"), { recursive: true });
+  const run = await cli(["uninstall", "--yes"], env);
+  assert.equal(run.status, 0, run.out);
+  assert.match(run.out, /Removed its Claude Code hooks[\s\S]*Removed its Pi extension[\s\S]*Removed its OpenCode plugin[\s\S]*Deleted its settings and files[\s\S]*npm uninstall -g 10and2/);
+  const settings = readFileSync(join(claude, "settings.json"), "utf8");
+  assert.doesNotMatch(settings, /10and2-hook/);
+  assert.match(settings, /say done/);
+  assert.equal(existsSync(join(pi, "extensions", "10and2.ts")), false);
+  assert.equal(existsSync(join(dir, "config", "opencode", "plugins", "10and2.js")), false);
+  assert.equal(existsSync(join(dir, "config", "10and2")), false);
+  assert.equal(existsSync(join(dir, "state", "10and2")), false);
+  // Again, there's nothing left to remove, and it says only how to remove the program.
+  const again = await cli(["uninstall", "--yes"], env);
+  assert.equal(again.status, 0);
+  assert.doesNotMatch(again.out, /Removed/);
 });

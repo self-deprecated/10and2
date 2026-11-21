@@ -3,32 +3,97 @@
 // A revoked or replaced connector exits so that none of them restarts it, and a crash is restarted.
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
-import { delimiter, dirname, join, sep, win32 } from "node:path";
+import { basename, delimiter, dirname, join, sep, win32 } from "node:path";
 import { pidState, type ImageOf } from "./claude/registry.ts";
 import { envVar, spawnCommand, which } from "./command.ts";
 import { run, type Runner } from "./credential.ts";
+import { stateDirectory } from "./paths.ts";
 import { ask, controlPipe, HIDDEN, logFile, loginFile, readLogin, saveLogin, withPath } from "./supervisor.ts";
 
 export const LABEL = "com.selfdeprecated.10and2";
-/** What the service runs (before the job's own arguments), and the PATH setup saw, so `t3` and `claude` are found. */
-export type Launch = { program: string[]; path: string };
+/**
+ * What the service runs (before the job's own arguments), the PATH setup saw, so `t3` and `claude` are found, and the
+ * rest of setup's environment it needs (CARRIED).
+ */
+export type Launch = { program: string[]; path: string; env?: Record<string, string>; left?: string[] };
+
+/**
+ * What a login service is given of setup's environment besides PATH: where the agents and 10and2 keep their files, the
+ * Node version manager's home, and how Node reaches the internet (a company's certificates and proxy). A login service
+ * starts with almost none of the user's own, so without these it would read other folders than setup did (Volta's shim
+ * needs its home when it isn't ~/.volta). Never a key or a token: a proxy address with a password in it is left out
+ * (`left`), and said.
+ */
+export const CARRIED = [
+  "CLAUDE_CONFIG_DIR", "CODEX_HOME", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "T3CODE_HOME", "T3_CLI", "OPENCODE_DB", "TENANDTWO_OPENCODE_DIR",
+  "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "TENANDTWO_COMMAND", "TENANDTWO_CREDENTIAL_STORE",
+  "VOLTA_HOME",
+  "NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA", "NODE_USE_ENV_PROXY", "SSL_CERT_FILE", "SSL_CERT_DIR",
+  "HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy",
+] as const;
+const PROXY = /^(https?|no)_proxy$/i;
+
+/** The CARRIED variables `env` has, and the names of those left out because they hold a password. */
+export function carried(env: NodeJS.ProcessEnv): { env: Record<string, string>; left: string[] } {
+  const out: Record<string, string> = {}, left: string[] = [];
+  for (const name of CARRIED) {
+    const value = env[name];
+    if (!value || /[\0\r\n]/.test(value)) continue;
+    if (PROXY.test(name) && /^[a-z][\w+.-]*:\/\/[^/@]*@/i.test(value)) { left.push(name); continue; }
+    out[name] = value;
+  }
+  return { env: out, left };
+}
+
+const realPath = (p: string) => { try { return realpathSync(p); } catch { return null; } };
+// Folders a command is on PATH from only for now: npx's, a package's own scripts', fnm's per-terminal one.
+const TEMPORARY = /[\\/](_npx|fnm_multishells)[\\/]|[\\/]node_modules[\\/]\.bin[\\/]/i;
+/**
+ * A folder on PATH only for now, as the folder it stands for when that one lasts. fnm's per-terminal folder
+ * (/run/user/…/fnm_multishells/…, gone at logout) is a link to one Node's: fnm's default alias when that's the same
+ * Node, since it follows `fnm default` through upgrades, else that Node's own folder. Null for npx's, which doesn't last.
+ */
+function lastingDir(dir: string, env: NodeJS.ProcessEnv): string | null {
+  if (!TEMPORARY.test(`${dir}${sep}`)) return dir;
+  const real = realPath(dir);
+  if (!real || TEMPORARY.test(`${real}${sep}`)) return null;
+  const alias = env.FNM_DIR && join(env.FNM_DIR, "aliases", "default", "bin");
+  return alias && realPath(alias) === real ? alias : real;
+}
+/** Volta's shim for a package Volta installed (~/.volta/bin/10and2 links to volta-shim), which finds this install. */
+const voltaShim = (found: string, target: string, self: string) =>
+  basename(target).startsWith("volta-shim") && /[\\/]tools[\\/]image[\\/]packages[\\/]10and2[\\/]/.test(self) && dirname(found) === dirname(target);
 
 /**
  * How a login service starts this install: the `10and2` on PATH, as PATH names it, when it's this same install. That
- * path outlives upgrades (Nix's ~/.nix-profile/bin/10and2, Homebrew's /opt/homebrew/bin/10and2), and it finds its own
- * Node. Otherwise (a checkout run with node) this Node and this script. Resolved paths name one version's files: on
- * 20 November Quartz's LaunchAgent had restarted 57,443 times against a Nix store path garbage-collected away.
+ * path outlives upgrades (Nix's ~/.nix-profile/bin/10and2, Homebrew's /opt/homebrew/bin/10and2, Volta's and pnpm's
+ * shims), and it finds its own Node. Otherwise (a checkout run with node) this Node and this script. Resolved paths name
+ * one version's files: on 20 November Quartz's LaunchAgent had restarted 57,443 times against a Nix store path
+ * garbage-collected away. Folders on PATH only for this terminal (fnm's) are written as the folders they stand for.
  */
-export function launchFor(script: string, node: string, path: string, which = onPath): Launch {
-  const real = (p: string) => { try { return realpathSync(p); } catch { return null; } };
-  const self = real(script);
-  const found = which("10and2", path);
-  const target = found && real(found);
+export function launchFor(script: string, node: string, env: NodeJS.ProcessEnv, which = onPath): Launch {
+  const path = (env.PATH ?? "/usr/bin:/bin").split(delimiter).map((d) => d && lastingDir(d, env)).filter((d): d is string => !!d).join(delimiter);
+  const { env: vars, left } = carried(env);
+  // Node before 24.14 uses a proxy for fetch only when told to at start (net.ts).
+  if (Object.keys(vars).some((k) => /^https?_proxy$/i.test(k))) vars.NODE_USE_ENV_PROXY ??= "1";
+  const self = realPath(script);
+  const onPathNow = which("10and2", env.PATH ?? "");
+  const found = onPathNow && (TEMPORARY.test(onPathNow) ? (() => { const dir = lastingDir(dirname(onPathNow), env); return dir && join(dir, "10and2"); })() : onPathNow);
+  const target = found && realPath(found);
   // npm: <prefix>/bin/10and2 -> …/node_modules/10and2/bin/10and2.js; Nix: …/bin/10and2 -> <out>/bin/10and2, beside
-  // <out>/lib/10and2/dist/10and2.js. Either way the package's root is two folders up from what PATH's resolves to.
-  if (found && self && target && self.startsWith(dirname(dirname(target)) + sep)) return { program: [found], path };
-  return { program: [node, self ?? script], path };
+  // <out>/lib/10and2/dist/10and2.js; pnpm: $PNPM_HOME/10and2, a script running $PNPM_HOME/global/…/10and2. Each time
+  // the package's root is two folders up from what PATH's resolves to.
+  if (found && self && target && (self.startsWith(dirname(dirname(target)) + sep) || voltaShim(found, target, self))) return { program: [found], path, env: vars, left };
+  return { program: [node, self ?? script], path, env: vars, left };
 }
+
+/**
+ * Whether a launch runs a copy that's only here for now (npx's cache), which a login service can't rely on: npm
+ * replaces or clears it.
+ */
+export const temporary = (l: Launch) => l.program.some((p) => TEMPORARY.test(p));
+/** Whether a launch is a checkout run with node (not an installed package), whose service is never rewritten for it. */
+export const checkout = (l: Launch) => l.program.length > 1 && !/[\\/]node_modules[\\/]10and2[\\/]/.test(l.program[1]!);
 
 /** The first executable `name` in `path`, as named there (not resolved). */
 export function onPath(name: string, path: string): string | null {
@@ -55,6 +120,10 @@ export const BRAIN: Job = {
   args: ["brain", "run"], launchdArgs: ["brain", "run"],
 };
 
+/** Linux without systemd (a container, WSL without it, Alpine, Devuan): nothing to start it at login. */
+export const NO_SYSTEMD = "This computer doesn't run systemd, so 10and2 can't start at login by itself. Keep 10and2 run going another way: a tmux or screen session, your init system's service, or cron's @reboot (10and2's README, under Starting at login).";
+const NO_USER_SYSTEMD = "systemd has no user session for this login, so 10and2 can't start at login (systemctl --user failed).";
+
 const xml = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 const systemdQuote = (s: string) => /^[\w@%+=:,./-]+$/.test(s) ? s : `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 
@@ -66,7 +135,7 @@ Wants=network-online.target
 
 [Service]
 ExecStart=${[...l.program, ...job.args].map(systemdQuote).join(" ")}
-Environment=${systemdQuote(`PATH=${l.path}`)}
+${[["PATH", l.path], ...Object.entries(l.env ?? {})].map(([k, v]) => `Environment=${systemdQuote(`${k}=${v.replace(/%/g, "%%")}`)}`).join("\n")}
 Restart=on-failure
 RestartSec=5
 # 78: revoked, replaced by another copy, or a brain this version can't talk to. Restarting wouldn't help.
@@ -92,7 +161,9 @@ export function launchAgent(l: Launch, logs: string, job = CONNECTOR): string {
 ${[...l.program, ...job.launchdArgs].map((a) => `    <string>${xml(a)}</string>`).join("\n")}
   </array>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>${xml(l.path)}</string></dict>
+  <dict>
+${[["PATH", l.path], ...Object.entries(l.env ?? {})].map(([k, v]) => `    <key>${xml(k)}</key><string>${xml(v)}</string>`).join("\n")}
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>10</integer>
@@ -114,8 +185,6 @@ const commandName = (env: NodeJS.ProcessEnv) => env.TENANDTWO_COMMAND || "10and2
 const systemRoot = (env: NodeJS.ProcessEnv) => envVar(env, "SystemRoot") || "C:\\Windows";
 // A word cmd.exe passes on as it is.
 const PLAIN = /^[\w@+=:,./\\-]+$/;
-// Folders a command is on PATH from only for now: npx's, a package's own scripts', fnm's per-terminal one.
-const TEMPORARY = /[\\/](_npx|fnm_multishells)[\\/]|[\\/]node_modules[\\/]\.bin[\\/]/i;
 /** A Windows PATH without the folders that are on it only for now, which a login won't have. */
 const lasting = (path: string) => path.split(";").filter((dir) => !TEMPORARY.test(`${dir}\\`)).join(";");
 
@@ -136,7 +205,7 @@ export function runEntry(job: Job, env: NodeJS.ProcessEnv): string {
  * `elevated`: set up on Windows from a terminal run as administrator, so it wasn't started now (everything it started
  * would run as administrator until sign-out, beyond an ordinary terminal's reach); it starts at the next sign-in.
  */
-export type ServiceState = { installed: boolean; running: boolean; where: string; logs: string; elevated?: true };
+export type ServiceState = { installed: boolean; running: boolean; where: string; logs: string; elevated?: true; note?: string };
 
 /**
  * Whether the connector status.json names (with its `startedAt`) is still running. On Windows a pid is soon another
@@ -212,9 +281,45 @@ export class Service {
    * installed there for good (npm i -g), not just for now (npx).
    */
   unavailable(l: Launch): string | null {
+    if (this.platform === "linux") {
+      if (temporary(l)) return "To start at login, 10and2 needs to be installed: npm i -g 10and2";
+      if (!this.systemd()) return NO_SYSTEMD;
+      return null;
+    }
     if (this.platform !== "win32") return null;
     const found = which(commandName(this.env), withPath(this.env, lasting(l.path)), "win32");
     return found && !TEMPORARY.test(found) ? null : "To start at login, 10and2 needs to be installed: npm i -g 10and2";
+  }
+
+  /** Whether this Linux was started by systemd, with its `systemctl` on PATH. */
+  private systemd(): boolean {
+    return (this.env.TENANDTWO_SYSTEMD_DIR ? existsSync(this.env.TENANDTWO_SYSTEMD_DIR) : existsSync("/run/systemd/system")) && which("systemctl", this.env) !== null;
+  }
+  /** No desktop session: logged in over SSH, or on a console. A user service there stops at logout unless it lingers. */
+  private get headless() { return !!(this.env.SSH_CONNECTION || this.env.SSH_TTY) || !(this.env.DISPLAY || this.env.WAYLAND_DISPLAY); }
+  /** Where it's noted that 10and2 turned on lingering, so turning its services off turns it off again. */
+  private get lingerMark() { return join(stateDirectory(this.env), "linger"); }
+
+  /**
+   * With no desktop session, systemd stops a user's services when they log out, and starts them only when they log in
+   * again: lingering keeps them running, and starts them at boot. Turned on when it's off (the user may turn it on for
+   * their own account on most systems); what to run when that's refused. Null when there's nothing to say.
+   */
+  private async linger(): Promise<string | null> {
+    if (!this.headless) return null;
+    const user = userInfo().username;
+    if ((await this.runner("loginctl", ["show-user", user, "--property=Linger", "--value"]))?.trim() === "yes") return null;
+    if (await this.runner("loginctl", ["enable-linger", user]) !== null) {
+      try { mkdirSync(dirname(this.lingerMark), { recursive: true, mode: 0o700 }); writeFileSync(this.lingerMark, `${user}\n`, { mode: 0o600 }); } catch { /* it's only for turning it off */ }
+      return "Keeps running after you log out, and starts when the computer does (systemd lingering is on for your account)";
+    }
+    return `It stops when you log out, and starts when you next log in. To keep it running, run once: sudo loginctl enable-linger ${user}`;
+  }
+  /** Lingering off again when 10and2 turned it on and none of its services is left. */
+  private async unlinger() {
+    if (!existsSync(this.lingerMark) || [CONNECTOR, BRAIN].some((j) => existsSync(join(dirname(this.unit), j.unit)))) return;
+    await this.runner("loginctl", ["disable-linger", userInfo().username]);
+    rmSync(this.lingerMark, { force: true });
   }
 
   /** Whether this runs as administrator on Windows: a High or System mandatory label among its groups. */
@@ -239,7 +344,7 @@ export class Service {
 
   /** Writes the service and starts it now (on Windows, unless this runs as administrator). Throws with what went wrong. */
   async install(l: Launch): Promise<ServiceState> {
-    let elevated = false;
+    let elevated = false, note: string | null = null;
     if (this.platform === "darwin") {
       mkdirSync(join(this.home, "Library", "LaunchAgents"), { recursive: true });
       mkdirSync(join(this.home, "Library", "Logs"), { recursive: true });
@@ -248,11 +353,17 @@ export class Service {
       const loaded = await this.until(async () => await this.runner("launchctl", ["bootstrap", this.domain, this.plist]) !== null, 5000);
       if (!loaded) throw new Error("launchctl couldn't load the LaunchAgent");
     } else if (this.platform === "linux") {
+      const why = this.unavailable(l);
+      if (why) throw new Error(why);
       mkdirSync(join(this.unit, ".."), { recursive: true });
       writeFileSync(this.unit, systemdUnit(l, this.job), { mode: 0o644 });
-      if (await this.runner("systemctl", ["--user", "daemon-reload"]) === null) throw new Error("systemctl --user isn't available (no systemd user session?)");
+      if (await this.runner("systemctl", ["--user", "daemon-reload"]) === null) {
+        rmSync(this.unit, { force: true });
+        throw new Error(this.env.XDG_RUNTIME_DIR ? NO_USER_SYSTEMD : `${NO_USER_SYSTEMD} This login has no XDG_RUNTIME_DIR: log in as yourself (ssh or the desktop) rather than through su or sudo.`);
+      }
       if (await this.runner("systemctl", ["--user", "enable", "--now", this.job.unit]) === null) throw new Error(`systemctl --user couldn't start ${this.job.unit}`);
       await this.runner("systemctl", ["--user", "restart", this.job.unit]);
+      note = await this.linger();
     } else if (this.platform === "win32") {
       const why = this.unavailable(l);
       if (why) throw new Error(why);
@@ -275,7 +386,8 @@ export class Service {
     let state = await this.state();
     if (elevated) return { ...state, elevated };
     await this.until(async () => (state = await this.state()).running);
-    return state;
+    if (l.left?.length && this.platform !== "win32") note = [note, `${l.left.join(" and ")} ${l.left.length > 1 ? "have" : "has"} a password in it, which isn't written where it starts at login, so it connects without that proxy.`].filter(Boolean).join("\n");
+    return note ? { ...state, note } : state;
   }
 
   async uninstall(): Promise<void> {
@@ -286,6 +398,7 @@ export class Service {
       await this.runner("systemctl", ["--user", "disable", "--now", this.job.unit]);
       rmSync(this.unit, { force: true });
       await this.runner("systemctl", ["--user", "daemon-reload"]);
+      await this.unlinger();
     } else if (this.platform === "win32") {
       await this.stopSupervisor();
       await this.runner(this.reg, ["delete", RUN_KEY, "/v", this.value, "/f"]);

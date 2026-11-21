@@ -362,8 +362,8 @@ test("on Windows, starting at login is refused, before anything is written, when
   assert.equal(w.service().unavailable(both), null);
   await w.service().install(both);
   assert.equal(readLogin(loginFile(CONNECTOR, w.env)).path, [w.npm, "C:\\Windows"].join(";"));
-  // Elsewhere launchd and systemd run the script setup ran.
-  assert.equal(new Service({ platform: "linux", env: {} }).unavailable({ program: ["/usr/bin/node", "/x.js"], path: "/nonexistent" }), null);
+  // On a Mac, launchd runs the script setup ran (Linux: setup.test.ts).
+  assert.equal(new Service({ platform: "darwin", env: {} }).unavailable({ program: ["/usr/bin/node", "/x.js"], path: "/nonexistent" }), null);
 });
 
 test("on Windows, a TENANDTWO_COMMAND with spaces is one word to cmd.exe", (t) => {

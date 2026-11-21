@@ -124,6 +124,11 @@ readme)
         check "the cloud was told" grep -q "cloud: revoke$" /run/standin/events
         check "the credential is gone" bash -c "! grep -q 10and2.selfdep.com $CONFIG/credentials.json 2>/dev/null"
         check "it no longer starts at login" test ! -e "$UNIT" ;;
+      "10and2 uninstall")
+        check "uninstall ends well" is "$code" 0
+        check "uninstall says how to remove the program" has "npm uninstall -g 10and2"
+        check "its settings and key are gone" test ! -e "$CONFIG"
+        check "nothing starts at login" test ! -e "$UNIT" ;;
       "10and2 help")
         check "help ends well" is "$code" 0
         check "help lists setup" has "10and2 setup" ;;

@@ -15,6 +15,7 @@ Setup finds the coding agents on this computer and lets you switch off any you d
 10and2 status    # whether it's connected, and what 10 & 2 can see and do
 10and2 agents    # choose again which agents to connect, and what 10 & 2 may do
 10and2 revoke    # disconnect this computer
+10and2 uninstall # remove everything 10and2 added: its service, hooks, extensions, settings and key
 10and2 help      # everything else
 ```
 
@@ -23,6 +24,21 @@ New work in T3 Code, Claude Code and Codex can start on a coding model you name 
 Needs Node 22.13 or newer. Setup and `10and2 status` say when one of your agents is too old for something 10 & 2 does, and how to update it.
 
 Without a terminal (a script, Nix), every agent found is connected with everything allowed, and flags narrow it: `--agents=claude,pi` (only these), `--off=codex`, `--no-steer`, `--no-answer`, `--no-start`, `--no-tidy`, `--read-only`. Given names, as in `--no-steer=codex`, a flag narrows only those agents.
+
+## Installing
+
+- **Node:** `node --version` should say 22.13 or newer. The Node Ubuntu and Debian ship is older. Install a current Node for yourself with [nvm](https://github.com/nvm-sh/nvm) (`nvm install 24`), fnm, Volta or Homebrew; none of them needs sudo.
+- **`npm install -g` fails with EACCES:** your npm installs into a folder only root can write, usually because Node came from the system. Don't use sudo: everything 10and2 does afterwards would need it too. Use a Node from nvm (above), or point npm at a folder of your own: `npm config set prefix ~/.local`, with `~/.local/bin` on your PATH.
+- **pnpm, Volta, fnm:** `pnpm add -g 10and2` and `volta install 10and2` work too, and the login service keeps working through their upgrades. With npx it can run, but not start at login.
+- **Behind a company proxy:** set `HTTPS_PROXY` (and `NO_PROXY`) before setup; the login service is given them. Node 24.14 or newer uses them by itself; Node 22.21 to 24.13 only with `NODE_USE_ENV_PROXY=1` set as well, which setup says. A proxy address with a password in it isn't written into the login service.
+- **TLS inspection:** 10and2 trusts the certificates your computer trusts (the Keychain, Windows' certificate store, or Linux's bundle in `/etc/ssl/certs`) besides Node's own, with Node 22.19 or newer. On an older Node, point `NODE_EXTRA_CA_CERTS` at your company's root certificate.
+- **Where your agents keep their files:** setup reads `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CODING_AGENT_DIR`, `T3CODE_HOME` and the `XDG_*` folders from your terminal, and the login service is given the same, so run setup (or `10and2 autostart on`, after changing them) from a terminal that has them.
+
+## Starting at login
+
+On a Mac it's a LaunchAgent; on Linux, a systemd user service. Logged in over SSH (a server, a VM), setup turns on systemd's lingering for your account so it keeps running after you log out and starts at boot; where that needs an administrator, it says to run `sudo loginctl enable-linger $USER`. `10and2 autostart off` turns it off again.
+
+Without systemd (a container, WSL without systemd, Alpine), nothing starts it for you: keep `10and2 run` going some other way, for example in a tmux session, as your init system's service, or with a crontab line such as `@reboot 10and2 run --wait-for-credential >> ~/.local/state/10and2/10and2.log 2>&1` (give cron your PATH, so it finds `node` and your agents).
 
 ## Claude Code
 

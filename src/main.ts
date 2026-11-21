@@ -2,7 +2,7 @@
 // 10and2: the connector. Credentials and backend code live here, on the machine doing the work; the brain holds only
 // a hash of this machine's credential.
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -19,7 +19,8 @@ import { describeFound, detect, NAMES, ORDER, type Found } from "./agents.ts";
 import { versionWarning } from "./versions.ts";
 import { applyChoice, applyFlags, capsFor, CAP_SHORT, CEILING_LABEL, chooseInteractively, choiceOf, startingChoice, summary, type Choice } from "./choose.ts";
 import { VERSION } from "./protocol.ts";
-import { BRAIN, CONNECTOR, connectorRunning, launchFor, Service, type ServiceState } from "./service.ts";
+import { proxyAdvice, useSystemNetwork } from "./net.ts";
+import { BRAIN, checkout, CONNECTOR, connectorRunning, launchFor, Service, temporary, type ServiceState } from "./service.ts";
 import { pidState } from "./claude/registry.ts";
 import { loginService, stopLikeSigterm } from "./supervisor.ts";
 import { T3Adapter } from "./t3/adapter.ts";
@@ -41,6 +42,7 @@ const usage = () => `${bold("10and2")} ${VERSION} ${dim("·")} connects this com
   ${cmd("10and2 status")}    whether it's connected, and what 10 & 2 can see and do here
   ${cmd("10and2 agents")}    choose which coding agents to connect, and what 10 & 2 may do
   ${cmd("10and2 revoke")}    disconnect this computer
+  ${cmd("10and2 uninstall")} remove everything 10and2 added to this computer
 
 More
   ${cmd("10and2 autostart on|off|status")}     start at login
@@ -89,6 +91,7 @@ const TAKES: Record<string, { words: number; flags: string[] }> = {
   run: { words: 0, flags: ["wait-for-credential", "fatal-exit"] },
   status: { words: 0, flags: ["verbose"] },
   revoke: { words: 0, flags: ["yes"] },
+  uninstall: { words: 0, flags: ["yes"] },
   autostart: { words: 1, flags: [] },
   hooks: { words: 1, flags: [] },
   pi: { words: 1, flags: [] },
@@ -115,6 +118,9 @@ function unread(): string | null {
   return flag === undefined ? null : `${cmd(`10and2 ${command}`)} has no ${cmd(`--${flag}`)}. ${cmd("10and2 help")} lists what each command takes.`;
 }
 
+// Claude Code's hooks and Pi's turns talk only to this computer, and start often: no need to read certificates for them.
+if (!["hook", "pi-turn"].includes(command ?? "")) useSystemNetwork();
+
 try {
   const refused = unread();
   if (refused) { fail(`✗ ${refused}`, 64); process.exit(); }
@@ -124,6 +130,7 @@ try {
     case "run": await runConnector(); break;
     case "status": await status(); break;
     case "revoke": await revoke(); break;
+    case "uninstall": await uninstall(); break;
     case "autostart": await autostart(); break;
     case "hook": await relayHook(process.stdin, hookSocket()); break; // Claude Code runs this; it must stay silent
     case "hooks": await hooks(); break;
@@ -204,6 +211,8 @@ async function setup() {
   }
 
   say(`${bold("10 & 2")} ${dim("·")} connect this computer\n`);
+  const proxy = proxyAdvice();
+  if (proxy) warn(proxy);
   const { found, choice } = await chooseAgents("10and2 setup", existing);
   const policy = await policyFor(origin, existing, choice);
   const name = await machineName();
@@ -300,10 +309,13 @@ async function startAtLogin(service: Service, question: string, ...again: string
   const why = service.unavailable(l);
   if (why) { note(why); return null; }
   if (!await confirm(question, true)) return null;
-  const s = await service.install(l);
+  // Paired by now: a service that can't be set up is said, and setup goes on.
+  let s: ServiceState;
+  try { s = await service.install(l); } catch (e) { warn(describe(e)); return null; }
   if (s.elevated) startsAtSignIn(...again);
   else if (s.running) ok("Starts at login");
   else warn(`Installed at ${s.where}, but it isn't running: see ${s.logs}`);
+  if (s.note) note(s.note);
   return s;
 }
 
@@ -348,7 +360,7 @@ async function offerHelpers(choice: Choice) {
   if (wants("claude") && !(await hooksStatus(claudeDir()).catch(() => null))?.installed) {
     const unavailable = hooksUnavailable(claudeDir());
     if (unavailable) note(dim(unavailable));
-    else helpers.push({ name: "Claude Code hooks", undo: "10and2 hooks uninstall", add: () => installHooks(claudeDir(), process.env.TENANDTWO_COMMAND || "10and2") });
+    else helpers.push({ name: "Claude Code hooks", undo: "10and2 hooks uninstall", add: () => installHooks(claudeDir(), hookCommand()) });
   }
   if (wants("pi") && piExtensionStatus(piAgentDir()).state !== "installed") {
     helpers.push({ name: "Pi extension", undo: "10and2 pi uninstall", add: async () => { installPiExtension(piAgentDir()); } });
@@ -440,7 +452,7 @@ function seesText(p: any) {
  * `10and2` from the PATH): there they start its supervisor this once, and the PATH is kept for it.
  */
 function launch() {
-  return launchFor(process.argv[1], process.execPath, process.env.PATH ?? "/usr/bin:/bin");
+  return launchFor(process.argv[1], process.execPath, process.env);
 }
 
 /**
@@ -451,7 +463,8 @@ async function repairService(service: Service) {
   const gone = service.supported ? service.missing() : null;
   if (!gone) return;
   const l = launch();
-  if (l.program.length !== 1) return;
+  // A checkout run with node, or npx's copy, isn't put in: never a service that runs a checkout or a cache.
+  if (checkout(l) || temporary(l)) return;
   const s = await service.install(l);
   (s.running ? ok : warn)(`Starts at login again: it ran ${gone}, which is gone, and now runs ${l.program[0]}${s.running ? "" : `, but isn't running: see ${s.logs}`}`);
 }
@@ -525,6 +538,8 @@ async function runConnector() {
   });
   link.start();
   log(`connector ${VERSION}: linking to ${origin}`);
+  const proxy = proxyAdvice();
+  if (proxy) log(`connector: ${proxy}`);
   void detect().then((found) => { for (const f of found) { const w = policy[f.agent] && f.installed ? versionWarning(f.agent, f.name, f.version) : null; if (w) log(`${f.agent}: ${w}`); } }, () => {});
   void t3?.start().catch((e) => { log(`t3: ${describe(e)}; not restarting`); record({ error: `T3 Code: ${describe(e)}` }); stop(fatalExit); });
   void claude?.start().then(() => log("claude: reading sessions"), (e) => log(`claude: ${describe(e)}`));
@@ -604,7 +619,8 @@ async function status() {
   }
 }
 
-async function revoke() {
+/** `10and2 revoke`; `uninstalling`, as part of `10and2 uninstall`, which says what's left itself. */
+async function revoke(uninstalling = false) {
   const policy = readPolicyFile();
   const origin = policy?.brain ? originOf(policy.brain) : DEFAULT_ORIGIN;
   const creds = new Credentials();
@@ -623,7 +639,62 @@ async function revoke() {
   await new Service().uninstall();
   await creds.delete(origin);
   rmSync(statusFile(), { force: true });
-  if (cred) ok(`Forgot its key, and it no longer starts at login ${dim(`· your settings stay in ${defaultPolicyPath()}`)}`);
+  if (cred) ok(`Forgot its key, and it no longer starts at login${uninstalling ? "" : ` ${dim(`· your settings stay in ${defaultPolicyPath()}; ${cmd("10and2 uninstall")} removes everything`)}`}`);
+}
+
+/**
+ * What Claude Code's hooks run. This Node and this 10and2 first, as setup ran them: Claude Code started from the
+ * desktop app has hardly any PATH, and in a project whose .nvmrc picks another Node, PATH's 10and2 is missing or runs
+ * on a Node too old for it. Once either is gone (an upgrade), the `10and2` on PATH. Windows runs the hooks in Git Bash,
+ * where that's `10and2`; a checkout's hooks run `10and2` too.
+ */
+function hookCommand(): string {
+  if (process.env.TENANDTWO_COMMAND) return process.env.TENANDTWO_COMMAND;
+  const l = launch();
+  if (process.platform === "win32" || checkout(l) || temporary(l)) return "10and2";
+  const node = process.execPath, script = realpathOr(process.argv[1]);
+  const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  return `{ [ -x ${q(node)} ] && [ -f ${q(script)} ] && exec ${q(node)} ${q(script)} hook; }; 10and2`;
+}
+function realpathOr(p: string) { try { return realpathSync(p); } catch { return p; } }
+
+/**
+ * `10and2 uninstall`: everything 10and2 added to this computer, gone: disconnected, no longer started at login (nor a
+ * brain of your own), its Claude Code hooks, Pi extension and OpenCode plugin removed, and its settings, key and files
+ * deleted. Each part is tried even when one fails. The program itself is the package manager's to remove, said last.
+ */
+async function uninstall() {
+  if (!flags.has("yes") && !await confirm(`Remove 10and2 from this computer? It disconnects it, stops it starting at login, removes its Claude Code hooks, Pi extension and OpenCode plugin, and deletes its settings and files (${configDirectory()}, ${stateDirectory()})`, true)) throw new Cancelled();
+  flags.set("yes", "true");
+  const step = async (what: string, f: () => Promise<boolean | void>) => {
+    try { if (await f() !== false) ok(what); } catch (e) { warn(`Couldn't ${what.charAt(0).toLowerCase()}${what.slice(1)} (${describe(e)})`); }
+  };
+  const policy = (() => { try { return readPolicyFile(); } catch { return null; } })();
+  const origin = policy?.brain ? originOf(policy.brain) : DEFAULT_ORIGIN;
+  if (await new Credentials().load(origin).catch(() => null)) await revoke(true);
+  await step("Stopped, and no longer starts at login", async () => { await new Service().uninstall(); await new Service({ job: BRAIN }).uninstall(); });
+  await step("Removed its Claude Code hooks", async () => {
+    if (!(await hooksStatus(claudeDir())).events.length) return false;
+    await uninstallHooks(claudeDir());
+  });
+  await step("Removed its Pi extension", async () => {
+    if (!["installed", "outdated"].includes(piExtensionStatus(piAgentDir()).state)) return false;
+    uninstallPiExtension(piAgentDir());
+  });
+  await step("Removed its OpenCode plugin", async () => {
+    if (!(await openCodePluginStatus()).installed) return false;
+    await uninstallOpenCodePlugin();
+  });
+  await step(`Deleted its settings and files`, async () => {
+    for (const dir of [configDirectory(), stateDirectory(), ...(process.env.XDG_RUNTIME_DIR ? [join(process.env.XDG_RUNTIME_DIR, "10and2")] : [])]) rmSync(dir, { recursive: true, force: true });
+  });
+  say(`
+  Last, remove the program itself: ${cmd(removeCommand())}`);
+}
+/** How this copy of 10and2 was installed, as the command that removes it. */
+function removeCommand(): string {
+  const at = realpathOr(process.argv[1]).replace(/\\/g, "/");
+  return at.includes("/.volta/") ? "volta uninstall 10and2" : at.includes("/pnpm/") ? "pnpm remove -g 10and2" : at.includes("/nix/store/") ? "nix profile remove 10and2" : "npm uninstall -g 10and2";
 }
 
 async function autostart() {
@@ -633,6 +704,7 @@ async function autostart() {
     if (s.elevated) { startsAtSignIn("10and2 autostart on"); return; }
     if (!s.running) { warn(`Installed at ${s.where}, but not running: see ${s.logs}`); return; }
     ok("Starts at login, and (re)started now");
+    if (s.note) note(s.note);
     const policy = readPolicyFile();
     if (policy?.brain) await connected(originOf(policy.brain), (await new Credentials().load(originOf(policy.brain)).catch(() => null))?.secret);
   }
@@ -643,9 +715,8 @@ async function autostart() {
 
 async function hooks() {
   // Hooks edit the user's own Claude Code settings, so they're only ever installed or removed when asked (here, or by
-  // setup's question). The command is found on PATH, so an upgrade doesn't leave hooks pointing at an old copy.
-  const hookCommand = process.env.TENANDTWO_COMMAND || "10and2";
-  if (sub === "install") await installHooks(claudeDir(), hookCommand);
+  // setup's question).
+  if (sub === "install") await installHooks(claudeDir(), hookCommand());
   else if (sub === "uninstall") await uninstallHooks(claudeDir());
   else if (sub !== "status") throw new Error(`${cmd("10and2 hooks")} takes install, uninstall or status.`);
   const s = await hooksStatus(claudeDir());
