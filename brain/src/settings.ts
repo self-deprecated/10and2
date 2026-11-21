@@ -84,6 +84,12 @@ export type Settings = {
   banner: { text: string } | null;
   /** The oldest iOS build (12 digits) that may start a new call; null: any. Enforced by the server only (§6). */
   minBuild: { ios: string | null };
+  /**
+   * Calls off: the Worker refuses every session start, the demo's too, with a line the apps show (cloud/src/router.ts).
+   * A call already connected carries on until its session ends. Global like the banner: current's only
+   * (docs/launch/ops-safety.md).
+   */
+  callsOff: boolean;
   /** The Ops version these came from (docs/launch/ops-app.md §4.2); null: git's defaults. Not a setting. */
   version: number | null;
 };
@@ -106,6 +112,7 @@ export function defaults(cfg: Pick<Config, "idleMs" | "maxSessionMs" | "liveMode
     prompts: {},
     banner: null,
     minBuild: { ios: null },
+    callsOff: false,
     version: null,
   };
 }
@@ -205,6 +212,7 @@ export const SETTINGS: Record<string, { label: string; check: Check; gated?: boo
   allowances: { label: "Free seconds each UTC day, by account label", check: fields({ tester: int(0, 3600), presenter: int(0, 14_400) }) },
   backgroundCentsPerDay: { label: "Safety limit on background work (briefing, rewrites, new threads' titles, threads' purposes) per account per UTC day (cents)", check: int(0, 500) },
   banner: { label: "Banner in the app, shown once", check: banner },
+  callsOff: { label: "Calls off: refuse every new call, for everyone", check: bool },
   minBuild: { label: "Oldest iOS build that may start a new call", check: fields({ ios: (v) => (v === null || (typeof v === "string" && /^\d{12}$/.test(v)) ? null : "must be a 12-digit build or none") }) },
   liveModel: { label: "Voice model", check: oneOf(LIVE_MODELS), gated: true },
   backendModel: { label: "Backend model", check: oneOf(BACKEND_MODELS), gated: true },
@@ -314,12 +322,13 @@ export function resolve(base: Settings, bundle: Bundle | null, o: Resolving = {}
     if (!o.ungated) problems.push(`its prompt or model settings are inert: no eval pass for them on this brain`);
   }
   const settings = apply(base, overrides, pick.id);
-  // The app's banner and the oldest build allowed are global: always current's, never a candidate's (§4.4). So is the
-  // reading voice switched off: a kill switch that a candidate tried on staff can't keep on.
+  // The app's banner, the oldest build allowed and calls off are global: always current's, never a candidate's (§4.4).
+  // So is the reading voice switched off: a kill switch that a candidate tried on staff can't keep on.
   if (pick !== bundle?.current) {
     const current = resolve(base, bundle ? { ...bundle, candidate: null } : null, { passes: o.passes, ungated: o.ungated }).settings;
     settings.banner = current.banner;
     settings.minBuild = current.minBuild;
+    settings.callsOff = current.callsOff;
     if (current.readingEngine === "off") settings.readingEngine = "off";
   }
   return { settings, problems };
