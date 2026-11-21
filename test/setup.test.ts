@@ -636,9 +636,9 @@ test("setup --yes starts at login without asking, even with a terminal on stdin"
   const bin = join(dir, "bin");
   mkdirSync(bin);
   fakeCommand(bin, "t3", "1.0");
-  // systemd, saying the unit runs.
+  // systemd, saying the unit runs, on a Linux it started (whatever runs the test: Nix's build sandbox has no systemd).
   fakeCommand(bin, "systemctl", "active");
-  const env = testEnv(dir, { PATH: bin, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_CREDENTIAL_STORE: "file" });
+  const env = testEnv(dir, { PATH: bin, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_SYSTEMD_DIR: dir });
   // As a Windows scheduled task's console runs it: stdin a terminal, the output going to a file nobody reads.
   const run = await cli(["setup", "--yes", "--brain=http://127.0.0.1:9", "--token", "--name=box"], env, "process.stdin.isTTY = true");
   assert.equal(run.status, 0, run.out);

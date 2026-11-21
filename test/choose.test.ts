@@ -88,9 +88,11 @@ test("agent lists take spaces as well as commas: PowerShell hands npm's script -
 
 test("--agents can't switch on an agent that wasn't found, and says which", () => {
   const here = found({ claude: true });
+  // Its words, coloured or not: `node --test` passes FORCE_COLOR to its files when it writes to a terminal, as in Nix's build.
+  const says = (re: RegExp) => (e: unknown) => re.test(stripVTControlCharacters(String(e)));
   assert.throws(() => applyFlags(defaultChoice(here), flags({ agents: "claude,codex" }), here),
-    /^Error: Codex wasn't found on this computer, so 10 & 2 can't connect it\. Install it, or leave it out of --agents\.$/);
-  assert.throws(() => applyFlags(defaultChoice(here), flags({ agents: "codex,pi" }), here), /^Error: Codex and Pi weren't found on this computer, so 10 & 2 can't connect them\./);
+    says(/^Error: Codex wasn't found on this computer, so 10 & 2 can't connect it\. Install it, or leave it out of --agents\.$/));
+  assert.throws(() => applyFlags(defaultChoice(here), flags({ agents: "codex,pi" }), here), says(/^Error: Codex and Pi weren't found on this computer, so 10 & 2 can't connect them\./));
 });
 
 test("the closing words say who 10 & 2 reaches, what it may do, and what's narrower", () => {

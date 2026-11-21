@@ -37,7 +37,8 @@ export class CopilotSession {
   private events: Msg[] = [];
   private calls = new Map<string, { at: string | null; ask: string | null }>();
   private workspace: Record<string, string> = {};
-  private workspaceMtime = 0;
+  /** `workspace.yaml`'s time and size when last read. */
+  private workspaceStamp = "";
   private cached: Projection | null = null;
   mtimeMs = 0;
 
@@ -52,7 +53,10 @@ export class CopilotSession {
   read(): void {
     try {
       const st = statSync(join(this.dir, "workspace.yaml"));
-      if (st.mtimeMs !== this.workspaceMtime) { this.workspace = parseWorkspace(readFileSync(join(this.dir, "workspace.yaml"), "utf8")); this.workspaceMtime = st.mtimeMs; }
+      // Its size too: Linux takes a file's time from a coarse clock (a tick, 1-4 ms), so a rename Copilot writes within a
+      // tick of the last read keeps the time it had (CI, 21 November).
+      const stamp = `${st.mtimeMs}:${st.size}`;
+      if (stamp !== this.workspaceStamp) { this.workspace = parseWorkspace(readFileSync(join(this.dir, "workspace.yaml"), "utf8")); this.workspaceStamp = stamp; }
       this.mtimeMs = Math.max(st.mtimeMs, (() => { try { return statSync(this.lines.path).mtimeMs; } catch { return 0; } })());
     } catch { return; }
     const { records, reset } = this.lines.read();
