@@ -2,7 +2,7 @@
   "name": "10and2",
   "type": "module",
   "version": "0.12.0",
-  "description": "The connector for 10 & 2: lets you talk to the coding agents on your computer (Claude Code, Codex, Pi, OpenCode, T3 Code) from the 10 & 2 iPhone app.",
+  "description": "The connector for 10 & 2: lets you talk to the coding agents on your computer (Claude Code, Codex, Copilot CLI, Gemini CLI, Cursor, OpenCode, Pi, T3 Code) from the 10 & 2 iPhone app.",
   "keywords": [
     "10and2",
     "coding agents",
@@ -11,6 +11,9 @@
     "pi",
     "opencode",
     "t3 code",
+    "copilot cli",
+    "gemini cli",
+    "cursor",
     "voice"
   ],
   "homepage": "https://10and2.app",
@@ -43,10 +46,10 @@
   "scripts": {
     "start": "node src/main.ts run",
     "build": "node build.mjs",
-    "test": "node --test test/*.test.ts",
+    "test": "node --test --test-timeout=120000 --test-force-exit test/*.test.ts",
     "test:harness": "bash test/harness/run.sh",
     "typecheck": "tsc --noEmit",
-    "check": "tsc --noEmit && node --test test/*.test.ts && npm run build && node test/smoke.mjs",
+    "check": "tsc --noEmit && node --test --test-timeout=120000 --test-force-exit test/*.test.ts && npm run build && node test/smoke.mjs",
     "prepublishOnly": "npm run check"
   },
   "allowScripts": {

@@ -12,7 +12,7 @@ import type { Runner } from "../src/credential.ts";
 import { Ledger, ledgerHeld } from "../src/ledger.ts";
 import { BRAIN, CONNECTOR, connectorRunning, RUN_KEY, runEntry, Service, STARTUP_APPROVED } from "../src/service.ts";
 import { ask, backoff, controlPipe, HIDDEN, loginFile, mergePath, readLogin, restartsAfter, rotate, saveLogin, supervise, withPath } from "../src/supervisor.ts";
-import { randomHex } from "../src/util.ts";
+import { randomHex, replaceFile } from "../src/util.ts";
 import { assertPrivate, ipcPath, nodeCommand, removeDir, SLOW, WINDOWS } from "./fixtures/platform.ts";
 
 const SUPERVISED = fileURLToPath(new URL("./fixtures/supervised.ts", import.meta.url));
@@ -102,11 +102,13 @@ test("the token naming the control pipe and the secret it proves itself with are
 test("the supervisor starts a crashed connector again, with the PATH it's given and its output in the log, and stops after 78 or 0", async (t) => {
   const p = place(t), { dir } = p;
   const notes = join(dir, "notes"), code = join(dir, "code"), log = join(dir, "10and2.log");
-  writeFileSync(code, "1");
+  // Replaced, not rewritten: a start between a rewrite's emptying and its writing would read no code and run for good.
+  const exitWith = (c: string) => { writeFileSync(`${code}.tmp`, c); replaceFile(`${code}.tmp`, code); };
+  exitWith("1");
   const path = mergePath(join(dir, "setup-bin"), process.env.PATH ?? "");
   const run = supervise({ name: "connector", ...p.control, command: [...nodeCommand(SUPERVISED), notes, `code=${code}`], env: withPath(process.env, path), log, timing: FAST });
   await until("restarted twice", () => starts(notes).length >= 3);
-  writeFileSync(code, "78");
+  exitWith("78");
   await run;
   const after = starts(notes).length;
   assert.ok(starts(notes).every((l) => l.endsWith(` ${path}`)), "each start had the PATH setup saw first");

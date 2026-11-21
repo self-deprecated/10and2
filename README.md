@@ -2,7 +2,7 @@
 
 The connector for [10 & 2](https://10and2.app), the iPhone app that lets you talk to your coding agents on the drive.
 
-Install it on the Mac or Linux computer where your coding agents work: Claude Code, Codex, Pi, OpenCode, Gemini CLI, Copilot CLI or T3 Code. Then the voice in the app can tell you what they did and what's waiting on you, and follow up when you say yes.
+Install it on the Mac, Windows or Linux computer where your coding agents work: Claude Code, Codex, Copilot CLI, Gemini CLI, Cursor, OpenCode, Pi or T3 Code. Then the voice in the app can tell you what they did and what's waiting on you, and follow up when you say yes.
 
 ```sh
 npm install -g 10and2
@@ -19,7 +19,7 @@ Setup finds the coding agents on this computer and lets you switch off any you d
 10and2 help      # everything else
 ```
 
-New work in T3 Code, Claude Code, Codex, Gemini CLI and Copilot CLI can start on a coding model you name (in T3 Code, on the provider you name too), or the one you choose in the app's Settings → New threads → Coding model; otherwise, and in Pi and OpenCode, on the agent's own default.
+New work in T3 Code, Claude Code, Codex, Gemini CLI, Copilot CLI and Cursor can start on a coding model you name (in T3 Code, on the provider you name too), or the one you choose in the app's Settings → New threads → Coding model; otherwise, and in Pi and OpenCode, on the agent's own default.
 
 On a Mac, if your projects are in Documents, Desktop, Downloads or iCloud Drive, macOS asks whether “node” may open them once 10and2 runs at login: choose Allow, or turn it on later in System Settings, Privacy & Security, Files & Folders. `10and2 status` says when it's still off.
 
@@ -31,6 +31,7 @@ Without a terminal (a script, Nix), every agent found is connected with everythi
 
 - **Node:** `node --version` should say 22.13 or newer. The Node Ubuntu and Debian ship is older. Install a current Node for yourself with [nvm](https://github.com/nvm-sh/nvm) (`nvm install 24`), fnm, Volta or Homebrew; none of them needs sudo.
 - **`npm install -g` fails with EACCES:** your npm installs into a folder only root can write, usually because Node came from the system. Don't use sudo: everything 10and2 does afterwards would need it too. Use a Node from nvm (above), or point npm at a folder of your own: `npm config set prefix ~/.local`, with `~/.local/bin` on your PATH.
+- **PowerShell:** Windows' default script policy blocks the `10and2.ps1` npm installs, so PowerShell says running scripts is disabled. Type `10and2.cmd` instead, or allow your own scripts once with `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`. Command Prompt and Git Bash aren't affected.
 - **pnpm, Volta, fnm:** `pnpm add -g 10and2` and `volta install 10and2` work too, and the login service keeps working through their upgrades. With npx it can run, but not start at login.
 - **Behind a company proxy:** set `HTTPS_PROXY` (and `NO_PROXY`) before setup; the login service is given them. Node 24.14 or newer uses them by itself; Node 22.21 to 24.13 only with `NODE_USE_ENV_PROXY=1` set as well, which setup says. A proxy address with a password in it isn't written into the login service.
 - **TLS inspection:** 10and2 trusts the certificates your computer trusts (the Keychain, Windows' certificate store, or Linux's bundle in `/etc/ssl/certs`) besides Node's own, with Node 22.19 or newer. On an older Node, point `NODE_EXTRA_CA_CERTS` at your company's root certificate.
@@ -38,7 +39,7 @@ Without a terminal (a script, Nix), every agent found is connected with everythi
 
 ## Starting at login
 
-On a Mac it's a LaunchAgent; on Linux, a systemd user service. Logged in over SSH (a server, a VM), setup turns on systemd's lingering for your account so it keeps running after you log out and starts at boot; where that needs an administrator, it says to run `sudo loginctl enable-linger $USER`. `10and2 autostart off` turns it off again.
+On a Mac it's a LaunchAgent; on Windows, an entry in the apps it starts at sign-in (Task Manager's Startup apps), with its log in `%USERPROFILE%\.local\state\10and2\10and2.log`; on Linux, a systemd user service. Logged in over SSH (a server, a VM), setup turns on systemd's lingering for your account so it keeps running after you log out and starts at boot; where that needs an administrator, it says to run `sudo loginctl enable-linger $USER`. `10and2 autostart off` turns it off again.
 
 Without systemd (a container, WSL without systemd, Alpine), nothing starts it for you: keep `10and2 run` going some other way, for example in a tmux session, as your init system's service, or with a crontab line such as `@reboot 10and2 run --wait-for-credential >> ~/.local/state/10and2/10and2.log 2>&1` (give cron your PATH, so it finds `node` and your agents).
 
@@ -63,6 +64,10 @@ Without systemd (a container, WSL without systemd, Alpine), nothing starts it fo
 10 & 2 works with your Gemini CLI and GitHub Copilot CLI sessions: it reads them, and continues one you've closed, or starts new work in the project or a fresh worktree inside it, through the agent's own ACP mode (`gemini --acp`, `copilot --acp`), within what this computer allows. It never grants either a permission: a tool that asks first doesn't run, so give new work full access for it to edit and run things.
 
 What you tell it reaches a Copilot session open in a terminal as if you'd typed it there, during its turn when it's busy, and it can answer Copilot's questions. That needs 10and2's Copilot extension, which setup offers to add (`10and2 copilot install` adds it later, `10and2 copilot uninstall` removes it); Copilot loads extensions only with its experimental features on, so adding it turns them on, and only in folders you trust in Copilot. A Copilot already open needs restarting. A Gemini session open in a terminal, or a Copilot one in an editor, isn't sent to yet: say it there, or close it and 10 & 2 can continue it. Gemini CLI refuses full access in a folder you haven't trusted in it. Needs Gemini CLI 0.68.0 or newer, or Copilot CLI 1.0.112 or newer.
+
+## Cursor
+
+10 & 2 works with Cursor's CLI agent (`cursor-agent`): it reads your chats, continues one that's closed within what this computer allows, and starts new work in the project or a worktree inside it. A chat open in a terminal can't be sent to yet: say it there. Nothing to install. The editor's agent isn't reachable yet. Needs cursor-agent 2026.11.19 or newer.
 
 ## Your own brain
 

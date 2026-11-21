@@ -29,7 +29,7 @@ function temp(t: { after: (f: () => void) => void }, prefix: string) {
  */
 function testEnv(home: string, vars: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const env = { ...process.env };
-  for (const k of Object.keys(env)) if (/^(XDG_|CLAUDE_|CODEX_|PI_|T3|OPENCODE|TENANDTWO_|OPENAI_|DRIVER_|FORCE_COLOR$)/i.test(k)) delete env[k];
+  for (const k of Object.keys(env)) if (/^(XDG_|CLAUDE_|CODEX_|PI_|T3|OPENCODE|GEMINI_|COPILOT_|CURSOR_|TENANDTWO_|OPENAI_|DRIVER_|FORCE_COLOR$)/i.test(k)) delete env[k];
   return { ...env, HOME: home, USERPROFILE: home, ...vars };
 }
 

@@ -169,7 +169,7 @@ test("an agent is found by its command on PATH or by its own folder; T3 Code by 
   mkdirSync(bin);
   const env: NodeJS.ProcessEnv = {
     ...process.env, PATH: bin, CLAUDE_CONFIG_DIR: join(dir, "claude"), CODEX_HOME: join(dir, "codex"), PI_CODING_AGENT_DIR: join(dir, "pi"),
-    XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3", CURSOR_CONFIG_DIR: join(dir, "cursor"),
+    XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3", GEMINI_CLI_HOME: join(dir, "gemini"), COPILOT_HOME: join(dir, "copilot"), CURSOR_CONFIG_DIR: join(dir, "cursor"),
   };
   const installed = async () => (await detect(env)).filter((f) => f.installed).map((f) => [f.agent, f.version]);
   assert.deepEqual(await installed(), []);
@@ -188,6 +188,8 @@ test("an agent is found by its command on PATH or by its own folder; T3 Code by 
   // Cursor's CLI agent: by its command (its version is a date), or its chats folder.
   command("cursor-agent", "2026.11.19-f005e9d");
   assert.deepEqual((await detect(env)).find((f) => f.agent === "cursor")!.version, "2026.11.19-f005e9d");
+  // Asked about some agents only (the connector, about those it uses), the others' commands aren't run.
+  assert.deepEqual((await detect(env, 4000, false, (a) => a === "cursor")).filter((f) => f.version).map((f) => f.agent), ["cursor"]);
 });
 
 test("a command still running when detection stops waiting is found, version unknown; stopped, except by the connector, which leaves it to finish", async (t) => {
@@ -197,7 +199,7 @@ test("a command still running when detection stops waiting is found, version unk
   mkdirSync(bin);
   const env: NodeJS.ProcessEnv = {
     ...process.env, PATH: bin, CLAUDE_CONFIG_DIR: join(dir, "claude"), CODEX_HOME: join(dir, "codex"), PI_CODING_AGENT_DIR: join(dir, "pi"),
-    XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3",
+    XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3", GEMINI_CLI_HOME: join(dir, "gemini"), COPILOT_HOME: join(dir, "copilot"),
   };
   // npm's `t3` on its first run, which downloads T3's runtime before it answers; T3 has never run here.
   const installedMark = join(dir, "installed");
@@ -227,7 +229,7 @@ test("a short command that stops a slow --version isn't kept running by what tha
   mkdirSync(bin);
   // A launcher that leaves its own child holding the output (as cmd.exe running T3's desktop app does on Windows).
   writeFileSync(join(bin, "t3"), `#!/bin/sh\n"${process.execPath}" -e "setTimeout(() => {}, 8000)"\necho t3 v0.1.11\n`, { mode: 0o755 });
-  const env = { ...process.env, PATH: bin, CLAUDE_CONFIG_DIR: join(dir, "claude"), CODEX_HOME: join(dir, "codex"), PI_CODING_AGENT_DIR: join(dir, "pi"), XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3" };
+  const env = { ...process.env, PATH: bin, CLAUDE_CONFIG_DIR: join(dir, "claude"), CODEX_HOME: join(dir, "codex"), PI_CODING_AGENT_DIR: join(dir, "pi"), XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3", GEMINI_CLI_HOME: join(dir, "gemini"), COPILOT_HOME: join(dir, "copilot") };
   const agents = new URL("../src/agents.ts", import.meta.url).href;
   const started = Date.now();
   const r = spawnSync(process.execPath, ["--input-type=module", "-e", `const { detect } = await import(${JSON.stringify(agents)}); const f = (await detect(process.env, 200)).find((a) => a.agent === "t3"); console.log(JSON.stringify([f.installed, f.version]));`], { env, encoding: "utf8", timeout: 20_000 });

@@ -64,7 +64,11 @@ test("T3 Code: start work, list, read, follow up idle and busy, answer a questio
 
   await t.test("connect: a scoped session is minted and the project is a place", async () => {
     // The adapter retries a failed connect for good; a T3 Code it can't connect to fails here, not at the test's timeout.
-    await Promise.race([adapter.start(), sleep(60_000).then(() => { throw new Error("T3 didn't connect within a minute"); })]);
+    // The minute's timer is cleared once that's settled: left running, it kept this file's process alive until the minute
+    // was up, on CI about 50 s after its last test (21 November).
+    let minute: NodeJS.Timeout | undefined;
+    const late = new Promise<never>((_, reject) => { minute = setTimeout(() => reject(new Error("T3 didn't connect within a minute")), 60_000); });
+    try { await Promise.race([adapter.start(), late]); } finally { clearTimeout(minute); }
     await until("the project to be a place", () => adapter.places().some((p) => p.name === "lap-timer"), 30_000);
     place = adapter.places().find((p) => p.name === "lap-timer")!.id;
     // A new project has no default model; T3's own clients set one. The test does it with a session of its own.

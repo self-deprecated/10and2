@@ -107,7 +107,7 @@ test("a login service started before the keyring opens waits for the credential 
   mkdirSync(config, { recursive: true });
   // Port 9 refuses at once; the link only has to start, not succeed.
   writeFileSync(join(config, "connector.json"), JSON.stringify({ brain: "ws://127.0.0.1:9/connector", projects: "*", actions: [], t3: false, claude: true }));
-  const env: NodeJS.ProcessEnv = { ...process.env, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), XDG_RUNTIME_DIR: dir, CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_TOKEN: "" };
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: dir, USERPROFILE: dir, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), XDG_RUNTIME_DIR: dir, CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_TOKEN: "" };
   const child = spawn(process.execPath, [main, "run", "--wait-for-credential=0.1"], { env, stdio: ["ignore", "pipe", "pipe"] });
   // Stopped, and waited for, before its folder goes: Windows won't remove a file a running process holds.
   t.after(async () => {
@@ -142,7 +142,7 @@ test("on Windows the login service doesn't wait for a key it can't read: it stop
   const config = join(dir, "config", "10and2");
   mkdirSync(config, { recursive: true });
   writeFileSync(join(config, "connector.json"), JSON.stringify({ brain: "ws://127.0.0.1:9/connector", projects: "*", actions: [], t3: false, claude: true }));
-  const env: NodeJS.ProcessEnv = { ...process.env, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_TOKEN: "" };
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: dir, USERPROFILE: dir, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_TOKEN: "" };
   // As Windows' supervisor runs it (service.ts CONNECTOR), on a Windows of the test's own: no key in credentials.json.
   const win32 = `--import=data:text/javascript,Object.defineProperty(process, "platform", { value: "win32" })`;
   const r = spawnSync(process.execPath, [win32, main, "run", "--wait-for-credential=0.1"], { env, encoding: "utf8", timeout });
@@ -160,7 +160,7 @@ test("on Windows a key that's there but can't be read is tried again before the 
   writeFileSync(join(config, "connector.json"), JSON.stringify({ brain: "ws://127.0.0.1:9/connector", projects: "*", actions: [], t3: false, claude: true }));
   // A DPAPI key whose PowerShell can't start here (there's none on this machine), as one failed start at sign-in.
   writeFileSync(join(config, "credentials.json"), JSON.stringify({ "http://127.0.0.1:9": "dpapi:AAAA" }));
-  const env: NodeJS.ProcessEnv = { ...process.env, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_TOKEN: "", PATH: join(dir, "nothing") };
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: dir, USERPROFILE: dir, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_TOKEN: "", PATH: join(dir, "nothing") };
   const win32 = `--import=data:text/javascript,Object.defineProperty(process, "platform", { value: "win32" })`;
   const started = Date.now();
   const r = spawnSync(process.execPath, [win32, main, "run", "--wait-for-credential"], { env, encoding: "utf8", timeout: timeout + 10_000 });

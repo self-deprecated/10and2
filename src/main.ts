@@ -605,7 +605,7 @@ async function runConnector() {
   const proxy = proxyAdvice();
   if (proxy) log(`connector: ${proxy}`);
   // Running on, it leaves a first run that hasn't answered yet to finish (agents.ts onPath).
-  void detect(process.env, undefined, true).then((found) => { for (const f of found) { const w = policy[f.agent] && f.installed ? versionWarning(f.agent, f.name, f.version) : null; if (w) log(`${f.agent}: ${w}`); } }, () => {});
+  void detect(process.env, undefined, true, (a) => !!policy[a]).then((found) => { for (const f of found) { const w = policy[f.agent] && f.installed ? versionWarning(f.agent, f.name, f.version) : null; if (w) log(`${f.agent}: ${w}`); } }, () => {});
   void t3?.start().catch((e) => { log(`t3: ${describe(e)}; not restarting`); record({ error: `T3 Code: ${describe(e)}` }); stop(fatalExit); });
   void claude?.start().then(() => log("claude: reading sessions"), (e) => log(`claude: ${describe(e)}`));
   void codex?.start().then(() => log("codex: reading sessions"), (e) => log(`codex: ${describe(e)}`));

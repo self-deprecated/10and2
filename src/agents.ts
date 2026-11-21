@@ -94,9 +94,10 @@ function openCopilots(dir: string): number {
 /**
  * The agents here. Each command has `answerMs` to say its version: Windows starts a Node-based command (`codex.cmd`)
  * several times slower, and scans it, so longer there. One still running then is found, its version unknown, and stopped
- * unless `leave` (onPath).
+ * unless `leave` (onPath). With `only`, the other agents' commands aren't run: the connector asks only what it uses
+ * (a `gemini --version` leaves files in ~/.gemini, measured on 0.70.0).
  */
-export async function detect(env: NodeJS.ProcessEnv = process.env, answerMs = process.platform === "win32" ? 10_000 : 4000, leave = false): Promise<Found[]> {
+export async function detect(env: NodeJS.ProcessEnv = process.env, answerMs = process.platform === "win32" ? 10_000 : 4000, leave = false, only?: (agent: Agent) => boolean): Promise<Found[]> {
   const home = homedir();
   const claudeDir = env.CLAUDE_CONFIG_DIR || join(home, ".claude");
   const codexHome = env.CODEX_HOME || join(home, ".codex");
@@ -106,7 +107,8 @@ export async function detect(env: NodeJS.ProcessEnv = process.env, answerMs = pr
   const t3Cli = env.T3_CLI ?? "t3";
   const cursorChats = join(cursorConfigDir(env), "chats");
   const gemini = geminiDir(env), copilot = copilotDir(env);
-  const [claude, codex, pi, opencode, t3, geminiV, copilotV, cursor] = await Promise.all(["claude", "codex", "pi", "opencode", t3Cli, "gemini", "copilot", "cursor-agent"].map((bin) => onPath(bin, env, answerMs, leave)));
+  const commands: [Agent, string][] = [["claude", "claude"], ["codex", "codex"], ["pi", "pi"], ["opencode", "opencode"], ["t3", t3Cli], ["gemini", "gemini"], ["copilot", "copilot"], ["cursor", "cursor-agent"]];
+  const [claude, codex, pi, opencode, t3, geminiV, copilotV, cursor] = await Promise.all(commands.map(([agent, bin]) => only && !only(agent) ? null : onPath(bin, env, answerMs, leave)));
   const found: Found[] = [
     { agent: "claude", name: NAMES.claude, installed: claude !== null || existsSync(join(claudeDir, "projects")), version: claude || null,
       sessions: recentFiles(join(claudeDir, "projects"), /\.jsonl$/, 1), open: liveRegistries(join(claudeDir, "sessions")) },
@@ -120,7 +122,7 @@ export async function detect(env: NodeJS.ProcessEnv = process.env, answerMs = pr
     { agent: "opencode", name: NAMES.opencode, installed: opencode !== null || existsSync(opencodeData), version: opencode || null, sessions: oc?.sessions ?? null, open: oc?.open ?? null },
     // Gemini CLI keeps no record of what's open: its running processes are counted instead.
     { agent: "gemini", name: NAMES.gemini, installed: geminiV !== null || existsSync(join(gemini, "tmp")), version: geminiV || null,
-      sessions: recentFiles(join(gemini, "tmp"), /^session-.*\.jsonl?$/, 2), open: geminiV === null && !existsSync(join(gemini, "tmp")) ? null : processes(isGemini).length },
+      sessions: recentFiles(join(gemini, "tmp"), /^session-.*\.jsonl?$/, 2), open: (only && !only("gemini")) || (geminiV === null && !existsSync(join(gemini, "tmp"))) ? null : processes(isGemini).length },
     { agent: "copilot", name: NAMES.copilot, installed: copilotV !== null || existsSync(join(copilot, "session-state")), version: copilotV || null,
       sessions: recentFiles(join(copilot, "session-state"), /^events\.jsonl$/, 1), open: openCopilots(join(copilot, "session-state")) },
     // A `t3` that failed without a version still counts where T3 has run. Never without one: the connector reaches T3

@@ -99,17 +99,17 @@ export const ROUTES: Route[] = [
   {
     method: "POST", path: "/stripe/webhook", access: "webhook", signature: "stripe", by: "worker", where: "cloud",
     body: { id: "evt_1", type: "checkout.session.completed", data: { object: { id: "cs_test_1", client_reference_id: "user_a", payment_status: "paid", metadata: { pack: "minutes_60" } } } },
-    idempotent: { key: "the Checkout Session (`stripe:<id>`)", tested: ["cloud/test/workerd.test.ts", "credits: a new account has no trial and no free minutes"] },
+    idempotent: { key: "the Checkout Session (`stripe:<id>`)", tested: ["cloud/test/billing.workerd.test.ts", "credits: a new account has no trial and no free minutes"] },
   },
   {
     method: "POST", path: "/revenuecat/webhook", access: "webhook", signature: "revenuecat", by: "worker", where: "cloud",
     body: { event: { id: "rc_evt_1", type: "NON_RENEWING_PURCHASE", app_user_id: "user_a", product_id: "ai.selfdeprecated.driver.minutes60" } },
-    idempotent: { key: "the store's transaction", tested: ["cloud/test/workerd.test.ts", "credits: an App Store pack through RevenueCat, checked against its API, credited once"] },
+    idempotent: { key: "the store's transaction", tested: ["cloud/test/billing.workerd.test.ts", "credits: an App Store pack through RevenueCat, checked against its API, credited once"] },
   },
   {
     method: "POST", path: "/clerk/webhook", access: "webhook", signature: "clerk", by: "worker", where: "cloud",
     body: { type: "user.deleted", data: { id: "user_a", deleted: true } },
-    idempotent: { key: "the user: wiping an empty brain does nothing", tested: ["cloud/test/workerd.test.ts", "Clerk's user.deleted wipes a Driver user's brain"] },
+    idempotent: { key: "the user: wiping an empty brain does nothing", tested: ["cloud/test/accounts.workerd.test.ts", "Clerk's user.deleted wipes a Driver user's brain"] },
   },
 
   // Connectors (contracts §2).
@@ -129,12 +129,12 @@ export const ROUTES: Route[] = [
   // same for every account, so it isn't one of `ids`; one this account was never served is refused all the same.
   {
     method: "POST", path: "/api/messages", access: "signed_in", by: "brain", where: "cloud", body: { message: "m_k3x9q2b7wd", event: "shown" },
-    idempotent: { key: "message and event: the first of each counts", tested: ["cloud/test/workerd.test.ts", "messages to users: one chosen for the phone that asks, reported once, counted in Ops with no id"] },
+    idempotent: { key: "message and event: the first of each counts", tested: ["cloud/test/ops.workerd.test.ts", "messages to users: one chosen for the phone that asks, reported once, counted in Ops with no id"] },
   },
   // What only the phone sees the account do: the day it last did is kept (docs/launch/messages.md).
   {
     method: "POST", path: "/api/actions", access: "signed_in", by: "brain", where: "cloud", body: { action: "call_ear" },
-    idempotent: { key: "action: it sets the day the account last did it", tested: ["cloud/test/workerd.test.ts", "what people have done, and builds in use: the phone's actions kept as a day, a build counted once a week"] },
+    idempotent: { key: "action: it sets the day the account last did it", tested: ["cloud/test/ops.workerd.test.ts", "what people have done, and builds in use: the phone's actions kept as a day, a build counted once a week"] },
   },
   { method: "PUT", path: "/api/account/call-audio", access: "signed_in", by: "brain", where: "cloud", body: { on: false } },
   {
