@@ -13,12 +13,14 @@ import { t3Home } from "./t3/adapter.ts";
 import { geminiDir, isGemini } from "./gemini/source.ts";
 import { copilotDir } from "./copilot/source.ts";
 import { processes } from "./acp/processes.ts";
+import { cursorConfigDir } from "./cursor/paths.ts";
+import { openChats } from "./cursor/open.ts";
 
 export type Found = { agent: Agent; name: string; installed: boolean; version: string | null; sessions: number | null; open: number | null };
 
-export const NAMES: Record<Agent, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", opencode: "OpenCode", gemini: "Gemini CLI", copilot: "Copilot CLI", t3: "T3 Code" };
+export const NAMES: Record<Agent, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", opencode: "OpenCode", gemini: "Gemini CLI", copilot: "Copilot CLI", cursor: "Cursor", t3: "T3 Code" };
 /** The order they're shown in. */
-export const ORDER: readonly Agent[] = ["claude", "codex", "pi", "opencode", "gemini", "copilot", "t3"];
+export const ORDER: readonly Agent[] = ["claude", "codex", "pi", "opencode", "gemini", "copilot", "cursor", "t3"];
 const RECENT_MS = 14 * 86_400_000;
 
 /**
@@ -82,8 +84,9 @@ export async function detect(env: NodeJS.ProcessEnv = process.env): Promise<Foun
   const opencodeData = join(env.XDG_DATA_HOME || join(home, ".local", "share"), "opencode");
   const oc = (() => { try { return openCodeCounts(opencodeData); } catch { return null; } })();
   const t3Cli = env.T3_CLI ?? "t3";
+  const cursorChats = join(cursorConfigDir(env), "chats");
   const gemini = geminiDir(env), copilot = copilotDir(env);
-  const [claude, codex, pi, opencode, t3, geminiV, copilotV] = await Promise.all(["claude", "codex", "pi", "opencode", t3Cli, "gemini", "copilot"].map((bin) => onPath(bin, env)));
+  const [claude, codex, pi, opencode, t3, geminiV, copilotV, cursor] = await Promise.all(["claude", "codex", "pi", "opencode", t3Cli, "gemini", "copilot", "cursor-agent"].map((bin) => onPath(bin, env)));
   const found: Found[] = [
     { agent: "claude", name: NAMES.claude, installed: claude !== null || existsSync(join(claudeDir, "projects")), version: claude || null,
       sessions: recentFiles(join(claudeDir, "projects"), /\.jsonl$/, 1), open: liveRegistries(join(claudeDir, "sessions")) },
@@ -91,6 +94,9 @@ export async function detect(env: NodeJS.ProcessEnv = process.env): Promise<Foun
       sessions: (() => { try { return countSessions(codexHome, 14); } catch { return null; } })(), open: null },
     { agent: "pi", name: NAMES.pi, installed: pi !== null || existsSync(join(piDir, "sessions")), version: pi || null,
       sessions: recentFiles(join(piDir, "sessions"), /\.jsonl$/, 1), open: liveRegistries(join(piDir, "10and2")) },
+    // Cursor's CLI agent: each chat is `chats/<folder hash>/<id>/` with a meta.json Cursor rewrites as it changes.
+    { agent: "cursor", name: NAMES.cursor, installed: cursor !== null || existsSync(cursorChats), version: cursor || null,
+      sessions: recentFiles(cursorChats, /^meta\.json$/, 2), open: (() => { try { return openChats(cursorChats).size; } catch { return null; } })() },
     { agent: "opencode", name: NAMES.opencode, installed: opencode !== null || existsSync(opencodeData), version: opencode || null, sessions: oc?.sessions ?? null, open: oc?.open ?? null },
     // Gemini CLI keeps no record of what's open: its running processes are counted instead.
     { agent: "gemini", name: NAMES.gemini, installed: geminiV !== null || existsSync(join(gemini, "tmp")), version: geminiV || null,

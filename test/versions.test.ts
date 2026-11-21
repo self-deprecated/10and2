@@ -4,7 +4,7 @@ import { MINIMUM, shortfall, versionWarning } from "../src/versions.ts";
 import { AGENTS } from "../src/policy.ts";
 
 test("the versions the harness measured on are new enough for everything", () => {
-  const measured = { claude: "2.1.321", codex: "0.167.0", pi: "1.5.1", opencode: "1.19.5", gemini: "0.68.0", copilot: "1.0.112", t3: "0.1.8" } as const;
+  const measured = { claude: "2.1.321", codex: "0.167.0", pi: "1.5.1", opencode: "1.19.5", gemini: "0.68.0", copilot: "1.0.112", t3: "0.1.8", cursor: "2026.11.19-f005e9d" } as const;
   for (const a of AGENTS) assert.equal(shortfall(a, measured[a]), null, a);
 });
 

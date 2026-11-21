@@ -138,7 +138,7 @@ test("agents: each on or off, or narrowed; the older top-level booleans still re
   const old = parsePolicy(JSON.stringify({ brain, claude: true, t3: false }));
   assert.deepEqual([old.t3, old.claude, old.codex, old.steer, old.answer], [false, true, false, true, true]);
 
-  assert.throws(() => parsePolicy(JSON.stringify({ brain, agents: { cursor: true } })), /no agent called "cursor"/);
+  assert.throws(() => parsePolicy(JSON.stringify({ brain, agents: { aider: true } })), /no agent called "aider"/);
   assert.throws(() => parsePolicy(JSON.stringify({ brain, agents: { claude: { steer: "no" } } })), /agents.claude.steer must be true or false/);
   assert.throws(() => parsePolicy(JSON.stringify({ brain, agents: { t3: false, claude: false } })), /every coding agent is off/);
 });

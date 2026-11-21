@@ -13,9 +13,9 @@ const parts = (name: string) => {
 const renamed = (p: Place, extra: string) => ({ ...p, name: `${parts(p.name).base} (${extra})${parts(p.name).on}` });
 
 /** The coding apps a new thread can start in, as said. A connector names each by a prefix (after the machine's own); T3 Code's places have none. */
-export const APPS = { t3: "T3 Code", claude: "Claude Code", codex: "Codex", pi: "Pi", opencode: "OpenCode", gemini: "Gemini CLI", copilot: "Copilot CLI" } as const;
+export const APPS = { t3: "T3 Code", claude: "Claude Code", codex: "Codex", pi: "Pi", opencode: "OpenCode", gemini: "Gemini CLI", copilot: "Copilot CLI", cursor: "Cursor" } as const;
 export type App = keyof typeof APPS;
-const appOf = (p: Place): App => (/(?:^|\|)(claude|codex|pi|opencode|gemini|copilot):/.exec(p.id)?.[1] as App | undefined) ?? "t3";
+const appOf = (p: Place): App => (/(?:^|\|)(claude|codex|pi|opencode|gemini|copilot|cursor):/.exec(p.id)?.[1] as App | undefined) ?? "t3";
 /** The agent a place belongs to, said ("Claude Code"), or null for T3 Code's. */
 const agentOf = (p: Place) => (appOf(p) === "t3" ? null : APPS[appOf(p)]);
 

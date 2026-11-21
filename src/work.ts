@@ -5,8 +5,8 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { FirstAsk } from "./contract.ts";
 import { execFileCommand } from "./command.ts";
 
-/** A worktree a coding agent keeps inside its project (`<project>/.claude/worktrees/<name>`, and `.codex`, `.opencode`, `.pi`, `.gemini`, `.copilot`). */
-const AGENT_WORKTREE = /^(.*?)[/\\]\.(?:claude|codex|opencode|pi|gemini|copilot)[/\\]worktrees[/\\][^/\\]+(?:[/\\]|$)/;
+/** A worktree a coding agent keeps inside its project (`<project>/.claude/worktrees/<name>`, and `.codex`, `.opencode`, `.pi`, `.gemini`, `.copilot`, `.cursor`). */
+const AGENT_WORKTREE = /^(.*?)[/\\]\.(?:claude|codex|opencode|pi|gemini|copilot|cursor)[/\\]worktrees[/\\][^/\\]+(?:[/\\]|$)/;
 
 /**
  * The nearest folder at or above `cwd` with a `.git` (a checkout or a worktree), or null. A coding agent's own worktree

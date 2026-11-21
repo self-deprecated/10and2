@@ -18,7 +18,7 @@ const base = { brain: "wss://brain.example/connector", projects: "*" };
 
 test("every agent found starts on, with everything allowed", () => {
   const c = defaultChoice(found({ claude: true, pi: true }));
-  assert.deepEqual(c.on, { t3: false, claude: true, codex: false, opencode: false, pi: true, gemini: false, copilot: false });
+  assert.deepEqual(c.on, { t3: false, claude: true, codex: false, opencode: false, pi: true, gemini: false, copilot: false, cursor: false });
   assert.ok(Object.values(c.caps).every(Boolean));
   assert.equal(c.ceiling, "full-access");
 });
@@ -27,7 +27,7 @@ test("a choice written and read back is the same choice, and the policy enforces
   const c: Choice = { ...defaultChoice(found({ claude: true, codex: true, pi: true })), off: { codex: ["steer", "start_work"] } };
   const written = applyChoice({ ...base, claude: true, t3: true }, c);
   assert.equal(written.t3, undefined, "the older top-level booleans give way to agents");
-  assert.deepEqual(written.agents, { claude: true, codex: { steer: false, actions: ["follow_up", "settle", "snooze", "archive"] }, pi: true, opencode: false, gemini: false, copilot: false, t3: false });
+  assert.deepEqual(written.agents, { claude: true, codex: { steer: false, actions: ["follow_up", "settle", "snooze", "archive"] }, pi: true, opencode: false, gemini: false, copilot: false, cursor: false, t3: false });
   assert.deepEqual(choiceOf(written), c);
 
   const p = parsePolicy(JSON.stringify(written));
@@ -52,7 +52,7 @@ test("switching follow-ups off takes steering and answering with it", () => {
 
 test("a file from before agents reads as the same choice", () => {
   const c = choiceOf({ ...base, claude: true, actions: ["follow_up", "settle", "snooze", "archive"], maxRuntimeMode: "auto" });
-  assert.deepEqual(c.on, { t3: true, claude: true, codex: false, opencode: false, pi: false, gemini: false, copilot: false });
+  assert.deepEqual(c.on, { t3: true, claude: true, codex: false, opencode: false, pi: false, gemini: false, copilot: false, cursor: false });
   assert.deepEqual(c.caps, { follow_up: true, steer: true, answer: true, start_work: false, tidy: true });
   assert.equal(c.ceiling, "auto");
 });
@@ -60,7 +60,7 @@ test("a file from before agents reads as the same choice", () => {
 test("flags choose without a terminal, and narrow one agent when given names", () => {
   const start = defaultChoice(found({ claude: true, codex: true, pi: true }));
   const only = applyFlags(start, flags({ agents: "claude,pi", "no-steer": "true", "no-start": "true" }));
-  assert.deepEqual(only.on, { t3: false, claude: true, codex: false, opencode: false, pi: true, gemini: false, copilot: false });
+  assert.deepEqual(only.on, { t3: false, claude: true, codex: false, opencode: false, pi: true, gemini: false, copilot: false, cursor: false });
   assert.equal(only.caps.steer, false);
   assert.equal(only.caps.start_work, false);
   assert.equal(start.caps.steer, true, "the choice given isn't changed");
@@ -72,7 +72,7 @@ test("flags choose without a terminal, and narrow one agent when given names", (
 
   const ro = applyFlags(start, flags({ "read-only": "true" }));
   assert.ok(Object.values(ro.caps).every((v) => !v));
-  assert.throws(() => applyFlags(start, flags({ agents: "claude,cursor" })), /no agent called "cursor"/);
+  assert.throws(() => applyFlags(start, flags({ agents: "claude,aider" })), /no agent called "aider"/);
 });
 
 test("the closing words say who 10 & 2 reaches, what it may do, and what's narrower", () => {
@@ -121,8 +121,8 @@ test("the checklist moves, switches, opens an agent and cycles a choice", () => 
 test("choosing again starts from the file; agents a file from before agents doesn't mention start as found", () => {
   const all = found({ claude: true, codex: true, pi: true });
   const old = startingChoice({ ...base, claude: true, t3: false, actions: ["follow_up"] }, all);
-  assert.deepEqual(old.on, { t3: false, claude: true, codex: true, opencode: false, pi: true, gemini: false, copilot: false });
-  const chosen = startingChoice(applyChoice(base, { ...defaultChoice(all), on: { t3: false, claude: true, codex: false, opencode: false, pi: false, gemini: false, copilot: false } }), all);
+  assert.deepEqual(old.on, { t3: false, claude: true, codex: true, opencode: false, pi: true, gemini: false, copilot: false, cursor: false });
+  const chosen = startingChoice(applyChoice(base, { ...defaultChoice(all), on: { t3: false, claude: true, codex: false, opencode: false, pi: false, gemini: false, copilot: false, cursor: false } }), all);
   assert.equal(chosen.on.codex, false, "a choice made with agents stays as made");
   assert.equal(startingChoice({ ...base, claude: true, codex: false }, all).on.codex, false, "an agent the file names stays as named");
   assert.deepEqual(startingChoice(null, all).on, defaultChoice(all).on);
@@ -135,7 +135,7 @@ test("an agent is found by its command on PATH or by its own folder; T3 Code by 
   mkdirSync(bin);
   const env: NodeJS.ProcessEnv = {
     ...process.env, PATH: bin, CLAUDE_CONFIG_DIR: join(dir, "claude"), CODEX_HOME: join(dir, "codex"), PI_CODING_AGENT_DIR: join(dir, "pi"),
-    XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3",
+    XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3", CURSOR_CONFIG_DIR: join(dir, "cursor"),
   };
   const installed = async () => (await detect(env)).filter((f) => f.installed).map((f) => [f.agent, f.version]);
   assert.deepEqual(await installed(), []);
@@ -151,6 +151,9 @@ test("an agent is found by its command on PATH or by its own folder; T3 Code by 
   command("codex", "codex-cli 0.169.0");
   command("t3", "", 1);
   assert.deepEqual(await installed(), [["codex", "0.169.0"], ["pi", null], ["t3", null]]);
+  // Cursor's CLI agent: by its command (its version is a date), or its chats folder.
+  command("cursor-agent", "2026.11.19-f005e9d");
+  assert.deepEqual((await detect(env)).find((f) => f.agent === "cursor")!.version, "2026.11.19-f005e9d");
 });
 
 test("the old Windows console gets marks its fonts have; Windows Terminal, VS Code's terminal and every other system get Unicode", () => {

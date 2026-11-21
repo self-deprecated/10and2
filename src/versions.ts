@@ -36,12 +36,15 @@ export const MINIMUM: Record<Agent, Partial<Record<Feature, string>>> = {
   // modes and models and refuses YOLO in an untrusted folder, and Copilot CLI 1.0.112. Older ones aren't measured yet.
   gemini: { read: "0.68.0", follow_up: "0.68.0", continue: "0.68.0", start: "0.68.0", start_worktree: "0.68.0" },
   copilot: { read: "1.0.112", follow_up: "1.0.112", continue: "1.0.112", start: "1.0.112", start_worktree: "1.0.112" },
+  // Cursor's CLI agent names its releases by date. Its chats' meta.json (with the folder) and transcripts are laid out
+  // as read here from 2026.08.11 (read in each release's own code); the rest was measured on 2026.11.19 only.
+  cursor: { read: "2026.08.11", follow_up: "2026.11.19", continue: "2026.11.19", start: "2026.11.19", start_worktree: "2026.11.19" },
   // Orchestration protocol 2, scoped sessions and thread launches all came with 0.1.0; 0.0.45 refuses the connection.
   t3: { read: "0.1.0", follow_up: "0.1.0", steer: "0.1.0", answer: "0.1.0", start: "0.1.0", start_worktree: "0.1.0", tidy: "0.1.0" },
 };
 
 /** Each agent's own update command, which works however it was installed (all exist well before each floor). */
-export const UPDATE: Record<Agent, string> = { claude: "claude update", codex: "codex update", pi: "pi update self", opencode: "opencode upgrade", gemini: "npm install -g @google/gemini-cli@latest", copilot: "copilot update", t3: "t3 update" };
+export const UPDATE: Record<Agent, string> = { claude: "claude update", codex: "codex update", pi: "pi update self", opencode: "opencode upgrade", gemini: "npm install -g @google/gemini-cli@latest", copilot: "copilot update", t3: "t3 update", cursor: "cursor-agent update" };
 
 /** The leading x.y.z of a version as numbers ("0.1.6-dev.2d3b" → [0, 1, 6]); null when there isn't one. */
 function parts(v: string): number[] | null {

@@ -393,7 +393,7 @@ test("setup pairs in the browser, keeps the credential private, writes a policy;
   assertPrivate(creds);
   assert.equal(JSON.parse(readFileSync(creds, "utf8"))[origin], credential);
   const policy = JSON.parse(readFileSync(join(dir, "config", "10and2", "connector.json"), "utf8"));
-  assert.deepEqual(policy, { brain: `${origin.replace("http", "ws")}/connector`, projects: "*", actions: ["follow_up", "settle", "snooze", "archive", "start_work"], steer: true, answer: true, maxRuntimeMode: "full-access", agents: { claude: false, codex: false, pi: false, opencode: false, gemini: false, copilot: false, t3: true }, worktreeBase: "main" });
+  assert.deepEqual(policy, { brain: `${origin.replace("http", "ws")}/connector`, projects: "*", actions: ["follow_up", "settle", "snooze", "archive", "start_work"], steer: true, answer: true, maxRuntimeMode: "full-access", agents: { claude: false, codex: false, pi: false, opencode: false, gemini: false, copilot: false, cursor: false, t3: true }, worktreeBase: "main" });
 
   const again = await cli(["setup", "--no-autostart"], env);
   assert.equal(again.status, 0);
