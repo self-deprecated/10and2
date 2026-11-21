@@ -2,12 +2,16 @@
 // COPILOT_OFFLINE, so it never reaches GitHub): a session open in its terminal UI is listed and read, its question is
 // read out, and it isn't sent to while it's open; once closed it's continued through Copilot's ACP mode, where a
 // permission it asks for is refused; new work starts in the checkout (allow-all, which runs its tool), in a worktree,
-// and on a model Copilot lists. Runs in the harness container only (run.sh).
+// and on a model Copilot lists. Runs in the harness container (run.sh), or with TENANDTWO_HARNESS_HERE=1 where the CLI is
+// installed. Without tmux (Windows) there's no terminal UI to drive: the user's session is made with `copilot -p`, and
+// held open by a second Copilot through ACP, and the question (a terminal's) is left out.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readdirSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { AcpAdapter } from "../../src/acp/adapter.ts";
+import { AcpClient } from "../../src/acp/rpc.ts";
+import { spawnCommand } from "../../src/command.ts";
 import { CopilotSource } from "../../src/copilot/source.ts";
 import type { Action, LaunchProfile } from "../../src/contract.ts";
 import { has, home, inContainer, mockModel, project, sleep, Terminal, until } from "./lib.ts";
@@ -26,8 +30,14 @@ test("Copilot CLI: list, read, its question, refuse an open session, continue a 
     entryScript: resolve(import.meta.dirname, "..", "fixtures", "acp", "turn.ts"), acceptanceTimeoutMs: 60_000,
     policy: { brain: "wss://unused.invalid/connector", projects: [cwd], actions: ["follow_up", "settle", "snooze", "archive", "start_work"], maxRuntimeMode: "full-access",
       claude: false, t3: false, codex: false, opencode: false, pi: false, copilot: true, steer: true, answer: true, limits: {}, worktreeBase: "HEAD" } });
-  const tui = new Terminal("copilot");
-  t.after(async () => { tui.stop(); Terminal.stopAll(); await adapter.close(); });
+  const terminal = has("tmux"), tui = new Terminal("copilot");
+  let holder: AcpClient | null = null;
+  t.after(async () => { holder?.stop(); if (terminal) { tui.stop(); Terminal.stopAll(); } await adapter.close(); });
+  /** `copilot -p`, as a user's own run: resolves once it's done. */
+  const headless = (words: string) => new Promise<number | null>((done) => {
+    const child = spawnCommand("copilot", ["-p", words], { cwd, env: process.env, stdio: "ignore" });
+    child.on("exit", done); child.on("error", () => done(-1));
+  });
 
   let id = "";
   const follow = (key: string, message: string): Promise<any> => adapter.execute({ kind: "follow_up", itemId: id, message } as Action, key);
@@ -35,21 +45,31 @@ test("Copilot CLI: list, read, its question, refuse an open session, continue a 
     title: `Harness ${key}`, message, profile: { name: "Build", runtimeMode: "full-access", workspace: "root", interactionMode: "default", ...profile }, ...(model ? { model } : {}) }, key);
   const item = async () => (await adapter.list()).find((i) => i.id === id);
 
-  await t.test("read: a session open in its terminal is listed and read, and isn't sent to while it's open", async () => {
-    tui.start("copilot", cwd, env);
-    await until("the folder trust question", () => tui.screen().includes("Do you trust the files in this folder?"), 60_000);
-    tui.key("Enter");
-    await until("the terminal to be ready", () => tui.screen().includes("Manual Approval"), 30_000);
-    await tui.type("First words CPONE");
-    await until("its first reply", () => tui.screen().includes("ACK First words CPONE"), 60_000);
+  await t.test("read: a session open in its terminal (or held by another Copilot) is listed and read, and isn't sent to while it's open", async () => {
+    if (terminal) {
+      tui.start("copilot", cwd, env);
+      await until("the folder trust question", () => tui.screen().includes("Do you trust the files in this folder?"), 60_000);
+      tui.key("Enter");
+      await until("the terminal to be ready", () => tui.screen().includes("Manual Approval"), 30_000);
+      await tui.type("First words CPONE");
+      await until("its first reply", () => tui.screen().includes("ACK First words CPONE"), 60_000);
+    } else assert.equal(await headless("First words CPONE"), 0);
     await adapter.start();
     await until("it to be listed", async () => { const items = await adapter.list(); id = items[0]?.id ?? ""; return items.length === 1 && items[0]!.status === "completed"; });
+    if (!terminal) {
+      // Busy in another Copilot (an editor's, through ACP), which holds the session's lock while a turn runs (not while
+      // it only has it loaded, unlike a terminal).
+      holder = new AcpClient(["copilot", "--acp"], cwd, process.env);
+      await holder.initialize(); await holder.session(cwd, id);
+      void holder.prompt(id, "Busy words SLOW60").catch(() => {});
+      await until("the other Copilot to hold it", async () => /open in Copilot CLI/.test(await adapter.check({ kind: "follow_up", itemId: id, message: "x" }) ?? ""), 30_000);
+    }
     assert.equal((await adapter.report(id)).text, "ACK First words CPONE");
     assert.equal((await item())!.title, "First words CPONE");
     assert.match(await adapter.check({ kind: "follow_up", itemId: id, message: "x" }) ?? "", /open in Copilot CLI/);
   });
 
-  await t.test("question: Copilot's ask_user, open in its terminal, is read out and answered there", async () => {
+  await t.test("question: Copilot's ask_user, open in its terminal, is read out and answered there", { skip: !terminal && "needs a terminal UI (tmux)" }, async () => {
     await tui.type("Ask me CPASKQ");
     await until("the question to be listed", async () => (await item())?.pendingQuestion === true, 60_000);
     assert.equal((await item())!.status, "waiting");
@@ -61,7 +81,7 @@ test("Copilot CLI: list, read, its question, refuse an open session, continue a 
   });
 
   await t.test("continue: once the terminal is closed, the session is continued through ACP", async () => {
-    tui.stop();
+    if (terminal) tui.stop(); else { holder?.child.kill(); holder = null; }
     await until("the session to be closed", async () => (await adapter.check({ kind: "follow_up", itemId: id, message: "x" })) === null, 30_000);
     assert.deepEqual(await follow("closed", "Closed words CPCLOSED"), { ok: true });
     await until("the model to get it", () => mock.saw("Closed words CPCLOSED"), 60_000);

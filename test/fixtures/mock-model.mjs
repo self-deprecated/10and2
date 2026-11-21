@@ -19,8 +19,8 @@
 //                      options Alpha and Beta; the tool's result (a "tool" message) then comes back as "ACK RESULT <it>"
 //   contains CPASKQ    (Chat Completions, with Copilot's ask_user tool offered) calls ask_user: "Which one?", Alpha or Beta
 //   contains GASKQ     (Gemini, with its ask_user tool offered) calls ask_user with the same question
-//   contains TOUCH=<f> (Chat Completions with a bash tool, or Gemini with run_shell_command) runs `touch <f>` in the
-//                      session's folder: the file is there only if the agent ran it, which a refused permission stops
+//   contains TOUCH=<f> (Chat Completions with a bash or powershell tool, or Gemini with run_shell_command) runs
+//                      `echo made > <f>` (the same in bash, PowerShell and cmd) in the session's folder: the file is there only if the agent ran it, which a refused permission stops
 //   otherwise          answers at once
 // and is always "ACK <the user's text>", so a test can see exactly what reached the model. Every request is appended
 // to $MOCK_MODEL_LOG (JSON lines: path, the model asked for, the user texts it saw), when set.
@@ -93,7 +93,7 @@ createServer(async (req, res) => {
     let parts;
     if (result) parts = [{ text: `ACK RESULT ${JSON.stringify(result.response ?? {}).replace(/\s+/g, " ").slice(0, 400)}` }];
     else if (/GASKQ/.test(last) && tools.includes("ask_user")) parts = [{ functionCall: { name: "ask_user", args: { questions: [{ question: "Which one?", header: "Pick", type: "choice", options: [{ label: "Alpha", description: "the first" }, { label: "Beta", description: "the second" }] }] } } }];
-    else if (/TOUCH=\S+/.test(last) && tools.includes("run_shell_command")) parts = [{ functionCall: { name: "run_shell_command", args: { command: `touch ${/TOUCH=(\S+)/.exec(last)[1]}`, description: "Touch a file" } } }];
+    else if (/TOUCH=\S+/.test(last) && tools.includes("run_shell_command")) parts = [{ functionCall: { name: "run_shell_command", args: { command: `echo made > ${/TOUCH=(\S+)/.exec(last)[1]}`, description: "Make a file" } } }];
     if (gemini[1] === "generateContent") return json(answer(parts ?? [{ text: words.join("") }]));
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
     const send = (o) => res.write(`data: ${JSON.stringify(o)}\r\n\r\n`);
@@ -111,10 +111,10 @@ createServer(async (req, res) => {
       words.splice(0, words.length, ...`ACK RESULT ${said.replace(/\s+/g, " ").trim().slice(0, 400)}`.split(/(?<= )/));
     } else if ((/OCASKQ/.test(last) && (body.tools ?? []).some((t) => t?.function?.name === "question"))
       || (/CPASKQ/.test(last) && (body.tools ?? []).some((t) => t?.function?.name === "ask_user"))
-      || (/TOUCH=\S+/.test(last) && (body.tools ?? []).some((t) => t?.function?.name === "bash"))) {
+      || (/TOUCH=\S+/.test(last) && (body.tools ?? []).some((t) => ["bash", "powershell"].includes(t?.function?.name)))) {
       const [name, args] = /OCASKQ/.test(last) ? ["question", JSON.stringify({ questions: [{ question: "Which one?", header: "Pick", options: [{ label: "Alpha", description: "the first" }, { label: "Beta", description: "the second" }] }] })]
         : /CPASKQ/.test(last) ? ["ask_user", JSON.stringify({ message: "Which one?", requestedSchema: { type: "object", properties: { pick: { type: "string", title: "Pick", enum: ["Alpha", "Beta"] } }, required: ["pick"] } })]
-        : ["bash", JSON.stringify({ command: `touch ${/TOUCH=(\S+)/.exec(last)[1]}`, description: "Touch a file", mode: "sync" })];
+        : [(body.tools ?? []).some((t) => t?.function?.name === "bash") ? "bash" : "powershell", JSON.stringify({ command: `echo made > ${/TOUCH=(\S+)/.exec(last)[1]}`, description: "Make a file", mode: "sync" })];
       const call = { index: 0, id: `call_${id}`, type: "function", function: { name, arguments: args } };
       const usage = { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 };
       if (!body.stream) {

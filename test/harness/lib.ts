@@ -6,6 +6,7 @@ import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { TestContext } from "node:test";
+import { which } from "../../src/command.ts";
 
 export const inContainer = process.env.TENANDTWO_HARNESS === "1";
 export const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -67,10 +68,8 @@ export class Terminal {
 }
 export const shellQuote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
-/** Whether a CLI is on PATH here. */
-export function has(command: string): boolean {
-  try { execFileSync("sh", ["-c", `command -v ${command}`], { stdio: "ignore" }); return true; } catch { return false; }
-}
+/** Whether a CLI is on PATH here (found as the connector finds one: PATHEXT on Windows, where there's no `sh`). */
+export const has = (command: string): boolean => which(command) !== null;
 
 /** A fresh, private home for one harness's configuration and sessions. */
 export function home(name: string): string {
