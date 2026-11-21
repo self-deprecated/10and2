@@ -1,0 +1,18 @@
+# The install tests' machine (run.sh): Debian with systemd booted as PID 1, like a Linux desktop, and Node 22. The user
+# `node` installs with npm into ~/.local as nvm or a user prefix would, from the stand-in registry (standin.mjs), and
+# trusts the stand-in 10and2.selfdep.com's certificate. Only Claude Code is "installed": a stub that says its version.
+FROM docker.io/library/node:22-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv dbus dbus-user-session libpam-systemd openssl \
+  && rm -rf /var/lib/apt/lists/*
+# The user's systemd starts at boot (lingering), as `loginctl enable-linger` does; the boot is otherwise kept short.
+RUN mkdir -p /var/lib/systemd/linger && touch /var/lib/systemd/linger/node \
+  && systemctl mask getty.target console-getty.service systemd-firstboot.service apt-daily.timer apt-daily-upgrade.timer
+# The stand-in's certificate is made at each run (standin.mjs); Node reads it from here, in a login shell and in the
+# user's services alike.
+RUN echo 'export NODE_EXTRA_CA_CERTS=/etc/10and2-test/ca.pem' > /etc/profile.d/10and2-test.sh \
+  && mkdir -p /etc/systemd/user.conf.d \
+  && printf '[Manager]\nDefaultEnvironment=NODE_EXTRA_CA_CERTS=/etc/10and2-test/ca.pem\n' > /etc/systemd/user.conf.d/10and2-test.conf
+RUN printf '#!/bin/sh\necho "2.1.321 (Claude Code)"\n' > /usr/local/bin/claude && chmod 755 /usr/local/bin/claude
+USER node
+RUN mkdir -p ~/.local/bin && printf 'prefix=/home/node/.local\nregistry=http://127.0.0.1:4873/\naudit=false\nfund=false\nupdate-notifier=false\n' > ~/.npmrc
+USER root
