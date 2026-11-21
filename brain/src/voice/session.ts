@@ -112,7 +112,7 @@ export type SessionOptions = {
    * no opening note and a rejoined one only its note, and both wait for the user, as before 3 November.
    */
   speakFirstNew?: boolean;
-  /** How Driver opens a new call it speaks first in (the phone's setting `greeting`); absent: "news". */
+  /** How Driver opens a new call it speaks first in (the phone's setting `greeting`); absent: "hello". */
   greeting?: Greeting;
   /** What a reply Driver words for a thread does (the phone's setting `keepReplies`); absent: "send". */
   keepReplies?: KeepReplies;
@@ -224,7 +224,7 @@ function newsOf(replies: CallbackReply[], name: Name): string {
 
 /**
  * How Driver opens a new call (the phone's Settings → Calls → When a call starts): "news" says what happened since the
- * last drive or what's waiting; "hello" only says it's there, and waits.
+ * last drive or what's waiting; "hello" (the default) only asks what they want to work on, and waits.
  */
 export type Greeting = "news" | "hello";
 
@@ -433,7 +433,7 @@ export function buildSessionConfig(opts: SessionOptions, deps: ToolDeps, convers
   // A new call that waits for the user (speak-first switched off) has no note for either model, as before 3 November.
   const silentNew = opening.kind === "new" && opts.speakFirstNew === false;
   const speaks = speaksFirst(opening.kind, opts.speakFirstNew);
-  const text = silentNew ? null : opening.kind === "new" && opts.greeting === "hello" ? fill("opening.hello", {}, opts.prompts) : openingNote(opening, changes, name, opts.prompts, speaks);
+  const text = silentNew ? null : opening.kind === "new" && opts.greeting !== "news" ? fill("opening.hello", {}, opts.prompts) : openingNote(opening, changes, name, opts.prompts, speaks);
   // The note of a call Driver opens by speaking (a new or rejoined call, a call-back, back from a reading or a
   // dictation) is the user's turn, which the voice model answers. As a developer message, GPT-Live often began with a
   // burst of another language (eval, 4 November: 2 of 8 runs, none of 8 as the user's), and every burst in a recording

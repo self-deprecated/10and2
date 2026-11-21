@@ -173,9 +173,10 @@ Do not delegate to the backend when: greetings, small talk, reflecting back what
   // Driver speaks first in a new call: on 3 November Apple's reviewer started one and both sides waited a minute. In
   // English: with nothing from the user yet, GPT-Live opened one eval call in Hindi.
   editable("opening.new", "The user has just started a call and hasn't said anything yet. Speak first, in English: give your first answer now, in one to three short sentences (what happened since their last drive when the briefing says, otherwise what's waiting on them), then stop. Do not greet at length."),
-  // The user's setting `greeting` "hello" (Settings → Calls → When a call starts, Jordan, 14 November): Driver still
-  // speaks first, so the call doesn't seem dead, but only to say it's there; the briefing waits until they ask.
-  editable("opening.hello", "The user has just started a call and hasn't said anything yet. Speak first, in English: say only a short hello in a few words, such as \"Hi, I'm here.\", then stop and wait for them. Tell them nothing from the briefing, and ask them nothing, until they speak."),
+  // The user's setting `greeting` "hello" (Settings → Calls → When a call starts, Jordan, 14 November; the default since
+  // 21 November): Driver still speaks first, so the call doesn't seem dead, but only to ask what they want to work on;
+  // the briefing waits until they ask. A rundown at the start was hard to get a word in over.
+  editable("opening.hello", "The user has just started a call and hasn't said anything yet. Speak first, in English: in a few words, ask what they'd like to work on, such as \"Hi, what do you want to work on?\", then stop and wait for them. Tell them nothing from the briefing until they ask."),
   locked("opening.resume", "This is the same conversation, carried on in a new voice session (after a dropped connection, or a reading or dictation on the phone); carry on from where it left off and do not greet again.{{changes}}"),
   locked("opening.continue", "The user reopened this earlier conversation to carry on with it. {{opening.rejoin-history}}{{changes}}"),
   locked("opening.rejoin", "The user hung up a few minutes ago and has started a call again: this is a new call in the same conversation. {{opening.rejoin-history}}{{speak}}{{changes}}"),

@@ -236,8 +236,8 @@ const fastOf = (body: any) => ({ conversations: body.fast === "conversations" ||
  */
 const keepRepliesOf = (body: any): KeepReplies => (body.keepReplies === "ask" || body.keepReplies === "keep" ? body.keepReplies : "send");
 
-/** How Driver opens a new call (the phone's setting, `Greeting`). An older phone, which sends nothing, gets "news", as before. */
-const greetingOf = (body: any): Greeting => (body.greeting === "hello" ? "hello" : "news");
+/** How Driver opens a new call (the phone's setting, `Greeting`): "hello" unless the phone asks for "news" (21 November). */
+const greetingOf = (body: any): Greeting => (body.greeting === "news" ? "news" : "hello");
 
 /** The most kept replies one Send all sends. */
 const SEND_ALL_MAX = 50;
