@@ -16,10 +16,21 @@ repo="$(cd "$here/../../.." && pwd)"
 engine="$(command -v podman || command -v docker || true)"
 [[ -n $engine ]] || { echo "harness: needs podman or docker" >&2; exit 1; }
 have() { "$engine" image exists "$1" 2>/dev/null || "$engine" image inspect "$1" >/dev/null 2>&1; }
+# A build that stalls is stopped and tried once more: on CI one sat in a download for the job's whole 45 minutes (21
+# November). A build takes under a minute there; HARNESS_BUILD_TIMEOUT allows a slow first one elsewhere.
+build() {
+  local tag=$1 file=$2 try
+  local stop=(); command -v timeout >/dev/null && stop=(timeout -k 30s "${HARNESS_BUILD_TIMEOUT:-10m}")
+  for try in 1 2; do
+    ${stop[@]+"${stop[@]}"} "$engine" build -q -t "$tag" -f "$file" "$here" >/dev/null && return 0
+    echo "harness: building $tag failed or stalled (try $try of 2)" >&2
+  done
+  return 1
+}
 tag="10and2-harness:$(sha256sum "$here/Containerfile" | cut -c1-12)"
 if ! have "$tag"; then
   echo "harness: building $tag" >&2
-  "$engine" build -q -t "$tag" -f "$here/Containerfile" "$here" >/dev/null
+  build "$tag" "$here/Containerfile"
 fi
 # Pi was @mariozechner/pi-coding-agent before 0.74.0; both install `pi`, so the pinned one goes first.
 steps=()
@@ -42,7 +53,9 @@ if [[ ${#steps[@]} -gt 0 ]]; then
   tag="$tag-$(printf '%s' "$layer" | sha256sum | cut -c1-12)"
   if ! have "$tag"; then
     echo "harness: building $tag (${CLAUDE_CODE:+claude-code $CLAUDE_CODE }${CODEX:+codex $CODEX }${OPENCODE:+opencode $OPENCODE }${PI:+pi $PI }${T3:+t3 $T3 }${GEMINI:+gemini $GEMINI }${COPILOT:+copilot $COPILOT})" >&2
-    printf '%s\n' "$layer" | "$engine" build -q -t "$tag" -f - "$here" >/dev/null
+    containerfile="$(mktemp)"; trap 'rm -f "$containerfile"' EXIT
+    printf '%s\n' "$layer" > "$containerfile"
+    build "$tag" "$containerfile"; rm -f "$containerfile"
   fi
 fi
 [[ -d $repo/connector/node_modules ]] || (cd "$repo/connector" && npm ci --silent)
