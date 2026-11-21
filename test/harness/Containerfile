@@ -8,16 +8,21 @@ ARG OPENCODE=1.19.5
 ARG PI=1.5.1
 # T3 Code: upstream's npm `t3`, which runs its threads with the Codex above.
 ARG T3=0.1.8
+# Gemini CLI and GitHub Copilot CLI, reached through their ACP mode (src/acp/).
+ARG GEMINI=0.68.0
+ARG COPILOT=1.0.112
 RUN npm install -g --no-fund --no-audit "@anthropic-ai/claude-code@${CLAUDE_CODE}" \
     ${CODEX:+"@openai/codex@${CODEX}"} ${OPENCODE:+"opencode-ai@${OPENCODE}"} ${PI:+"@earendil-works/pi-coding-agent@${PI}"} \
-    ${T3:+"t3@${T3}"} \
+    ${T3:+"t3@${T3}"} ${GEMINI:+"@google/gemini-cli@${GEMINI}"} ${COPILOT:+"@github/copilot@${COPILOT}"} \
   && npm cache clean --force
 # OpenCode installs its plugin package into its config folder from npm before it loads any plugin, and waits for it: put
 # there ahead of time (opencode.harness.ts copies this into its own config folder), since the tests have no network.
 RUN if [ -n "$OPENCODE" ]; then mkdir -p /opt/opencode-config && cd /opt/opencode-config \
     && npm install --no-fund --no-audit --save-exact "@opencode-ai/plugin@${OPENCODE}" && npm cache clean --force; fi
 USER node
-# `t3` downloads T3 Code's executable into ~/.t3 the first time it runs: done here, while there's network.
+# `t3` downloads T3 Code's executable into ~/.t3 the first time it runs: done here, while there's network. Copilot
+# unpacks its own into ~/.cache/copilot the first time; the tests give it another HOME, so it's kept where any finds it.
 RUN if [ -n "$T3" ]; then t3 --version; fi
+RUN if [ -n "$COPILOT" ]; then copilot --version; fi
 ENV TENANDTWO_HARNESS=1 DISABLE_AUTOUPDATER=1
 WORKDIR /work/connector

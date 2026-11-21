@@ -18,7 +18,7 @@ const base = { brain: "wss://brain.example/connector", projects: "*" };
 
 test("every agent found starts on, with everything allowed", () => {
   const c = defaultChoice(found({ claude: true, pi: true }));
-  assert.deepEqual(c.on, { t3: false, claude: true, codex: false, opencode: false, pi: true });
+  assert.deepEqual(c.on, { t3: false, claude: true, codex: false, opencode: false, pi: true, gemini: false, copilot: false });
   assert.ok(Object.values(c.caps).every(Boolean));
   assert.equal(c.ceiling, "full-access");
 });
@@ -27,7 +27,7 @@ test("a choice written and read back is the same choice, and the policy enforces
   const c: Choice = { ...defaultChoice(found({ claude: true, codex: true, pi: true })), off: { codex: ["steer", "start_work"] } };
   const written = applyChoice({ ...base, claude: true, t3: true }, c);
   assert.equal(written.t3, undefined, "the older top-level booleans give way to agents");
-  assert.deepEqual(written.agents, { claude: true, codex: { steer: false, actions: ["follow_up", "settle", "snooze", "archive"] }, pi: true, opencode: false, t3: false });
+  assert.deepEqual(written.agents, { claude: true, codex: { steer: false, actions: ["follow_up", "settle", "snooze", "archive"] }, pi: true, opencode: false, gemini: false, copilot: false, t3: false });
   assert.deepEqual(choiceOf(written), c);
 
   const p = parsePolicy(JSON.stringify(written));
@@ -52,7 +52,7 @@ test("switching follow-ups off takes steering and answering with it", () => {
 
 test("a file from before agents reads as the same choice", () => {
   const c = choiceOf({ ...base, claude: true, actions: ["follow_up", "settle", "snooze", "archive"], maxRuntimeMode: "auto" });
-  assert.deepEqual(c.on, { t3: true, claude: true, codex: false, opencode: false, pi: false });
+  assert.deepEqual(c.on, { t3: true, claude: true, codex: false, opencode: false, pi: false, gemini: false, copilot: false });
   assert.deepEqual(c.caps, { follow_up: true, steer: true, answer: true, start_work: false, tidy: true });
   assert.equal(c.ceiling, "auto");
 });
@@ -60,7 +60,7 @@ test("a file from before agents reads as the same choice", () => {
 test("flags choose without a terminal, and narrow one agent when given names", () => {
   const start = defaultChoice(found({ claude: true, codex: true, pi: true }));
   const only = applyFlags(start, flags({ agents: "claude,pi", "no-steer": "true", "no-start": "true" }));
-  assert.deepEqual(only.on, { t3: false, claude: true, codex: false, opencode: false, pi: true });
+  assert.deepEqual(only.on, { t3: false, claude: true, codex: false, opencode: false, pi: true, gemini: false, copilot: false });
   assert.equal(only.caps.steer, false);
   assert.equal(only.caps.start_work, false);
   assert.equal(start.caps.steer, true, "the choice given isn't changed");
@@ -121,8 +121,8 @@ test("the checklist moves, switches, opens an agent and cycles a choice", () => 
 test("choosing again starts from the file; agents a file from before agents doesn't mention start as found", () => {
   const all = found({ claude: true, codex: true, pi: true });
   const old = startingChoice({ ...base, claude: true, t3: false, actions: ["follow_up"] }, all);
-  assert.deepEqual(old.on, { t3: false, claude: true, codex: true, opencode: false, pi: true });
-  const chosen = startingChoice(applyChoice(base, { ...defaultChoice(all), on: { t3: false, claude: true, codex: false, opencode: false, pi: false } }), all);
+  assert.deepEqual(old.on, { t3: false, claude: true, codex: true, opencode: false, pi: true, gemini: false, copilot: false });
+  const chosen = startingChoice(applyChoice(base, { ...defaultChoice(all), on: { t3: false, claude: true, codex: false, opencode: false, pi: false, gemini: false, copilot: false } }), all);
   assert.equal(chosen.on.codex, false, "a choice made with agents stays as made");
   assert.equal(startingChoice({ ...base, claude: true, codex: false }, all).on.codex, false, "an agent the file names stays as named");
   assert.deepEqual(startingChoice(null, all).on, defaultChoice(all).on);

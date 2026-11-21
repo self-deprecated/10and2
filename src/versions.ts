@@ -32,12 +32,16 @@ export const MINIMUM: Record<Agent, Partial<Record<Feature, string>>> = {
   // The session table's `agent` column, which Driver reads, is there from 1.14.34. Words to a session open in a terminal
   // (through 10and2's plugin) show there from 1.14.49; before it they reach the model but never the terminal.
   opencode: { read: "1.14.34", follow_up: "1.14.49", steer: "1.14.49", answer: "1.14.49", continue: "1.14.34", start: "1.14.34", start_worktree: "1.14.34" },
+  // Measured on one release each so far (docs/launch/more-agents.md): Gemini CLI 0.68.0, whose ACP mode loads, lists
+  // modes and models and refuses YOLO in an untrusted folder, and Copilot CLI 1.0.112. Older ones aren't measured yet.
+  gemini: { read: "0.68.0", follow_up: "0.68.0", continue: "0.68.0", start: "0.68.0", start_worktree: "0.68.0" },
+  copilot: { read: "1.0.112", follow_up: "1.0.112", continue: "1.0.112", start: "1.0.112", start_worktree: "1.0.112" },
   // Orchestration protocol 2, scoped sessions and thread launches all came with 0.1.0; 0.0.45 refuses the connection.
   t3: { read: "0.1.0", follow_up: "0.1.0", steer: "0.1.0", answer: "0.1.0", start: "0.1.0", start_worktree: "0.1.0", tidy: "0.1.0" },
 };
 
 /** Each agent's own update command, which works however it was installed (all exist well before each floor). */
-export const UPDATE: Record<Agent, string> = { claude: "claude update", codex: "codex update", pi: "pi update self", opencode: "opencode upgrade", t3: "t3 update" };
+export const UPDATE: Record<Agent, string> = { claude: "claude update", codex: "codex update", pi: "pi update self", opencode: "opencode upgrade", gemini: "npm install -g @google/gemini-cli@latest", copilot: "copilot update", t3: "t3 update" };
 
 /** The leading x.y.z of a version as numbers ("0.1.6-dev.2d3b" → [0, 1, 6]); null when there isn't one. */
 function parts(v: string): number[] | null {

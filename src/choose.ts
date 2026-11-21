@@ -36,7 +36,7 @@ const actionsOf = (caps: Record<Cap, boolean>): ActionKind[] =>
 /** The choice a policy file holds (raw JSON, as written; the older top-level booleans too). */
 export function choiceOf(raw: any): Choice {
   const actions: string[] = Array.isArray(raw?.actions) ? raw.actions : [];
-  const on: Record<Agent, boolean> = { t3: raw?.t3 ?? true, claude: !!raw?.claude, codex: !!raw?.codex, opencode: !!raw?.opencode, pi: !!raw?.pi };
+  const on: Record<Agent, boolean> = { t3: raw?.t3 ?? true, claude: !!raw?.claude, codex: !!raw?.codex, opencode: !!raw?.opencode, pi: !!raw?.pi, gemini: false, copilot: false };
   const off: Partial<Record<Agent, Cap[]>> = {};
   if (raw?.agents && typeof raw.agents === "object") {
     for (const a of AGENTS) {

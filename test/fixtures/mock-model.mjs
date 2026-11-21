@@ -2,8 +2,10 @@
 // A deterministic stand-in for an OpenAI-compatible model API, so real coding-agent CLIs (Codex, OpenCode, Pi) can run in
 // tests without a model: `node mock-model.mjs [port]` prints the port it listens on. It never calls anything.
 //
-// It answers the APIs those CLIs use (and Claude Code's, via ANTHROPIC_BASE_URL), streaming or not:
+// It answers the APIs those CLIs use (and Claude Code's, via ANTHROPIC_BASE_URL; Gemini CLI's, via GOOGLE_GEMINI_BASE_URL;
+// Copilot CLI's chat completions, via COPILOT_PROVIDER_BASE_URL), streaming or not:
 //   POST /v1/chat/completions   (and /chat/completions)
+//   POST /v1beta/models/<model>:generateContent, :streamGenerateContent, :countTokens   Gemini's API
 //   POST /v1/responses          (and /responses)
 //   POST /v1/messages           Anthropic's Messages API (and /v1/messages/count_tokens)
 //   GET  /v1/models
@@ -15,6 +17,10 @@
 //                      same question (id "pick"); a function_call_output then comes back as "ACK RESULT <it>"
 //   contains OCASKQ    (Chat Completions, with OpenCode's question tool offered) calls question with the same question,
 //                      options Alpha and Beta; the tool's result (a "tool" message) then comes back as "ACK RESULT <it>"
+//   contains CPASKQ    (Chat Completions, with Copilot's ask_user tool offered) calls ask_user: "Which one?", Alpha or Beta
+//   contains GASKQ     (Gemini, with its ask_user tool offered) calls ask_user with the same question
+//   contains TOUCH=<f> (Chat Completions with a bash tool, or Gemini with run_shell_command) runs `touch <f>` in the
+//                      session's folder: the file is there only if the agent ran it, which a refused permission stops
 //   otherwise          answers at once
 // and is always "ACK <the user's text>", so a test can see exactly what reached the model. Every request is appended
 // to $MOCK_MODEL_LOG (JSON lines: path, the model asked for, the user texts it saw), when set.
@@ -32,10 +38,16 @@ function userTexts(body) {
   // Anthropic's system-reminder blocks ride along in user content; only the user's own words count. OpenCode before
   // 1.17.9 wraps words sent to a busy session in one ("The user sent the following message: …"): those are the user's.
   const opencodeQueued = /<system-reminder>\s*The user sent the following message:\s*([\s\S]*?)\s*Please address this message and continue with your tasks\.\s*<\/system-reminder>/g;
-  if (Array.isArray(body.messages)) for (let i = 0; i < out.length; i++) out[i] = out[i].replace(opencodeQueued, "$1").replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").trim();
+  // Copilot CLI puts the time in front of the user's words (`<current_datetime>…</current_datetime>`): not theirs either.
+  if (Array.isArray(body.messages)) for (let i = 0; i < out.length; i++) out[i] = out[i].replace(opencodeQueued, "$1").replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, "").replace(/<current_datetime>[\s\S]*?<\/current_datetime>/g, "").trim();
   const input = body.input;
   if (typeof input === "string") out.push(input);
   else if (Array.isArray(input)) for (const m of input) if (m?.role === "user" || m?.type === "message" && m?.role === "user") out.push(text(m.content));
+  // Gemini's contents: its user turns' text parts, less its own context and tools' results.
+  for (const c of body.contents ?? []) if (c?.role === "user") {
+    const t = (c.parts ?? []).map((p) => typeof p?.text === "string" && !p.text.startsWith("<session_context>") ? p.text : "").join("");
+    if (t.trim()) out.push(t);
+  }
   return out.filter((t) => t.trim());
 }
 
@@ -61,6 +73,35 @@ createServer(async (req, res) => {
   const gap = seconds ? (seconds * 1000) / Math.max(1, words.length) : 0;
   const id = `mock-${Date.now().toString(36)}`, created = Math.floor(Date.now() / 1000), model = body.model ?? "mock-model";
 
+  // Gemini's API: the path keeps its model and method (`/v1beta/models/gemini-2.5-flash:streamGenerateContent`).
+  const gemini = /\/models\/[^/:]+:(generateContent|streamGenerateContent|countTokens)$/.exec(new URL(req.url, "http://x").pathname);
+  if (gemini) {
+    const json = (o) => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify(o)); };
+    if (gemini[1] === "countTokens") return json({ totalTokens: 1 });
+    const usage = { promptTokenCount: 1, candidatesTokenCount: words.length, totalTokenCount: 1 + words.length };
+    const answer = (parts) => ({ candidates: [{ content: { role: "model", parts }, finishReason: "STOP", index: 0 }], usageMetadata: usage, modelVersion: "mock-model" });
+    const config = body.generationConfig ?? {};
+    // Gemini CLI's own housekeeping asks for JSON (which model to route to, who speaks next): answered in its shape.
+    if (config.responseMimeType === "application/json") {
+      const schema = JSON.stringify(config.responseJsonSchema ?? config.responseSchema ?? {}) + JSON.stringify(body.systemInstruction ?? "");
+      const o = /model_choice/.test(schema) ? { reasoning: "mock", model_choice: "flash" } : /next_speaker/.test(schema) ? { reasoning: "mock", next_speaker: "user" } : {};
+      return json(answer([{ text: JSON.stringify(o) }]));
+    }
+    const lastParts = (body.contents ?? []).at(-1)?.parts ?? [];
+    const result = lastParts.find((p) => p?.functionResponse)?.functionResponse;
+    const tools = (body.tools ?? []).flatMap((t) => (t?.functionDeclarations ?? []).map((f) => f?.name));
+    let parts;
+    if (result) parts = [{ text: `ACK RESULT ${JSON.stringify(result.response ?? {}).replace(/\s+/g, " ").slice(0, 400)}` }];
+    else if (/GASKQ/.test(last) && tools.includes("ask_user")) parts = [{ functionCall: { name: "ask_user", args: { questions: [{ question: "Which one?", header: "Pick", type: "choice", options: [{ label: "Alpha", description: "the first" }, { label: "Beta", description: "the second" }] }] } } }];
+    else if (/TOUCH=\S+/.test(last) && tools.includes("run_shell_command")) parts = [{ functionCall: { name: "run_shell_command", args: { command: `touch ${/TOUCH=(\S+)/.exec(last)[1]}`, description: "Touch a file" } } }];
+    if (gemini[1] === "generateContent") return json(answer(parts ?? [{ text: words.join("") }]));
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+    const send = (o) => res.write(`data: ${JSON.stringify(o)}\r\n\r\n`);
+    if (parts) send(answer(parts));
+    else for (const [i, w] of words.entries()) { send({ ...answer([{ text: w }]), candidates: [{ content: { role: "model", parts: [{ text: w }] }, index: 0, ...(i === words.length - 1 ? { finishReason: "STOP" } : {}) }] }); if (gap) await sleep(gap); }
+    return res.end();
+  }
+
   if (path === "/chat/completions") {
     // A tool's result as the newest message: echo it. The OCASKQ prompt, with OpenCode's question tool offered (its own
     // title requests offer no tools): ask one question with it.
@@ -68,9 +109,13 @@ createServer(async (req, res) => {
     if (lastMsg?.role === "tool") {
       const said = typeof lastMsg.content === "string" ? lastMsg.content : (lastMsg.content ?? []).map((p) => p?.text ?? "").join(" ");
       words.splice(0, words.length, ...`ACK RESULT ${said.replace(/\s+/g, " ").trim().slice(0, 400)}`.split(/(?<= )/));
-    } else if (/OCASKQ/.test(last) && (body.tools ?? []).some((t) => t?.function?.name === "question")) {
-      const args = JSON.stringify({ questions: [{ question: "Which one?", header: "Pick", options: [{ label: "Alpha", description: "the first" }, { label: "Beta", description: "the second" }] }] });
-      const call = { index: 0, id: `call_${id}`, type: "function", function: { name: "question", arguments: args } };
+    } else if ((/OCASKQ/.test(last) && (body.tools ?? []).some((t) => t?.function?.name === "question"))
+      || (/CPASKQ/.test(last) && (body.tools ?? []).some((t) => t?.function?.name === "ask_user"))
+      || (/TOUCH=\S+/.test(last) && (body.tools ?? []).some((t) => t?.function?.name === "bash"))) {
+      const [name, args] = /OCASKQ/.test(last) ? ["question", JSON.stringify({ questions: [{ question: "Which one?", header: "Pick", options: [{ label: "Alpha", description: "the first" }, { label: "Beta", description: "the second" }] }] })]
+        : /CPASKQ/.test(last) ? ["ask_user", JSON.stringify({ message: "Which one?", requestedSchema: { type: "object", properties: { pick: { type: "string", title: "Pick", enum: ["Alpha", "Beta"] } }, required: ["pick"] } })]
+        : ["bash", JSON.stringify({ command: `touch ${/TOUCH=(\S+)/.exec(last)[1]}`, description: "Touch a file", mode: "sync" })];
+      const call = { index: 0, id: `call_${id}`, type: "function", function: { name, arguments: args } };
       const usage = { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 };
       if (!body.stream) {
         res.writeHead(200, { "content-type": "application/json" });
@@ -78,7 +123,7 @@ createServer(async (req, res) => {
       }
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
       const send = (o) => res.write(`data: ${JSON.stringify(o)}\n\n`);
-      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ ...call, function: { name: "question", arguments: "" } }] }, finish_reason: null }] });
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ ...call, function: { name, arguments: "" } }] }, finish_reason: null }] });
       send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: args } }] }, finish_reason: null }] });
       send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage });
       res.write("data: [DONE]\n\n");

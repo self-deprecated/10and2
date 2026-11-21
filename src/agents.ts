@@ -10,12 +10,15 @@ import { openCodeCounts } from "./opencode/index.ts";
 import { countSessions } from "./codex/adapter.ts";
 import { piAgentDir } from "./pi/extension.ts";
 import { t3Home } from "./t3/adapter.ts";
+import { geminiDir, isGemini } from "./gemini/source.ts";
+import { copilotDir } from "./copilot/source.ts";
+import { processes } from "./acp/processes.ts";
 
 export type Found = { agent: Agent; name: string; installed: boolean; version: string | null; sessions: number | null; open: number | null };
 
-export const NAMES: Record<Agent, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", opencode: "OpenCode", t3: "T3 Code" };
+export const NAMES: Record<Agent, string> = { claude: "Claude Code", codex: "Codex", pi: "Pi", opencode: "OpenCode", gemini: "Gemini CLI", copilot: "Copilot CLI", t3: "T3 Code" };
 /** The order they're shown in. */
-export const ORDER: readonly Agent[] = ["claude", "codex", "pi", "opencode", "t3"];
+export const ORDER: readonly Agent[] = ["claude", "codex", "pi", "opencode", "gemini", "copilot", "t3"];
 const RECENT_MS = 14 * 86_400_000;
 
 /**
@@ -62,6 +65,15 @@ function liveRegistries(dir: string): number {
   } catch { return 0; }
 }
 
+/** Copilot sessions some Copilot holds open now (`inuse.<pid>.lock` with that pid running). */
+function openCopilots(dir: string): number {
+  try {
+    return readdirSync(dir, { withFileTypes: true }).filter((d) => d.isDirectory()).filter((d) => {
+      try { return readdirSync(join(dir, d.name)).some((f) => { const pid = /^inuse\.(\d+)\.lock$/.exec(f)?.[1]; return !!pid && alive(Number(pid)); }); } catch { return false; }
+    }).length;
+  } catch { return 0; }
+}
+
 export async function detect(env: NodeJS.ProcessEnv = process.env): Promise<Found[]> {
   const home = homedir();
   const claudeDir = env.CLAUDE_CONFIG_DIR || join(home, ".claude");
@@ -70,7 +82,8 @@ export async function detect(env: NodeJS.ProcessEnv = process.env): Promise<Foun
   const opencodeData = join(env.XDG_DATA_HOME || join(home, ".local", "share"), "opencode");
   const oc = (() => { try { return openCodeCounts(opencodeData); } catch { return null; } })();
   const t3Cli = env.T3_CLI ?? "t3";
-  const [claude, codex, pi, opencode, t3] = await Promise.all(["claude", "codex", "pi", "opencode", t3Cli].map((bin) => onPath(bin, env)));
+  const gemini = geminiDir(env), copilot = copilotDir(env);
+  const [claude, codex, pi, opencode, t3, geminiV, copilotV] = await Promise.all(["claude", "codex", "pi", "opencode", t3Cli, "gemini", "copilot"].map((bin) => onPath(bin, env)));
   const found: Found[] = [
     { agent: "claude", name: NAMES.claude, installed: claude !== null || existsSync(join(claudeDir, "projects")), version: claude || null,
       sessions: recentFiles(join(claudeDir, "projects"), /\.jsonl$/, 1), open: liveRegistries(join(claudeDir, "sessions")) },
@@ -79,6 +92,11 @@ export async function detect(env: NodeJS.ProcessEnv = process.env): Promise<Foun
     { agent: "pi", name: NAMES.pi, installed: pi !== null || existsSync(join(piDir, "sessions")), version: pi || null,
       sessions: recentFiles(join(piDir, "sessions"), /\.jsonl$/, 1), open: liveRegistries(join(piDir, "10and2")) },
     { agent: "opencode", name: NAMES.opencode, installed: opencode !== null || existsSync(opencodeData), version: opencode || null, sessions: oc?.sessions ?? null, open: oc?.open ?? null },
+    // Gemini CLI keeps no record of what's open: its running processes are counted instead.
+    { agent: "gemini", name: NAMES.gemini, installed: geminiV !== null || existsSync(join(gemini, "tmp")), version: geminiV || null,
+      sessions: recentFiles(join(gemini, "tmp"), /^session-.*\.jsonl?$/, 2), open: geminiV === null && !existsSync(join(gemini, "tmp")) ? null : processes(isGemini).length },
+    { agent: "copilot", name: NAMES.copilot, installed: copilotV !== null || existsSync(join(copilot, "session-state")), version: copilotV || null,
+      sessions: recentFiles(join(copilot, "session-state"), /^events\.jsonl$/, 1), open: openCopilots(join(copilot, "session-state")) },
     // A `t3` that didn't answer in time (T3's desktop app starts its own as Node, slowly on Windows) still counts where
     // T3 has run. Never without one: the connector reaches T3 through it, and stops when it can't.
     { agent: "t3", name: NAMES.t3, installed: t3 !== null || (existsSync(join(t3Home(env), "userdata")) && which(t3Cli, env) !== null), version: t3 || null, sessions: null, open: null },

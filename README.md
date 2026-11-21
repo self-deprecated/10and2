@@ -2,7 +2,7 @@
 
 The connector for [10 & 2](https://10and2.app), the iPhone app that lets you talk to your coding agents on the drive.
 
-Install it on the Mac or Linux computer where your coding agents work: Claude Code, Codex, Pi, OpenCode or T3 Code. Then the voice in the app can tell you what they did and what's waiting on you, and follow up when you say yes.
+Install it on the Mac or Linux computer where your coding agents work: Claude Code, Codex, Pi, OpenCode, Gemini CLI, Copilot CLI or T3 Code. Then the voice in the app can tell you what they did and what's waiting on you, and follow up when you say yes.
 
 ```sh
 npm install -g 10and2
@@ -19,7 +19,7 @@ Setup finds the coding agents on this computer and lets you switch off any you d
 10and2 help      # everything else
 ```
 
-New work in T3 Code, Claude Code and Codex can start on a coding model you name (in T3 Code, on the provider you name too), or the one you choose in the app's Settings → New threads → Coding model; otherwise, and in Pi and OpenCode, on the agent's own default.
+New work in T3 Code, Claude Code, Codex, Gemini CLI and Copilot CLI can start on a coding model you name (in T3 Code, on the provider you name too), or the one you choose in the app's Settings → New threads → Coding model; otherwise, and in Pi and OpenCode, on the agent's own default.
 
 Needs Node 22.13 or newer. Setup and `10and2 status` say when one of your agents is too old for something 10 & 2 does, and how to update it.
 
@@ -55,6 +55,10 @@ Without systemd (a container, WSL without systemd, Alpine), nothing starts it fo
 ## OpenCode
 
 10 & 2 works with your OpenCode sessions: what you tell it reaches a session open in OpenCode, and waits there if it's busy; it can answer OpenCode's questions, but never grants it a permission. A closed session, or new work, runs in an OpenCode server of 10 & 2's own on this computer, within what this computer allows. Reaching open sessions needs 10and2's OpenCode plugin, which setup offers to add (`10and2 opencode install` adds it later, `10and2 opencode uninstall` removes it). The first OpenCode you start after adding it needs the internet once, to fetch what plugins use. Needs OpenCode 1.14.34 or newer, and 1.14.49 or newer to reach a session open in OpenCode.
+
+## Gemini CLI and Copilot CLI
+
+10 & 2 works with your Gemini CLI and GitHub Copilot CLI sessions: it reads them, and continues one you've closed, or starts new work in the project or a fresh worktree inside it, through the agent's own ACP mode (`gemini --acp`, `copilot --acp`), within what this computer allows. It never grants either a permission: a tool that asks first doesn't run, so give new work full access for it to edit and run things. A session open in a terminal or an editor isn't sent to yet: say it there, or close it and 10 & 2 can continue it. A question it asks there is read out, and answered there. Gemini CLI refuses full access in a folder you haven't trusted in it. Needs Gemini CLI 0.68.0 or newer, or Copilot CLI 1.0.112 or newer.
 
 ## Your own brain
 

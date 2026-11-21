@@ -29,6 +29,10 @@ import { CodexAdapter, defaultCodexHome } from "./codex/adapter.ts";
 import { PiAdapter } from "./pi/adapter.ts";
 import { installPiExtension, piAgentDir, piExtensionStatus, uninstallPiExtension } from "./pi/extension.ts";
 import { runPiTurn } from "./pi/turn.ts";
+import { AcpAdapter } from "./acp/adapter.ts";
+import { runAcpTurn } from "./acp/turn.ts";
+import { GeminiSource } from "./gemini/source.ts";
+import { CopilotSource } from "./copilot/source.ts";
 import { installOpenCodePlugin, OpenCodeAdapter, openCodePluginStatus, uninstallOpenCodePlugin } from "./opencode/index.ts";
 import { describe, replaceFile } from "./util.ts";
 import { accent, ago, ask, bad, bold, Cancelled, cmd, confirm, dim, keys, note, ok, say, secret, spinner, warn } from "./ui.ts";
@@ -36,7 +40,7 @@ import { accent, ago, ask, bad, bold, Cancelled, cmd, confirm, dim, keys, note, 
 const DEFAULT_ORIGIN = "https://10and2.selfdep.com";
 /** Someone running their own brain needs to know which key to make (Jordan, 5 Nov: the CLI may say OpenAI). */
 const OWN_KEY = "your OpenAI key"; // provider-name-ok: see above
-const usage = () => `${bold("10and2")} ${VERSION} ${dim("·")} connects this computer's coding agents (Claude Code, Codex, Pi, OpenCode, T3 Code) to 10 & 2
+const usage = () => `${bold("10and2")} ${VERSION} ${dim("·")} connects this computer's coding agents (Claude Code, Codex, Pi, OpenCode, Gemini CLI, Copilot CLI, T3 Code) to 10 & 2
 
   ${cmd("10and2 setup")}     connect this computer (opens your browser to approve it)
   ${cmd("10and2 status")}    whether it's connected, and what 10 & 2 can see and do here
@@ -97,6 +101,7 @@ const TAKES: Record<string, { words: number; flags: string[] }> = {
   pi: { words: 1, flags: [] },
   opencode: { words: 1, flags: [] },
   "pi-turn": { words: 0, flags: [] },
+  "acp-turn": { words: 0, flags: [] },
   "login-service": { words: 1, flags: [] },
   brain: { words: 3, flags: ["port", "code", "name", "yes", "no-autostart", ...CHOOSING] },
   token: { words: 0, flags: [] },
@@ -137,6 +142,7 @@ try {
     case "pi": piCommand(); break;
     case "opencode": await openCodeCommand(); break;
     case "pi-turn": process.exitCode = await runPiTurn(); break; // the connector runs this; it must stay silent
+    case "acp-turn": process.exitCode = await runAcpTurn(); break; // the connector runs this; it must stay silent
     // Windows runs this at login (service.ts runEntry); it must stay silent.
     case "login-service": {
       const job = [CONNECTOR, BRAIN].find((j) => j.name === sub);
@@ -245,7 +251,7 @@ async function setup() {
 async function chooseAgents(again: string, existing: any | null): Promise<{ found: Found[]; choice: Choice }> {
   const found = await detect();
   if (!found.some((f) => f.installed)) {
-    throw new Error(`No coding agent 10 & 2 works with is on this computer (Claude Code, Codex, Pi, OpenCode or T3 Code), so there's nothing to connect. Install one, then run ${cmd(again)} again.`);
+    throw new Error(`No coding agent 10 & 2 works with is on this computer (Claude Code, Codex, Pi, OpenCode, Gemini CLI, Copilot CLI or T3 Code), so there's nothing to connect. Install one, then run ${cmd(again)} again.`);
   }
   let choice = applyFlags(startingChoice(existing, found), flags);
   if (!flags.has("yes") && process.stdin.isTTY && process.stdout.isTTY) choice = await chooseInteractively(found, choice);
@@ -523,12 +529,18 @@ async function runConnector() {
   const codex = policy.codex ? new CodexAdapter({ policy, codexHome: defaultCodexHome(), db: join(stateDirectory(), "codex.db"), stateDir: join(stateDirectory(), "codex"), log }) : null;
   const opencode = policy.opencode ? new OpenCodeAdapter({ policy, db: join(stateDirectory(), "opencode.db"), stateDir: join(stateDirectory(), "opencode"), log }) : null;
   const pi = policy.pi ? new PiAdapter({ policy, agentDir: piAgentDir(), db: join(stateDirectory(), "pi.db"), stateDir: join(stateDirectory(), "pi"), log }) : null;
+  // Gemini CLI and Copilot CLI, through their ACP mode: neither dedupes a prompt, so a lost outcome is never sent again.
+  const acp = (source: GeminiSource | CopilotSource) => new AcpAdapter({ policy, source, db: join(stateDirectory(), `${source.agent}.db`), stateDir: join(stateDirectory(), source.agent), log });
+  const gemini = policy.gemini ? acp(new GeminiSource()) : null;
+  const copilot = policy.copilot ? acp(new CopilotSource()) : null;
   const adapter = new Local([
     ...(t3 ? [{ prefix: "", adapter: t3, retrySafe: true }] : []),
     ...(claude ? [{ prefix: "claude", adapter: claude }] : []),
     ...(codex ? [{ prefix: "codex", adapter: codex }] : []),
     ...(pi ? [{ prefix: "pi", adapter: pi }] : []),
     ...(opencode ? [{ prefix: "opencode", adapter: opencode }] : []),
+    ...(gemini ? [{ prefix: "gemini", adapter: gemini }] : []),
+    ...(copilot ? [{ prefix: "copilot", adapter: copilot }] : []),
   ], policy);
   link = new Link({
     url: policy.brain, token, adapter, ledger, log,
@@ -546,6 +558,7 @@ async function runConnector() {
   void codex?.start().then(() => log("codex: reading sessions"), (e) => log(`codex: ${describe(e)}`));
   void opencode?.start().then(() => log("opencode: reading sessions"), (e) => log(`opencode: ${describe(e)}`));
   void pi?.start().then(() => log("pi: reading sessions"), (e) => log(`pi: ${describe(e)}`));
+  for (const a of [gemini, copilot]) void a?.start().then(() => log(`${a.name}: reading sessions`), (e) => log(`${a.name}: ${describe(e)}`));
   let stopping = false;
   const shutdown = async () => {
     if (stopping) return;

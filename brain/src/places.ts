@@ -13,9 +13,9 @@ const parts = (name: string) => {
 const renamed = (p: Place, extra: string) => ({ ...p, name: `${parts(p.name).base} (${extra})${parts(p.name).on}` });
 
 /** The coding apps a new thread can start in, as said. A connector names each by a prefix (after the machine's own); T3 Code's places have none. */
-export const APPS = { t3: "T3 Code", claude: "Claude Code", codex: "Codex", pi: "Pi", opencode: "OpenCode" } as const;
+export const APPS = { t3: "T3 Code", claude: "Claude Code", codex: "Codex", pi: "Pi", opencode: "OpenCode", gemini: "Gemini CLI", copilot: "Copilot CLI" } as const;
 export type App = keyof typeof APPS;
-const appOf = (p: Place): App => (/(?:^|\|)(claude|codex|pi|opencode):/.exec(p.id)?.[1] as App | undefined) ?? "t3";
+const appOf = (p: Place): App => (/(?:^|\|)(claude|codex|pi|opencode|gemini|copilot):/.exec(p.id)?.[1] as App | undefined) ?? "t3";
 /** The agent a place belongs to, said ("Claude Code"), or null for T3 Code's. */
 const agentOf = (p: Place) => (appOf(p) === "t3" ? null : APPS[appOf(p)]);
 
@@ -106,7 +106,7 @@ export function preferred(places: Place[], d: NewThreadDefaults, said = "", plac
   if (d.machine === null && d.app === null) return places;
   const machines = [...new Set(places.map((p) => placeParts(p).machine).filter((m): m is string => m !== null))];
   const machineSaid = names(said, machines.map((m) => `on ${m}`));
-  const appSaid = names(said, [...Object.values(APPS), "open code"]);
+  const appSaid = names(said, [...Object.values(APPS), "open code", "gemini", "copilot"]);
   const groups = new Map<string, Place[]>();
   for (const p of places) groups.set(sayKey(placeParts(p).project), [...(groups.get(sayKey(placeParts(p).project)) ?? []), p]);
   const keep = new Set<string>();

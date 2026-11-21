@@ -4,9 +4,9 @@
 # CLI's terminal UI in tmux and the connector's adapter for it: list, read, follow up idle, steer busy, continue a closed
 # session, start work, answer a question where the CLI asks one.
 #   test/harness/run.sh                 every harness (npm run test:harness)
-#   test/harness/run.sh codex           one: test/harness/codex.harness.ts
+#   test/harness/run.sh codex           one: test/harness/codex.harness.ts (also claude, opencode, pi, t3, gemini, copilot)
 #   CODEX=0.160.0 test/harness/run.sh codex
-#                                       another version of a CLI (CLAUDE_CODE, CODEX, OPENCODE, PI, T3), for finding the
+#                                       another version of a CLI (CLAUDE_CODE, CODEX, OPENCODE, PI, T3, GEMINI, COPILOT), for finding the
 #                                       oldest each feature works with (src/versions.ts); each subtest is one feature
 # Needs podman (or docker). The image is built once per Containerfile (pinned CLI versions) and reused; another
 # version is a layer over it, also reused.
@@ -33,12 +33,15 @@ if [[ -n ${PI:-} ]]; then
 fi
 # T3 Code's npm package downloads its executable into ~/.t3 on first run, so that's done while there's network.
 [[ -n ${T3:-} ]] && steps+=("npm install -g --no-fund --no-audit t3@$T3")
+[[ -n ${GEMINI:-} ]] && steps+=("npm install -g --no-fund --no-audit @google/gemini-cli@$GEMINI")
+[[ -n ${COPILOT:-} ]] && steps+=("npm install -g --no-fund --no-audit @github/copilot@$COPILOT")
 if [[ ${#steps[@]} -gt 0 ]]; then
   layer="$(printf 'FROM %s\nUSER root\n' "$tag"; for s in "${steps[@]}"; do printf 'RUN %s && npm cache clean --force\n' "$s"; done
-    printf 'USER node\n'; if [[ -n ${T3:-} ]]; then printf 'RUN rm -rf ~/.t3 && t3 --version\n'; fi)"
+    printf 'USER node\n'; if [[ -n ${T3:-} ]]; then printf 'RUN rm -rf ~/.t3 && t3 --version\n'; fi
+    if [[ -n ${COPILOT:-} ]]; then printf 'RUN copilot --version\n'; fi)"
   tag="$tag-$(printf '%s' "$layer" | sha256sum | cut -c1-12)"
   if ! have "$tag"; then
-    echo "harness: building $tag (${CLAUDE_CODE:+claude-code $CLAUDE_CODE }${CODEX:+codex $CODEX }${OPENCODE:+opencode $OPENCODE }${PI:+pi $PI }${T3:+t3 $T3})" >&2
+    echo "harness: building $tag (${CLAUDE_CODE:+claude-code $CLAUDE_CODE }${CODEX:+codex $CODEX }${OPENCODE:+opencode $OPENCODE }${PI:+pi $PI }${T3:+t3 $T3 }${GEMINI:+gemini $GEMINI }${COPILOT:+copilot $COPILOT})" >&2
     printf '%s\n' "$layer" | "$engine" build -q -t "$tag" -f - "$here" >/dev/null
   fi
 fi

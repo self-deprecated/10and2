@@ -10,7 +10,7 @@ import { configDirectory } from "./paths.ts";
 export type RuntimeMode = LaunchProfile["runtimeMode"];
 
 /** The coding agents a connector can read, each with its own adapter. */
-export const AGENTS = ["t3", "claude", "codex", "opencode", "pi"] as const;
+export const AGENTS = ["t3", "claude", "codex", "opencode", "pi", "gemini", "copilot"] as const;
 export type Agent = (typeof AGENTS)[number];
 /**
  * What one agent may do, narrower than the machine's own: an agent's entry in `agents` may switch off steering or
@@ -37,6 +37,10 @@ export type Policy = {
   opencode: boolean;
   /** Whether Pi sessions are read here. */
   pi: boolean;
+  /** Whether Gemini CLI sessions are read here (absent: off). */
+  gemini?: boolean;
+  /** Whether GitHub Copilot CLI sessions are read here (absent: off). */
+  copilot?: boolean;
   /** Whether a follow-up may reach a session that's open (in a terminal, a background session, still running). On by default. */
   steer: boolean;
   /** Whether Driver may answer an agent's questions and plans. On by default. */
@@ -119,7 +123,7 @@ export function parsePolicy(text: string): Policy {
   if (raw.claude !== undefined && typeof raw.claude !== "boolean") throw bad("claude must be true or false");
   if (raw.t3 !== undefined && typeof raw.t3 !== "boolean") throw bad("t3 must be true or false");
   // Which agents are on: `agents` (true, false, or an object narrowing that agent), or the older top-level booleans.
-  const on: Record<Agent, boolean> = { t3: true, claude: false, codex: false, opencode: false, pi: false };
+  const on: Record<Agent, boolean> = { t3: true, claude: false, codex: false, opencode: false, pi: false, gemini: false, copilot: false };
   const limits: Partial<Record<Agent, Limit>> = {};
   if (raw.agents !== undefined) {
     if (typeof raw.agents !== "object" || raw.agents === null || Array.isArray(raw.agents)) throw bad("agents must be an object");
