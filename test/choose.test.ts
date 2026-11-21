@@ -1,13 +1,15 @@
+import { spawnSync } from "node:child_process";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 import { applyChoice, applyFlags, capsFor, choiceOf, defaultChoice, policyFields, startingChoice, summary, type Choice } from "../src/choose.ts";
 import { describeFound, detect, type Found } from "../src/agents.ts";
 import { allows, answers, ceilingFor, parsePolicy, steers } from "../src/policy.ts";
-import { listStep, marks, type ListState } from "../src/ui.ts";
-import { removeDir, WINDOWS } from "./fixtures/platform.ts";
+import { drawList, listStep, marks, type ListState } from "../src/ui.ts";
+import { removeDir, SLOW, WINDOWS } from "./fixtures/platform.ts";
 
 const found = (installed: Partial<Record<Found["agent"], boolean>>): Found[] =>
   (["claude", "codex", "pi", "opencode", "t3"] as const).map((agent) => ({
@@ -58,21 +60,37 @@ test("a file from before agents reads as the same choice", () => {
 });
 
 test("flags choose without a terminal, and narrow one agent when given names", () => {
-  const start = defaultChoice(found({ claude: true, codex: true, pi: true }));
-  const only = applyFlags(start, flags({ agents: "claude,pi", "no-steer": "true", "no-start": "true" }));
+  const here = found({ claude: true, codex: true, pi: true });
+  const start = defaultChoice(here);
+  const only = applyFlags(start, flags({ agents: "claude,pi", "no-steer": "true", "no-start": "true" }), here);
   assert.deepEqual(only.on, { t3: false, claude: true, codex: false, opencode: false, pi: true, gemini: false, copilot: false, cursor: false });
   assert.equal(only.caps.steer, false);
   assert.equal(only.caps.start_work, false);
   assert.equal(start.caps.steer, true, "the choice given isn't changed");
 
-  const narrowed = applyFlags(start, flags({ off: "codex", "no-answer": "pi" }));
+  const narrowed = applyFlags(start, flags({ off: "codex", "no-answer": "pi" }), here);
   assert.equal(narrowed.on.codex, false);
   assert.deepEqual(narrowed.off, { pi: ["answer"] });
   assert.equal(narrowed.caps.answer, true);
 
-  const ro = applyFlags(start, flags({ "read-only": "true" }));
+  const ro = applyFlags(start, flags({ "read-only": "true" }), here);
   assert.ok(Object.values(ro.caps).every((v) => !v));
-  assert.throws(() => applyFlags(start, flags({ agents: "claude,aider" })), /no agent called "aider"/);
+  assert.throws(() => applyFlags(start, flags({ agents: "claude,aider" }), here), /no agent called "aider"/);
+});
+
+test("agent lists take spaces as well as commas: PowerShell hands npm's script --agents=claude,pi as \"claude pi\"", () => {
+  const here = found({ claude: true, codex: true, pi: true });
+  const c = applyFlags(defaultChoice(here), flags({ agents: "claude pi", "no-steer": "claude  pi" }), here);
+  assert.deepEqual(c.on, { t3: false, claude: true, codex: false, opencode: false, pi: true, gemini: false, copilot: false, cursor: false });
+  assert.deepEqual(c.off, { claude: ["steer"], pi: ["steer"] });
+  assert.deepEqual(applyFlags(defaultChoice(here), flags({ off: "codex pi" }), here).on, { t3: false, claude: true, codex: false, opencode: false, pi: false, gemini: false, copilot: false, cursor: false });
+});
+
+test("--agents can't switch on an agent that wasn't found, and says which", () => {
+  const here = found({ claude: true });
+  assert.throws(() => applyFlags(defaultChoice(here), flags({ agents: "claude,codex" }), here),
+    /^Error: Codex wasn't found on this computer, so 10 & 2 can't connect it\. Install it, or leave it out of --agents\.$/);
+  assert.throws(() => applyFlags(defaultChoice(here), flags({ agents: "codex,pi" }), here), /^Error: Codex and Pi weren't found on this computer, so 10 & 2 can't connect them\./);
 });
 
 test("the closing words say who 10 & 2 reaches, what it may do, and what's narrower", () => {
@@ -80,9 +98,10 @@ test("the closing words say who 10 & 2 reaches, what it may do, and what's narro
   c.on.opencode = false;
   const lines = summary(c, found({ claude: true, codex: true, pi: true, opencode: true }));
   assert.match(lines[0]!, /^10 & 2 can reach Claude Code, Codex and Pi \(OpenCode is off\), and can follow up, steer an open session/);
+  assert.match(lines[0]!, /: each only after you hear it read back and say yes\.$/);
   assert.equal(lines[1], "For Codex: no steering, no new work.");
   const none = summary({ ...c, caps: { follow_up: false, steer: false, answer: false, start_work: false, tidy: false } }, found({ claude: true }));
-  assert.match(none[0]!, /can only read/);
+  assert.equal(none[0], "10 & 2 can reach Claude Code, Codex and Pi, and can only read.", "nothing to hear read back");
   assert.equal(none.length, 1, "nothing is narrower than nothing");
 });
 
@@ -116,6 +135,19 @@ test("the checklist moves, switches, opens an agent and cycles a choice", () => 
   assert.deepEqual(listStep(s, "cancel"), { done: true, cancelled: true });
   assert.deepEqual(listStep({ ...s, at: 0 }, "left"), { done: false }, "← does nothing on a first screen");
   assert.deepEqual(listStep({ ...s, at: 0, back: true }, "left"), { done: true }, "← goes back from an agent's own screen");
+});
+
+test("in colour, an agent not found lines up with the others", (t) => {
+  const was = process.env.FORCE_COLOR;
+  t.after(() => { if (was === undefined) delete process.env.FORCE_COLOR; else process.env.FORCE_COLOR = was; });
+  process.env.FORCE_COLOR = "1";
+  const lines = drawList("Coding agents on this computer", { at: 0, rows: [
+    { kind: "box", label: "Claude Code", detail: "0 sessions", on: true },
+    { kind: "box", label: "Pi", detail: "not found", on: false, disabled: true },
+  ] }, "enter continue");
+  assert.match(lines[2]!, /\x1b\[2m/, "the row not found is dimmed");
+  const plain = lines.map(stripVTControlCharacters);
+  assert.equal(plain[2]!.indexOf("not found"), plain[1]!.indexOf("0 sessions"));
 });
 
 test("choosing again starts from the file; agents a file from before agents doesn't mention start as found", () => {
@@ -154,6 +186,51 @@ test("an agent is found by its command on PATH or by its own folder; T3 Code by 
   // Cursor's CLI agent: by its command (its version is a date), or its chats folder.
   command("cursor-agent", "2026.11.19-f005e9d");
   assert.deepEqual((await detect(env)).find((f) => f.agent === "cursor")!.version, "2026.11.19-f005e9d");
+});
+
+test("a command still running when detection stops waiting is found, version unknown; stopped, except by the connector, which leaves it to finish", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "agents-"));
+  t.after(() => removeDir(dir));
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env, PATH: bin, CLAUDE_CONFIG_DIR: join(dir, "claude"), CODEX_HOME: join(dir, "codex"), PI_CODING_AGENT_DIR: join(dir, "pi"),
+    XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3",
+  };
+  // npm's `t3` on its first run, which downloads T3's runtime before it answers; T3 has never run here.
+  const installedMark = join(dir, "installed");
+  writeFileSync(join(bin, "t3.mjs"), `import { writeFileSync } from "node:fs";\nsetTimeout(() => { writeFileSync(${JSON.stringify(installedMark)}, ""); console.log("t3 v0.1.11"); }, ${1500 * SLOW});\n`);
+  if (WINDOWS) writeFileSync(join(bin, "t3.cmd"), `@ECHO off\r\nnode "%~dp0\\t3.mjs" %*\r\n`);
+  else writeFileSync(join(bin, "t3"), `#!/bin/sh\nexec "${process.execPath}" "${join(bin, "t3.mjs")}" "$@"\n`, { mode: 0o755 });
+  const finished = async () => {
+    for (let i = 0; i < 60 * SLOW && !existsSync(installedMark); i++) await new Promise((r) => setTimeout(r, 50));
+    return existsSync(installedMark);
+  };
+
+  // A short command (setup, status) stops it, so a hung one isn't left behind.
+  let t3 = (await detect(env, 200)).find((f) => f.agent === "t3")!;
+  assert.deepEqual([t3.installed, t3.version], [true, null]);
+  assert.equal(await finished(), false, "stopped");
+
+  t3 = (await detect(env, 200, true)).find((f) => f.agent === "t3")!;
+  assert.deepEqual([t3.installed, t3.version], [true, null]);
+  assert.equal(existsSync(installedMark), false, "it was still going");
+  assert.ok(await finished(), "it finished rather than being stopped part-way");
+});
+
+test("a short command that stops a slow --version isn't kept running by what that started", { skip: WINDOWS && "a POSIX script's child stands for it" }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "agents-"));
+  t.after(() => removeDir(dir));
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  // A launcher that leaves its own child holding the output (as cmd.exe running T3's desktop app does on Windows).
+  writeFileSync(join(bin, "t3"), `#!/bin/sh\n"${process.execPath}" -e "setTimeout(() => {}, 8000)"\necho t3 v0.1.11\n`, { mode: 0o755 });
+  const env = { ...process.env, PATH: bin, CLAUDE_CONFIG_DIR: join(dir, "claude"), CODEX_HOME: join(dir, "codex"), PI_CODING_AGENT_DIR: join(dir, "pi"), XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3" };
+  const agents = new URL("../src/agents.ts", import.meta.url).href;
+  const started = Date.now();
+  const r = spawnSync(process.execPath, ["--input-type=module", "-e", `const { detect } = await import(${JSON.stringify(agents)}); const f = (await detect(process.env, 200)).find((a) => a.agent === "t3"); console.log(JSON.stringify([f.installed, f.version]));`], { env, encoding: "utf8", timeout: 20_000 });
+  assert.equal(r.stdout.trim(), "[true,null]", r.stderr);
+  assert.ok(Date.now() - started < 6000, `exited ${Date.now() - started} ms after starting, not when the script's sleep ended`);
 });
 
 test("the old Windows console gets marks its fonts have; Windows Terminal, VS Code's terminal and every other system get Unicode", () => {

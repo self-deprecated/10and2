@@ -4,15 +4,14 @@
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, hostname } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Credentials, parseCredential, run as runCommand, type Store } from "./credential.ts";
-import { spawnCommand, which } from "./command.ts";
 import { Ledger } from "./ledger.ts";
 import { Link } from "./link.ts";
 import { Local } from "./local.ts";
 import { Expired, linkUrl, originOf, pair } from "./pair.ts";
-import { configDirectory, hookSocket, stateDirectory } from "./paths.ts";
+import { configDirectory, databasePath, hookSocket, stateDirectory } from "./paths.ts";
 import { addMachine, brainDb, brainEnvPath, brainOrigin, brainPort, DEFAULT_PORT, machines, readBrainEnv, removeMachine, validName, writeBrainEnv } from "./brain.ts";
 import { AGENTS, type Agent, defaultPolicyPath, loadPolicy, parsePolicy, readSettings, validBase, visible } from "./policy.ts";
 import { describeFound, detect, NAMES, ORDER, type Found } from "./agents.ts";
@@ -36,9 +35,12 @@ import { GeminiSource } from "./gemini/source.ts";
 import { CopilotSource } from "./copilot/source.ts";
 import { installOpenCodePlugin, OpenCodeAdapter, openCodePluginStatus, uninstallOpenCodePlugin } from "./opencode/index.ts";
 import { describe, replaceFile } from "./util.ts";
-import { accent, ago, ask, bad, bold, Cancelled, cmd, confirm, dim, keys, note, ok, say, secret, spinner, warn } from "./ui.ts";
+import { openBrowser, opener } from "./browser.ts";
+import { accent, ago, ask, bad, bold, Cancelled, cmd, confirm, dim, keys, mark, note, ok, say, secret, spinner, warn } from "./ui.ts";
 
 const DEFAULT_ORIGIN = "https://10and2.selfdep.com";
+/** The 10 & 2 service's own addresses (production and staging): any other is a brain of your own. */
+const SERVICE = [DEFAULT_ORIGIN, "https://10and2-stg.selfdep.com"];
 /** Someone running their own brain needs to know which key to make (Jordan, 5 Nov: the CLI may say OpenAI). */
 const OWN_KEY = "your OpenAI key"; // provider-name-ok: see above
 const usage = () => `${bold("10and2")} ${VERSION} ${dim("·")} connects this computer's coding agents (Claude Code, Codex, Pi, OpenCode, Gemini CLI, Copilot CLI, Cursor, T3 Code) to 10 & 2
@@ -78,10 +80,13 @@ const statusFile = () => join(stateDirectory(), "status.json");
 const fail = (s: string, code = 1) => { console.error(s); process.exitCode = code; };
 /** The default account's host is left out of what's shown: it's the only one most people ever use. */
 const hostOf = (origin: string) => new URL(origin).host;
-/** A key from pairing with a 10 & 2 account; a brain of your own takes a plain token instead (`--token`, `brain setup`). */
-const paired = (secret: string | undefined) => secret === undefined || parseCredential(secret) !== null;
+/**
+ * A key from pairing with a 10 & 2 account; a brain of your own takes a plain token instead (`--token`, `brain setup`).
+ * Without a key (revoked, or one this account can't read), the address says which.
+ */
+const paired = (origin: string, secret?: string) => secret === undefined ? SERVICE.includes(origin) : parseCredential(secret) !== null;
 /** What this computer is connected to, given its key when there is one. */
-const account = (origin: string, secret?: string) => !paired(secret) ? `your brain at ${hostOf(origin)}`
+const account = (origin: string, secret?: string) => !paired(origin, secret) ? `your brain at ${hostOf(origin)}`
   : origin === DEFAULT_ORIGIN ? "your 10 & 2 account" : `your 10 & 2 account at ${hostOf(origin)}`;
 
 // `--help` or `-h` anywhere only prints the help: `10and2 setup --help` must never start a pairing.
@@ -129,7 +134,7 @@ if (!["hook", "pi-turn"].includes(command ?? "")) useSystemNetwork();
 
 try {
   const refused = unread();
-  if (refused) { fail(`✗ ${refused}`, 64); process.exit(); }
+  if (refused) { fail(`${mark.bad} ${refused}`, 64); process.exit(); }
   switch (wantsHelp ? "help" : command) {
     case "setup": await setup(); break;
     case "agents": await agentsCommand(); break;
@@ -166,7 +171,7 @@ try {
   }
 } catch (e) {
   if (e instanceof Cancelled) fail("Cancelled.", 130);
-  else fail(`✗ ${describe(e)}`);
+  else fail(`${mark.bad} ${describe(e)}`);
 }
 
 function readPolicyFile(): any | null {
@@ -184,21 +189,15 @@ function where(s: Store) {
   const file = join(configDirectory(), "credentials.json");
   return s === "keychain" ? "your login Keychain" : s === "libsecret" ? "your keyring (libsecret)" : s === "dpapi" ? `${file} (encrypted for your Windows account)` : `${file} (only you can read it)`;
 }
-function openBrowser(url: string) {
-  // On Windows its own handler for a link (rundll32), run without a shell, so the `&` in a URL is never read as a
-  // command. Each is found on PATH first, so one of that name in the current folder never runs.
-  const [opener, ...args] = process.platform === "darwin" ? ["open", url] : process.platform === "linux" ? ["xdg-open", url]
-    : process.platform === "win32" ? ["rundll32", "url.dll,FileProtocolHandler", url] : [];
-  if (!opener || !which(opener)) return;
-  // Not hidden: rundll32 passes its window's state on to a browser it starts, which would then open with no window.
-  try { spawnCommand(opener, args, { stdio: "ignore", detached: true, windowsHide: false }).on("error", () => {}).unref(); } catch { /* the URL is printed anyway */ }
-}
 /**
- * Said when a job set to start at login wasn't started now, from a terminal run as administrator; `again` starts it.
- * Signing in again is said first: with the built-in Administrator account, or UAC off, every terminal runs as one.
+ * Said when a job set to start at login wasn't (re)started now, from a terminal run as administrator: one that already
+ * runs keeps running as it was. `again` (re)starts it. Signing in again is said first: with the built-in Administrator
+ * account, or UAC off, every terminal runs as one.
  */
-function startsAtSignIn(...again: string[]) {
-  warn(`Starts at your next sign-in, not now: this terminal runs as administrator. To start it sooner, sign out and back in, or run ${words(again.map(cmd))} in a terminal that isn't run as administrator.`);
+function startsAtSignIn(s: ServiceState, ...again: string[]) {
+  const sooner = `sign out and back in, or run ${words(again.map(cmd))} in a terminal that isn't run as administrator.`;
+  if (s.running) warn(`Starts at login, and keeps running as it was until your next sign-in: this terminal runs as administrator. To restart it sooner, ${sooner}`);
+  else warn(`Starts at your next sign-in, not now: this terminal runs as administrator. To start it sooner, ${sooner}`);
 }
 
 async function setup() {
@@ -226,7 +225,9 @@ async function setup() {
   if (byToken && !validName(name)) throw new Error(`Your brain can't call it "${name}": start with a letter or digit (${cmd("--name=")}).`);
   say();
   const credential = byToken ? randomBytes(32).toString("base64url") : await approve(origin, name);
-  const store = await creds.save(origin, credential);
+  // Seconds on Windows, where it's encrypted through PowerShell.
+  const saving = spinner("Saving its key");
+  const store = await creds.save(origin, credential).finally(() => saving.clear());
   writePrivate(defaultPolicyPath(), JSON.stringify(policy, null, 2) + "\n");
   if (byToken) {
     ok(`Made its key ${dim(`· in ${store === "file" ? "a file only you can read" : where(store)}`)}`);
@@ -235,11 +236,14 @@ async function setup() {
   } else ok(`Approved ${dim(`· its key is in ${store === "file" ? "a file only you can read" : where(store)}`)}`);
   await offerHelpers(choice);
 
-  const started = (await startAtLogin(new Service(), "Keep it connected, starting at login?", "10and2 autostart on"))?.running === true;
+  const login = await startAtLogin(new Service(), "Keep it connected, starting at login?", "10and2 autostart on");
+  // From a terminal run as administrator, one already running isn't restarted with the new key: nothing to wait for.
+  const started = login?.running === true && !login.elevated;
   // A brain of your own accepts this computer only once it's been added there.
   if (started && !byToken) await connected(origin, credential);
-  else if (!started) note(`To connect: ${cmd("10and2 run")} in a terminal you keep open, or ${cmd("10and2 autostart on")}.`);
-  else note(`It connects once your brain accepts it; ${cmd("10and2 status")} says when.`);
+  else if (started) note(`It connects once your brain accepts it; ${cmd("10and2 status")} says when.`);
+  // From a terminal run as administrator, startAtLogin has said when it starts, and how to start it sooner.
+  else if (!login?.elevated) note(`To connect: ${cmd("10and2 run")} in a terminal you keep open, or ${cmd("10and2 autostart on")}.`);
   canDo(policy, choice, found);
   if (started && !byToken) say(`\n  ${bold("Next:")} open 10 & 2 on your phone and tap Start.`);
 }
@@ -254,7 +258,7 @@ async function chooseAgents(again: string, existing: any | null): Promise<{ foun
   if (!found.some((f) => f.installed)) {
     throw new Error(`No coding agent 10 & 2 works with is on this computer (Claude Code, Codex, Pi, OpenCode, Gemini CLI, Copilot CLI, Cursor or T3 Code), so there's nothing to connect. Install one, then run ${cmd(again)} again.`);
   }
-  let choice = applyFlags(startingChoice(existing, found), flags);
+  let choice = applyFlags(startingChoice(existing, found), flags, found);
   if (!flags.has("yes") && process.stdin.isTTY && process.stdout.isTTY) choice = await chooseInteractively(found, choice);
   else {
     // Git Bash's own window (mintty) gives a program pipes, not a terminal, so nothing can be asked there.
@@ -306,7 +310,7 @@ async function machineName() {
 }
 
 /**
- * Offers to start a job at login (unless --no-autostart): what installing it gave, or null when it wasn't installed.
+ * Offers to start a job at login (unless --no-autostart; --yes accepts): what installing it gave, or null when it wasn't installed.
  * `again` are the commands that start it now (and whatever is installed after it) when a terminal run as administrator didn't.
  */
 async function startAtLogin(service: Service, question: string, ...again: string[]): Promise<ServiceState | null> {
@@ -315,11 +319,11 @@ async function startAtLogin(service: Service, question: string, ...again: string
   const l = launch();
   const why = service.unavailable(l);
   if (why) { note(why); return null; }
-  if (!await confirm(question, true)) return null;
+  if (!flags.has("yes") && !await confirm(question, true)) return null;
   // Paired by now: a service that can't be set up is said, and setup goes on.
   let s: ServiceState;
   try { s = await service.install(l); } catch (e) { warn(describe(e)); return null; }
-  if (s.elevated) startsAtSignIn(...again);
+  if (s.elevated) startsAtSignIn(s, ...again);
   else if (s.running) ok("Starts at login");
   else warn(`Installed at ${s.where}, but it isn't running: see ${s.logs}`);
   if (s.note) note(s.note);
@@ -393,7 +397,7 @@ function defaultName() { return oneWord(hostname().replace(/\.(local|lan|home)$/
 /** As the cloud names machines (cloud/src/links.ts machineName), before it adds a number to a name already taken. */
 function oneWord(name: string) { return name.normalize("NFKD").replace(/[^\w-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32) || "computer"; }
 
-/** Shows the code, opens the browser and waits for the approval: Enter opens the page again; an expired code can be renewed. */
+/** Shows the code, opens the browser and waits for the approval: Enter opens the page again; at a terminal, an expired code can be renewed. */
 async function approve(origin: string, name: string): Promise<string> {
   for (;;) {
     const controller = new AbortController();
@@ -411,13 +415,16 @@ async function approve(origin: string, name: string): Promise<string> {
           say(`    ${accent(p.verificationUrl)}`);
           say(`    The page should show the code ${bold(p.userCode)}.\n`);
           openBrowser(p.verificationUrl);
-          wait = spinner(`Waiting for you to approve it ${dim(process.stdin.isTTY ? "· Enter opens the page again · Ctrl-C cancels" : "")}`);
+          wait = spinner(`Waiting for you to approve it ${dim(!process.stdin.isTTY ? "" : opener(p.verificationUrl) ? "· Enter opens the page again · Ctrl-C cancels" : "· Ctrl-C cancels")}`);
         },
       });
     } catch (e) {
       wait?.clear();
       if (controller.signal.aborted) throw new Cancelled();
       if (!(e instanceof Expired)) throw e;
+      // Off a terminal, or with --yes, nobody may be there to approve a new code: renewing would open the browser every 10
+      // minutes, for good.
+      if (!process.stdin.isTTY || flags.has("yes")) throw new Error(`The code expired before it was approved. To get a new one, run ${cmd(`10and2 setup${flags.has("brain") ? ` --brain=${flags.get("brain")}` : ""}`)} again.`);
       warn("The code expired before it was approved.");
       if (!await confirm("Get a new code?", true)) throw new Cancelled();
     } finally {
@@ -490,10 +497,16 @@ async function runConnector() {
   record({ brain: origin });
   let token = process.env.TENANDTWO_TOKEN;
   // The login service's way: a start before the keyring opens (boot, with lingering) waits for it instead of giving up.
-  const wait = flags.get("wait-for-credential");
+  // Windows has no keyring: DPAPI reads the key from sign-in or never (made for another account), so it stops as unpaired.
+  const wait = process.platform === "win32" ? undefined : flags.get("wait-for-credential");
   const waitMs = wait === "true" ? 15_000 : Number(wait) * 1000;
   try {
     token ||= (await new Credentials().load(origin))?.secret;
+    // Reading it takes a PowerShell start, which can fail once at sign-in: a key that's there is tried again first.
+    for (let i = 0; !token && process.platform === "win32" && i < 2 && new Credentials().stored(origin); i++) {
+      await new Promise((r) => setTimeout(r, 3000));
+      token = (await new Credentials().load(origin))?.secret;
+    }
     if (!token && wait) {
       log(`connector: no credential readable for ${origin} yet (is the keyring locked until you log in?); checking every ${waitMs / 1000}s`);
       record({ error: "waiting for the credential (keyring locked?)" });
@@ -502,6 +515,7 @@ async function runConnector() {
         token = (await new Credentials().load(origin))?.secret;
       }
       log("connector: the credential is readable now");
+      record({ error: null });
     }
   }
   catch (e) { log(`connector: ${describe(e)}`); process.exitCode = fatalExit; return; }
@@ -550,7 +564,7 @@ async function runConnector() {
     url: policy.brain, token, adapter, ledger, log,
     onFatal: () => { record({ error: "this computer was disconnected (revoked on the website, or set up again elsewhere)", fatal: true }); stop(fatalExit); },
     onView: (n) => {
-      record(n);
+      if (n.threads !== state.threads || n.projects !== state.projects) record(n);
       // Once every work system has been read: which protected folders macOS keeps from this program. The first ask
       // makes macOS show its prompt, at login, while someone is at the Mac; later views ask again (at most every 30 s
       // per folder), so `status` stops saying it once it's allowed (privacy.ts).
@@ -567,7 +581,8 @@ async function runConnector() {
   log(`connector ${VERSION}: linking to ${origin}`);
   const proxy = proxyAdvice();
   if (proxy) log(`connector: ${proxy}`);
-  void detect().then((found) => { for (const f of found) { const w = policy[f.agent] && f.installed ? versionWarning(f.agent, f.name, f.version) : null; if (w) log(`${f.agent}: ${w}`); } }, () => {});
+  // Running on, it leaves a first run that hasn't answered yet to finish (agents.ts onPath).
+  void detect(process.env, undefined, true).then((found) => { for (const f of found) { const w = policy[f.agent] && f.installed ? versionWarning(f.agent, f.name, f.version) : null; if (w) log(`${f.agent}: ${w}`); } }, () => {});
   void t3?.start().catch((e) => { log(`t3: ${describe(e)}; not restarting`); record({ error: `T3 Code: ${describe(e)}` }); stop(fatalExit); });
   void claude?.start().then(() => log("claude: reading sessions"), (e) => log(`claude: ${describe(e)}`));
   void codex?.start().then(() => log("codex: reading sessions"), (e) => log(`codex: ${describe(e)}`));
@@ -602,17 +617,20 @@ async function status() {
   await repairService(service);
   const s = await service.state();
   const st = readStatus();
-  const alive = st?.pid ? connectorRunning(st.pid, st.startedAt) : false;
+  const alive = st?.pid ? connectorRunning(st.pid) : false;
 
-  if (!cred && !token) bad(`Not connected to ${account(origin, key)}: ${cmd("10and2 setup")} connects it.`);
-  else if (!alive) bad(`Not running. ${s.installed ? `It should start at login; see ${s.logs}` : `${cmd("10and2 autostart on")} keeps it running.`}`);
+  // A brain of your own has no website to approve this computer on, so plain setup can't connect it again.
+  if (!cred && !token) bad(`Not connected to ${account(origin, key)}: ${cmd(paired(origin) ? "10and2 setup" : `10and2 setup --brain=${origin} --token`)} connects it.`);
+  // A log that isn't there yet: it has never run (set up from a terminal run as administrator, on Windows).
+  else if (!alive) bad(`Not running. ${!s.installed ? `${cmd("10and2 autostart on")} keeps it running.` : isAbsolute(s.logs) && !existsSync(s.logs) ? "It starts at your next sign-in." : `It should start at login; see ${s.logs}`}`);
   else if (st.linked) ok(`Connected to ${account(origin, key)} ${dim(`· ${Date.now() - Date.parse(st.since) < 10_000 ? "just now" : `for ${ago(st.since)}`}`)}${st.threads !== undefined ? ` ${dim("·")} ${sizeText(st)}` : ""}`);
   else warn(`Connecting to ${account(origin, key)}${st.error ? `: ${st.error}` : ""}`);
   // What macOS keeps from the running connector (privacy.ts), as it last found.
   if (alive) for (const why of Array.isArray(st.privacy) ? st.privacy : []) warn(why);
-  if (cred || token) {
+  // Not running is said once, above; running (here, or in another terminal), whether it also starts at login.
+  if ((cred || token) && alive) {
     if (s.installed) (s.running ? ok : warn)(s.running ? "Starts at login" : `Starts at login, but isn't running: see ${s.logs}`);
-    else if (alive) note(dim(`Doesn't start at login (${cmd("10and2 autostart on")})`));
+    else note(dim(`Doesn't start at login (${cmd("10and2 autostart on")})`));
   }
   say();
   note(`Sees   ${seesText(policy)}`);
@@ -633,7 +651,7 @@ async function status() {
     if (!h?.installed) note(dim(hooksUnavailable(claudeDir()) ?? `${cmd("10and2 hooks install")} lets 10 & 2 answer Claude Code's questions, and makes updates instant`));
     const db = join(stateDirectory(), "claude.db");
     if (existsSync(db)) {
-      const conn = new DatabaseSync(db, { readOnly: true });
+      const conn = new DatabaseSync(databasePath(db), { readOnly: true });
       try {
         const runs = conn.prepare("SELECT sessionId, pid, procStart FROM claude_runs WHERE pid IS NOT NULL").all() as { sessionId: string; pid: number; procStart: string | null }[];
         // As the adapter tells a run from a later process given its pid (on Windows, perhaps another account's).
@@ -645,7 +663,7 @@ async function status() {
   note(dim(`Settings ${defaultPolicyPath()}`));
   if (flags.has("verbose")) {
     const device = cred ? parseCredential(cred.secret) : null;
-    note(dim(`Key in ${cred ? where(cred.store) : "TENANDTWO_TOKEN"}${device ? `, device ${device.deviceId} of ${device.userId}` : ""}`));
+    note(dim(!cred && !token ? "No key it can read" : `Key in ${cred ? where(cred.store) : "TENANDTWO_TOKEN"}${device ? `, device ${device.deviceId} of ${device.userId}` : ""}`));
     note(dim(`Link ${policy.brain}${st?.pid ? `, pid ${st.pid}, version ${st.version}` : ""}`));
   }
 }
@@ -658,7 +676,7 @@ async function revoke(uninstalling = false) {
   const cred = await creds.load(origin).catch(() => null);
   if (!cred) say(`This computer isn't connected to ${account(origin)}.`);
   if (cred && !flags.has("yes") && !await confirm(`Disconnect this computer from ${account(origin, cred.secret)}?`, true)) throw new Cancelled();
-  if (cred && !paired(cred.secret)) note(`Your brain still accepts this computer's old key until you remove it there: ${cmd("10and2 brain remove <name>")}.`);
+  if (cred && !paired(origin, cred.secret)) note(`Your brain still accepts this computer's old key until you remove it there: ${cmd("10and2 brain remove <name>")}.`);
   else if (cred) {
     const spin = spinner("Disconnecting");
     try {
@@ -731,13 +749,15 @@ function removeCommand(): string {
 async function autostart() {
   const service = new Service();
   if (sub === "on") {
+    // Not set up, it would only exit at each sign-in.
+    const policy = readPolicyFile();
+    if (!policy) throw new Error(`This computer isn't set up yet: ${cmd("10and2 setup")} connects it.`);
     const s = await service.install(launch());
-    if (s.elevated) { startsAtSignIn("10and2 autostart on"); return; }
+    if (s.elevated) { startsAtSignIn(s, "10and2 autostart on"); return; }
     if (!s.running) { warn(`Installed at ${s.where}, but not running: see ${s.logs}`); return; }
     ok("Starts at login, and (re)started now");
     if (s.note) note(s.note);
-    const policy = readPolicyFile();
-    if (policy?.brain) await connected(originOf(policy.brain), (await new Credentials().load(originOf(policy.brain)).catch(() => null))?.secret);
+    if (policy.brain) await connected(originOf(policy.brain), (await new Credentials().load(originOf(policy.brain)).catch(() => null))?.secret);
   }
   else if (sub === "off") { await service.uninstall(); ok("Stopped, and no longer starts at login"); }
   else if (sub === "status" || sub === undefined) { const s = await service.state(); say(s.installed ? `${s.running ? "Running" : "Not running"}; starts at login ${dim(`(${s.where})`)}.` : "Doesn't start at login."); }
@@ -815,7 +835,7 @@ async function brain() {
       if (on === "on") {
         settings();
         const s = await service.install(launch());
-        if (s.elevated) startsAtSignIn("10and2 brain autostart on");
+        if (s.elevated) startsAtSignIn(s, "10and2 brain autostart on");
         else if (s.running) ok("Your brain starts at login, and (re)started now"); else warn(`Installed at ${s.where}, but not running: see ${s.logs}`);
       } else if (on === "off") { await service.uninstall(); ok("Your brain stopped, and no longer starts at login"); }
       else if (on === "status" || on === undefined) { const s = await service.state(); say(s.installed ? `${s.running ? "Running" : "Not running"}; starts at login ${dim(`(${s.where})`)}.` : "Doesn't start at login."); }
@@ -858,7 +878,8 @@ async function brainSetup(service: Service, path: string) {
     DRIVER_PORT: String(port),
   }, { name, tokenSha256: sha256(token), local: true });
   writeBrainEnv(vars, path);
-  const store = await new Credentials().save(origin, token);
+  const saving = spinner("Saving this computer's key");
+  const store = await new Credentials().save(origin, token).finally(() => saving.clear());
   writePrivate(defaultPolicyPath(), JSON.stringify(policy, null, 2) + "\n");
   ok(`Set up ${dim(`· your key and its settings are in ${path}, which only you can read`)}`);
   if (store !== "file") ok(`This computer's key to it is in ${where(store)}`);
@@ -868,7 +889,7 @@ async function brainSetup(service: Service, path: string) {
   // so neither is waited for now.
   if (brain?.running || brain?.elevated) {
     const s = await new Service().install(launch());
-    if (s.elevated) { if (!brain.elevated) startsAtSignIn("10and2 autostart on"); }
+    if (s.elevated) { if (!brain.elevated) startsAtSignIn(s, "10and2 autostart on"); }
     else if (s.running) await connected(origin, token);
     else warn(`This computer's connection is installed at ${s.where}, but isn't running: see ${s.logs}`);
   } else note(`To run it: ${cmd("10and2 brain run")} and ${cmd("10and2 run")}, each in a terminal you keep open; or ${cmd("10and2 brain autostart on")} and ${cmd("10and2 autostart on")}.`);
@@ -902,10 +923,12 @@ async function brainStatus(service: Service, path: string) {
   const origin = brainOrigin(vars);
   const up = await fetch(`${origin}/`, { signal: AbortSignal.timeout(2000) }).then((r) => r.ok, () => false);
   const s = await service.state();
-  if (up) ok(`Running at ${origin}`);
-  else bad(`Not running. ${s.installed ? `It should start at login; see ${s.logs}` : `${cmd("10and2 brain run")} runs it, or ${cmd("10and2 brain autostart on")}.`}`);
-  if (s.installed) (s.running ? ok : warn)(s.running ? "Starts at login" : `Starts at login, but isn't running: see ${s.logs}`);
-  else if (up) note(dim(`Doesn't start at login (${cmd("10and2 brain autostart on")})`));
+  if (!up) bad(`Not running. ${!s.installed ? `${cmd("10and2 brain run")} runs it, or ${cmd("10and2 brain autostart on")}.` : isAbsolute(s.logs) && !existsSync(s.logs) ? "It starts at your next sign-in." : `It should start at login; see ${s.logs}`}`);
+  else {
+    ok(`Running at ${origin}`);
+    if (s.installed) (s.running ? ok : warn)(s.running ? "Starts at login" : `Starts at login, but isn't running: see ${s.logs}`);
+    else note(dim(`Doesn't start at login (${cmd("10and2 brain autostart on")})`));
+  }
   say();
   const list = machines(vars);
   note(`Accepts  ${list.length ? list.map((m) => m.local ? `${m.name} ${dim("(this computer)")}` : m.name).join(", ") : "no computers"}`);

@@ -24,7 +24,7 @@ export function marks(platform: NodeJS.Platform = process.platform, env: NodeJS.
     ? { spinner: "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", ok: "✓", bad: "✗", cursor: "❯", on: "◉", off: "○", left: "◂", right: "▸" }
     : { spinner: "|/-\\", ok: "√", bad: "×", cursor: ">", on: "●", off: "○", left: "◄", right: "►" };
 }
-const mark = marks();
+export const mark = marks();
 
 export const say = (s = "") => console.log(s);
 export const ok = (s: string) => say(`  ${paint("green", mark.ok)} ${s}`);
@@ -155,14 +155,15 @@ export function listStep(s: ListState, key: ListKey): ListOutcome {
   return { done: false };
 }
 
-function drawList(title: string, s: ListState, hint: string): string[] {
+/** A checklist's lines. A label is padded before it's dimmed: padding counts colour codes as characters. */
+export function drawList(title: string, s: ListState, hint: string): string[] {
   const lines = [`  ${title}`];
   s.rows.forEach((r, i) => {
     const cursor = i === s.at ? accent(mark.cursor) : " ";
     if (r.kind === "box") {
       const box = r.disabled ? dim(mark.off) : r.on ? paint("green", mark.on) : dim(mark.off);
-      const label = r.disabled ? dim(r.label) : r.label;
-      lines.push(`  ${cursor} ${box} ${label.padEnd(14)}${r.detail ? ` ${dim(r.detail)}` : ""}`);
+      const label = r.disabled ? dim(r.label.padEnd(14)) : r.label.padEnd(14);
+      lines.push(`  ${cursor} ${box} ${label}${r.detail ? ` ${dim(r.detail)}` : ""}`);
     } else {
       lines.push(`  ${cursor}   ${r.label}  ${accent(`${mark.left} ${r.options[r.index]} ${mark.right}`)}${r.detail ? `  ${dim(r.detail)}` : ""}`);
     }

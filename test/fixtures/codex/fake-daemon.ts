@@ -2,9 +2,10 @@
 // unix socket speaking the part of its JSON-RPC the adapter uses, with threads, turns and server requests (questions,
 // approvals) a test sets up and drives. Every request is recorded; any method can be overridden per test.
 import { createServer, type Server } from "node:http";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import fs, { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, type WebSocket } from "ws";
 
@@ -70,7 +71,8 @@ export class FakeCodex {
       ws.on("message", (data) => void this.onMessage(conn, JSON.parse(String(data))));
     });
     // Windows: Node makes pipes, not socket files. The file Codex's socket would be names the pipe, for the fake proxy
-    // (proxy.mjs), which is how the adapter reaches Codex there.
+    // (proxy.mjs), which is how the adapter reaches Codex there. Node sees that file as an ordinary one, unlike Codex's
+    // real socket: statRefused() makes it look like that.
     if (process.platform === "win32") {
       const pipe = `\\\\.\\pipe\\fake-codex-${randomUUID()}`;
       await new Promise<void>((resolve) => this.http.listen(pipe, resolve));
@@ -83,6 +85,23 @@ export class FakeCodex {
     this.conns.clear();
     await new Promise<void>((resolve) => this.wss.close(() => this.http.close(() => resolve())));
     rmSync(this.socketPath, { force: true });
+  }
+  /**
+   * Makes this process see the socket's file as Node on Windows sees Codex's real one, an AF_UNIX socket (checked on
+   * Windows 10): there to access and in its folder, but stat and lstat refuse it (EACCES), so existsSync is false.
+   * Returns what undoes it.
+   */
+  statRefused(): () => void {
+    const real = { existsSync: fs.existsSync, statSync: fs.statSync, lstatSync: fs.lstatSync };
+    const mine = (p: unknown) => typeof p === "string" && resolve(p) === resolve(this.socketPath);
+    const refuse = (p: string): never => { throw Object.assign(new Error(`EACCES: permission denied, stat '${p}'`), { code: "EACCES", errno: -4092, syscall: "stat", path: p }); };
+    Object.assign(fs, {
+      existsSync: (p: any) => !mine(p) && real.existsSync(p),
+      statSync: (p: any, o?: any) => mine(p) ? refuse(p) : real.statSync(p, o),
+      lstatSync: (p: any, o?: any) => mine(p) ? refuse(p) : real.lstatSync(p, o),
+    });
+    syncBuiltinESMExports();
+    return () => { Object.assign(fs, real); syncBuiltinESMExports(); };
   }
   get connections() { return this.conns.size; }
   count(method: string) { return this.calls.filter((c) => c.method === method).length; }

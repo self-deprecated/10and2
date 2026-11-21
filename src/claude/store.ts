@@ -2,6 +2,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync, chmodSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Receipt } from "../contract.ts";
+import { databasePath } from "../paths.ts";
 
 /** What Driver keeps for a Claude session itself, since Claude has no such state. */
 export type OverlayKind = "settle" | "snooze" | "archive" | "unsettle" | "unsnooze";
@@ -14,7 +15,7 @@ export class Store {
   readonly db: DatabaseSync;
   constructor(path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-    this.db = new DatabaseSync(path);
+    this.db = new DatabaseSync(databasePath(path));
     if (path !== ":memory:") chmodSync(path, 0o600);
     this.db.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
       CREATE TABLE IF NOT EXISTS claude_overlay (sessionId TEXT PRIMARY KEY, settledAt TEXT, snoozedAt TEXT, snoozedUntil TEXT, archived INTEGER NOT NULL DEFAULT 0);

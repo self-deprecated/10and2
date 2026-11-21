@@ -38,7 +38,7 @@ const config = (fake: FakeCodex, text: string) =>
 // Codex's proxy (the way in on Windows) as the fake daemon's: `node proxy.mjs app-server proxy`.
 const PROXY = [process.execPath, fileURLToPath(new URL("./fixtures/codex/proxy.mjs", import.meta.url))];
 
-async function setup(t: TestContext, opts: { policy?: Partial<Policy>; acceptanceTimeoutMs?: number; before?: (fake: FakeCodex, cwd: string, root: string) => void; start?: boolean; transport?: "socket" | "proxy"; heartbeatMs?: number; autoStart?: boolean; platform?: NodeJS.Platform } = {}) {
+async function setup(t: TestContext, opts: { policy?: Partial<Policy>; acceptanceTimeoutMs?: number; before?: (fake: FakeCodex, cwd: string, root: string) => void; start?: boolean; transport?: "socket" | "proxy"; heartbeatMs?: number; autoStart?: boolean; platform?: NodeJS.Platform; now?: () => number; daemonStartMs?: number } = {}) {
   const fake = await FakeCodex.start();
   // As a Windows computer whose Codex has its sandbox set up: without one, Codex won't edit on its own there, and the
   // adapter refuses such work (tested on its own below).
@@ -51,7 +51,8 @@ async function setup(t: TestContext, opts: { policy?: Partial<Policy>; acceptanc
   opts.before?.(fake, cwd, root);
   const logs: string[] = [];
   const adapter = new CodexAdapter({ policy, codexHome: fake.home, db: join(root, "codex.db"), stateDir: join(root, "state"), log: (m) => logs.push(m),
-    autoStart: opts.autoStart ?? false, acceptanceTimeoutMs: opts.acceptanceTimeoutMs ?? 1000 * SLOW, refreshMs: 60_000, codexCommand: PROXY, transport: opts.transport, heartbeatMs: opts.heartbeatMs, platform: opts.platform });
+    autoStart: opts.autoStart ?? false, acceptanceTimeoutMs: opts.acceptanceTimeoutMs ?? 1000 * SLOW, refreshMs: 60_000, codexCommand: PROXY, transport: opts.transport, heartbeatMs: opts.heartbeatMs, platform: opts.platform,
+    now: opts.now, daemonStartMs: opts.daemonStartMs });
   t.after(async () => { await adapter.close(); await fake.stop().catch(() => {}); removeDir(root); removeDir(fake.home); });
   if (opts.start !== false) await adapter.start();
   return { fake, adapter, cwd, root, policy, logs };
@@ -104,6 +105,49 @@ test("through Codex's proxy, which keeps its end open, a daemon that goes away i
   await until(() => logs.some((l) => l.startsWith("codex: connection lost")));
   await fake.listen();
   await until(() => adapter.connected(), 5000);
+});
+
+test("through Codex's proxy, a running daemon is reached when Node can't stat its socket's file (as on Windows)", async (t) => {
+  let own = "";
+  const { adapter, fake } = await setup(t, { transport: "proxy", start: false, autoStart: true, before: (fake, cwd) => { own = fake.thread(cwd, { status: { type: "idle" } }).id; } });
+  t.after(fake.statRefused());
+  await adapter.start();
+  assert.equal(adapter.connected(), true);
+  assert.deepEqual((await adapter.list()).map((i) => i.id), [own]);
+  assert.equal(existsSync(join(fake.home, "daemon-starts")), false, "a daemon that runs isn't started");
+});
+
+test("Codex's first start of its daemon, which installs it and can take minutes, is waited for and not started again", async (t) => {
+  let clock = Date.now();
+  const { adapter, fake, logs } = await setup(t, { transport: "proxy", start: false, autoStart: true, now: () => clock });
+  await fake.stop();
+  const installing = join(fake.home, "daemon-installing"), starts = join(fake.home, "daemon-starts");
+  writeFileSync(installing, "");
+  const started = adapter.start();
+  await until(() => existsSync(starts), 5000 * SLOW);
+  // Longer than 10 & 2 once gave it (30 s), and than its once-a-minute limit: it's still installing, not ended.
+  clock += 90_000;
+  await pause(300);
+  const pid = Number(readFileSync(starts, "utf8").trim());
+  assert.doesNotThrow(() => process.kill(pid, 0));
+  rmSync(installing);
+  // It says Codex runs, which can't be reached yet: no second start, a minute counts from when the first ended.
+  await started;
+  assert.deepEqual(readFileSync(starts, "utf8").trim().split("\n"), [String(pid)]);
+  assert.ok(logs.some((l) => l.startsWith("codex: starting Codex's daemon")), logs.join("\n"));
+  assert.ok(logs.some((l) => l.includes("its daemon isn't running")), logs.join("\n"));
+  await fake.listen();
+  await until(() => adapter.connected(), 5000 * SLOW);
+});
+
+test("a start of Codex's daemon still going past its limit is ended, with what it started", async (t) => {
+  const { adapter, fake, logs } = await setup(t, { transport: "proxy", start: false, autoStart: true, daemonStartMs: 1000 * SLOW });
+  await fake.stop();
+  writeFileSync(join(fake.home, "daemon-installing"), "");
+  await adapter.start();
+  assert.ok(logs.includes("codex: couldn't start Codex's daemon (it took too long)"), logs.join("\n"));
+  const pid = Number(readFileSync(join(fake.home, "daemon-starts"), "utf8").trim());
+  await until(() => { try { process.kill(pid, 0); return false; } catch { return true; } }, 5000);
 });
 
 test("through Codex's proxy, a socket file nothing listens on (Windows, after a restart) is a daemon to start", async (t) => {

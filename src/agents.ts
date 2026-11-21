@@ -1,10 +1,12 @@
 // Which coding agents are on this computer, for setup and `10and2 agents`: installed or not, their version, how many
 // sessions they have from the last two weeks, and how many are open now. Read cheaply from their own files, without
 // starting anything; a number that can't be told is left out rather than guessed.
+import type { ChildProcess } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import type { Socket } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { execFileCommand, which } from "./command.ts";
+import { spawnCommand, which } from "./command.ts";
 import type { Agent } from "./policy.ts";
 import { openCodeCounts } from "./opencode/index.ts";
 import { countSessions } from "./codex/adapter.ts";
@@ -23,23 +25,36 @@ export const NAMES: Record<Agent, string> = { claude: "Claude Code", codex: "Cod
 export const ORDER: readonly Agent[] = ["claude", "codex", "pi", "opencode", "gemini", "copilot", "cursor", "t3"];
 const RECENT_MS = 14 * 86_400_000;
 
+/** How long a command that hasn't answered may go on before it's stopped: a first run may be installing itself. */
+const LEFT_MS = 10 * 60_000;
+
 /**
- * The version a command on PATH says it is: "" when it answers without one, null when it isn't there. Found first, so a
- * program of that name in the current folder is never run (Windows would look there before PATH). Windows starts a
- * Node-based command (`codex.cmd`) several times slower, and scans it, so it has longer to answer there.
+ * The version a command on PATH says it is: "" when it answers without one or is still running after `answerMs`, null
+ * when it isn't there or fails without one. Found first, so a program of that name in the current folder is never run
+ * (Windows would look there before PATH). One still running then still counts as there (npm's `t3` downloads T3's
+ * runtime on its first run before it answers). It's stopped then, as a hung one must be, unless `leave`: the connector,
+ * which runs on, leaves it to finish for at most LEFT_MS, without that keeping the connector running.
  */
-function onPath(bin: string, env: NodeJS.ProcessEnv): Promise<string | null> {
+function onPath(bin: string, env: NodeJS.ProcessEnv, answerMs: number, leave: boolean): Promise<string | null> {
   if (!which(bin, env)) return Promise.resolve(null);
   return new Promise((resolve) => {
+    let child: ChildProcess;
     // Windows refuses some programs at once, with a throw rather than an error (an .exe whose install step didn't run,
     // left as a stub, is EFTYPE): one that won't start is as good as none.
-    try {
-      execFileCommand(bin, ["--version"], { timeout: process.platform === "win32" ? 10_000 : 4000, maxBuffer: 256 * 1024, env }, (err, stdout) => {
-        if (err && (err as NodeJS.ErrnoException).code === "ENOENT") return resolve(null);
-        const v = /\d+\.\d+(?:\.\d+)?(?:[-+.][\w.]+)?/.exec(String(stdout ?? ""))?.[0];
-        resolve(v ?? (err ? null : ""));
-      });
-    } catch { resolve(null); }
+    try { child = spawnCommand(bin, ["--version"], { env, stdio: ["ignore", "pipe", "ignore"] }); } catch { return resolve(null); }
+    let out = "";
+    const version = () => /\d+\.\d+(?:\.\d+)?(?:[-+.][\w.]+)?/.exec(out)?.[0];
+    child.stdout!.setEncoding("utf8").on("data", (s: string) => { if (out.length < 65_536) out += s; });
+    const answer = setTimeout(() => {
+      resolve(version() ?? "");
+      // Its output pipe too: what it started (cmd.exe's program, a script's child) would hold it open, and 10and2 with it.
+      if (!leave) { child.kill(); child.stdout!.destroy(); return; }
+      child.unref();
+      (child.stdout as Socket).unref();
+      setTimeout(() => { child.kill(); child.stdout!.destroy(); }, LEFT_MS).unref();
+    }, answerMs);
+    child.on("error", () => { clearTimeout(answer); resolve(version() ?? null); });
+    child.on("close", (code) => { clearTimeout(answer); resolve(version() ?? (code === 0 ? "" : null)); });
   });
 }
 
@@ -76,7 +91,12 @@ function openCopilots(dir: string): number {
   } catch { return 0; }
 }
 
-export async function detect(env: NodeJS.ProcessEnv = process.env): Promise<Found[]> {
+/**
+ * The agents here. Each command has `answerMs` to say its version: Windows starts a Node-based command (`codex.cmd`)
+ * several times slower, and scans it, so longer there. One still running then is found, its version unknown, and stopped
+ * unless `leave` (onPath).
+ */
+export async function detect(env: NodeJS.ProcessEnv = process.env, answerMs = process.platform === "win32" ? 10_000 : 4000, leave = false): Promise<Found[]> {
   const home = homedir();
   const claudeDir = env.CLAUDE_CONFIG_DIR || join(home, ".claude");
   const codexHome = env.CODEX_HOME || join(home, ".codex");
@@ -86,7 +106,7 @@ export async function detect(env: NodeJS.ProcessEnv = process.env): Promise<Foun
   const t3Cli = env.T3_CLI ?? "t3";
   const cursorChats = join(cursorConfigDir(env), "chats");
   const gemini = geminiDir(env), copilot = copilotDir(env);
-  const [claude, codex, pi, opencode, t3, geminiV, copilotV, cursor] = await Promise.all(["claude", "codex", "pi", "opencode", t3Cli, "gemini", "copilot", "cursor-agent"].map((bin) => onPath(bin, env)));
+  const [claude, codex, pi, opencode, t3, geminiV, copilotV, cursor] = await Promise.all(["claude", "codex", "pi", "opencode", t3Cli, "gemini", "copilot", "cursor-agent"].map((bin) => onPath(bin, env, answerMs, leave)));
   const found: Found[] = [
     { agent: "claude", name: NAMES.claude, installed: claude !== null || existsSync(join(claudeDir, "projects")), version: claude || null,
       sessions: recentFiles(join(claudeDir, "projects"), /\.jsonl$/, 1), open: liveRegistries(join(claudeDir, "sessions")) },
@@ -103,8 +123,8 @@ export async function detect(env: NodeJS.ProcessEnv = process.env): Promise<Foun
       sessions: recentFiles(join(gemini, "tmp"), /^session-.*\.jsonl?$/, 2), open: geminiV === null && !existsSync(join(gemini, "tmp")) ? null : processes(isGemini).length },
     { agent: "copilot", name: NAMES.copilot, installed: copilotV !== null || existsSync(join(copilot, "session-state")), version: copilotV || null,
       sessions: recentFiles(join(copilot, "session-state"), /^events\.jsonl$/, 1), open: openCopilots(join(copilot, "session-state")) },
-    // A `t3` that didn't answer in time (T3's desktop app starts its own as Node, slowly on Windows) still counts where
-    // T3 has run. Never without one: the connector reaches T3 through it, and stops when it can't.
+    // A `t3` that failed without a version still counts where T3 has run. Never without one: the connector reaches T3
+    // through it, and stops when it can't.
     { agent: "t3", name: NAMES.t3, installed: t3 !== null || (existsSync(join(t3Home(env), "userdata")) && which(t3Cli, env) !== null), version: t3 || null, sessions: null, open: null },
   ];
   return ORDER.map((a) => found.find((f) => f.agent === a)!);

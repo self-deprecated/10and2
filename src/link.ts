@@ -20,7 +20,7 @@ type Options = {
   onFatal: (code: number) => void;
   /** Told when the link comes up (initialized) and goes down, for `10and2 status`. */
   onState?: (s: { linked: boolean; error?: string }) => void;
-  /** After each whole view is sent: how much 10 & 2 can see here, for `setup` and `status`. */
+  /** After each read, a delta too: how much 10 & 2 can see here (the whole view), for `setup` and `status`. */
   onView?: (n: { threads: number; projects: number }) => void;
   /** Tests can reconnect promptly without changing the production backoff. */
   retryMs?: number;
@@ -161,10 +161,11 @@ export class Link {
           // Until every work system has loaded (or the grace is over), a view would say their threads had gone.
           while (!ready()) await new Promise((r) => setTimeout(r, 100));
           const first = sent.rev === null;
-          const read = sent.read(await view(), uri.searchParams.get("since"));
+          const now = await view();
+          const read = sent.read(now, uri.searchParams.get("since"));
           notified = false;
           const text = JSON.stringify(redactOutbound(read));
-          if (read.full) this.opts.onView?.({ threads: read.items.length, projects: read.places.length });
+          this.opts.onView?.({ threads: now.items.length, projects: now.places.length });
           if (first) this.opts.log(`connector: linked; first view ${read.items.length} items, ${read.places.length} places, ${Math.round(Buffer.byteLength(text) / 1024)} KB`);
           // A change that landed while this read was being answered still gets its own notification.
           setTimeout(() => void check(), 0);

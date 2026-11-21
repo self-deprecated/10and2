@@ -4,7 +4,7 @@
 import type { ActionKind } from "./contract.ts";
 import { AGENTS, RUNTIME_MODES, type Agent, type RuntimeMode } from "./policy.ts";
 import { describeFound, NAMES, ORDER, type Found } from "./agents.ts";
-import { checklist, type Row } from "./ui.ts";
+import { checklist, cmd, type Row } from "./ui.ts";
 
 /** What Driver may do, as the person reads it. `tidy` is settle, snooze and archive together. */
 export const CAPS = ["follow_up", "steer", "answer", "start_work", "tidy"] as const;
@@ -112,7 +112,7 @@ export function summary(c: Choice, found: Found[]): string[] {
   const reach = ORDER.filter((a) => c.on[a]).map((a) => NAMES[a]);
   const offFound = ORDER.filter((a) => !c.on[a] && found.find((f) => f.agent === a)?.installed).map((a) => NAMES[a]);
   const all = CAPS.filter((cap) => c.caps[cap]).flatMap((cap) => ({ follow_up: ["follow up"], steer: ["steer an open session"], answer: ["answer questions"], start_work: ["start new work"], tidy: ["settle", "snooze", "archive"] })[cap]);
-  const lines = [`10 & 2 can reach ${list(reach)}${offFound.length ? ` (${list(offFound)} ${offFound.length === 1 ? "is" : "are"} off)` : ""}, and can ${all.length ? list(all) : "only read"}: each only after you hear it read back and say yes.`];
+  const lines = [`10 & 2 can reach ${list(reach)}${offFound.length ? ` (${list(offFound)} ${offFound.length === 1 ? "is" : "are"} off)` : ""}, and can ${all.length ? `${list(all)}: each only after you hear it read back and say yes.` : "only read."}`];
   for (const a of ORDER) {
     const off = (c.off[a] ?? []).filter((cap) => c.on[a] && c.caps[cap]);
     if (off.length) lines.push(`For ${NAMES[a]}: ${off.map((cap) => "no " + ({ follow_up: "follow-ups", steer: "steering", answer: "answering", start_work: "new work", tidy: "tidying" })[cap]).join(", ")}.`);
@@ -122,15 +122,23 @@ export function summary(c: Choice, found: Found[]): string[] {
 
 /**
  * The flags that choose without a terminal: `--agents=claude,pi` (only these), `--off=codex`, `--no-steer`,
- * `--no-answer`, `--no-start`, `--read-only`; `--no-steer=codex` and the like narrow one agent. Unknown names throw.
+ * `--no-answer`, `--no-start`, `--read-only`; `--no-steer=codex` and the like narrow one agent. Names are split on
+ * commas or spaces (PowerShell hands npm's script `--agents=claude,pi` as "--agents=claude pi"). Unknown names throw,
+ * and so does `--agents` naming one that wasn't found.
  */
-export function applyFlags(c: Choice, flags: Map<string, string>): Choice {
-  const names = (v: string) => v.split(",").map((s) => s.trim()).filter(Boolean).map((s) => {
+export function applyFlags(c: Choice, flags: Map<string, string>, found: Found[]): Choice {
+  const names = (v: string) => v.split(/[\s,]+/).filter(Boolean).map((s) => {
     if (!AGENTS.includes(s as Agent)) throw new Error(`There's no agent called "${s}" (${AGENTS.join(", ")}).`);
     return s as Agent;
   });
   const out: Choice = { on: { ...c.on }, caps: { ...c.caps }, ceiling: c.ceiling, off: Object.fromEntries(Object.entries(c.off).map(([k, v]) => [k, [...v!]])) };
-  if (flags.has("agents")) { const only = names(flags.get("agents")!); for (const a of AGENTS) out.on[a] = only.includes(a); }
+  if (flags.has("agents")) {
+    const only = names(flags.get("agents")!);
+    const missing = only.filter((a) => !found.find((f) => f.agent === a)?.installed).map((a) => NAMES[a]);
+    const [them, were] = missing.length === 1 ? ["it", "wasn't"] : ["them", "weren't"];
+    if (missing.length) throw new Error(`${list(missing)} ${were} found on this computer, so 10 & 2 can't connect ${them}. Install ${them}, or leave ${them} out of ${cmd("--agents")}.`);
+    for (const a of AGENTS) out.on[a] = only.includes(a);
+  }
   if (flags.has("off")) for (const a of names(flags.get("off")!)) out.on[a] = false;
   if (flags.has("read-only")) for (const cap of CAPS) out.caps[cap] = false;
   for (const [flag, cap] of [["no-steer", "steer"], ["no-answer", "answer"], ["no-start", "start_work"], ["no-follow-up", "follow_up"], ["no-tidy", "tidy"]] as const) {

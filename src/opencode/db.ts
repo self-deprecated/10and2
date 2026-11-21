@@ -5,6 +5,7 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { PastReply, ReplyRef } from "../contract.ts";
+import { databasePath } from "../paths.ts";
 import { isRules } from "./rules.ts";
 import type { Rule } from "./rules.ts";
 
@@ -58,7 +59,7 @@ const json = (s: unknown) => { try { return typeof s === "string" ? JSON.parse(s
 /** Opens the database for one read and closes it again; a locked or missing database is an error the caller keeps its last read through. */
 export function withDb<T>(path: string, read: (db: DatabaseSync) => T): T {
   if (!existsSync(path)) throw new Error("OpenCode has no database here yet");
-  const db = new DatabaseSync(path, { readOnly: true });
+  const db = new DatabaseSync(databasePath(path), { readOnly: true });
   try { db.exec("PRAGMA busy_timeout=2000"); return read(db); } finally { db.close(); }
 }
 

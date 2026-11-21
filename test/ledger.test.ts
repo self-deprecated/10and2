@@ -4,7 +4,9 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { Ledger, actionHash } from "../src/ledger.ts";
+import { spawn } from "node:child_process";
+import { Ledger, actionHash, ledgerHeld } from "../src/ledger.ts";
+import { databasePath } from "../src/paths.ts";
 import { assertPrivate, removeDir } from "./fixtures/platform.ts";
 import type { Action, Receipt } from "../src/contract.ts";
 
@@ -115,4 +117,36 @@ test("a refusal on a retry-safe key whose outcome was lost stays unknown", async
   refusing = true;
   assert.deepEqual(await ledger.execute(action, "lost", opts), { ok: false, error: "Not allowed now.", unknown: true });
   await ledger.close();
+});
+
+test("a held ledger says a connector is running, and a look at it (as status takes) never stops one starting", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ledger-held-"));
+  t.after(() => removeDir(dir));
+  assert.equal(ledgerHeld(dir), undefined, "no ledger yet: can't be told");
+  const ledger = new Ledger(dir);
+  assert.equal(ledgerHeld(dir), true);
+  await ledger.close();
+  assert.equal(ledgerHeld(dir), false);
+  // Another process reading the ledger while a connector opens it: the connector waits for it.
+  const reader = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "-e", `
+    const db = new (require("node:sqlite").DatabaseSync)(${JSON.stringify(join(dir, "connector.db"))}, { readOnly: true });
+    db.exec("BEGIN"); db.prepare("SELECT 1 FROM sqlite_master").get(); console.log("reading");
+    setTimeout(() => { db.exec("COMMIT"); db.close(); }, 300);`], { stdio: ["ignore", "pipe", "inherit"] });
+  const exited = new Promise((r) => reader.once("exit", r));
+  await new Promise((r) => reader.stdout.once("data", r));
+  const next = new Ledger(dir);
+  await next.close();
+  await exited;
+});
+
+test("on Windows a database path too long for SQLite there is given as \\\\?\\, which has no such limit", () => {
+  // A new database's journal (8 characters more) must stay under Windows' 260: connector.db opens at 251, not at 252.
+  const at = (n: number) => `C:\\Users\\me\\${"x".repeat(n - 32)}\\10and2\\connector.db`;
+  assert.equal(at(251).length, 251);
+  assert.equal(databasePath(at(251), "win32"), at(251));
+  assert.equal(databasePath(at(252), "win32"), `\\\\?\\${at(252)}`);
+  assert.equal(databasePath(at(300), "win32"), `\\\\?\\${at(300)}`);
+  assert.equal(databasePath(":memory:", "win32"), ":memory:");
+  const posix = `/home/me/${"x".repeat(300)}/connector.db`;
+  assert.equal(databasePath(posix, "linux"), posix);
 });

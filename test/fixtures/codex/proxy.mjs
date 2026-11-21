@@ -2,12 +2,15 @@
 // the fake daemon (fake-daemon.ts) at $CODEX_HOME/app-server-control/app-server-control.sock, or on Windows, where the
 // fake can't make a socket file Node opens, at the pipe that file names.
 import { connect } from "node:net";
-import { appendFileSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-// `codex app-server daemon start`: says the daemon runs (the test brings the fake back), and notes that it was asked.
+// `codex app-server daemon start`: says the daemon runs (the test brings the fake back), and notes that it was asked
+// (its pid, a line each time). While the test leaves `daemon-installing` there, it's a first start, which installs the
+// daemon (minutes): it takes until that file goes.
 if (process.argv.includes("daemon")) {
-  appendFileSync(join(process.env.CODEX_HOME, "daemon-starts"), "start\n");
+  appendFileSync(join(process.env.CODEX_HOME, "daemon-starts"), `${process.pid}\n`);
+  while (existsSync(join(process.env.CODEX_HOME, "daemon-installing"))) await new Promise((r) => setTimeout(r, 20));
   process.stdout.write(JSON.stringify({ status: "alreadyRunning" }) + "\n");
   process.exit(0);
 }

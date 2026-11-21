@@ -8,7 +8,7 @@
 // Codex has no command ids that dedupe, so every write is at most once: the operation store reserves the key first,
 // and an outcome Driver can't confirm stays unknown and is never sent again.
 import { createHash } from "node:crypto";
-import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
+import { accessSync, closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Duplex } from "node:stream";
@@ -54,6 +54,8 @@ export type Options = {
   heartbeatMs?: number;
   /** How long connecting to Codex may take before it's given up on (10 s). */
   connectTimeoutMs?: number;
+  /** How long starting Codex's daemon may take before it's ended (10 min): its first start for a Codex version installs it. */
+  daemonStartMs?: number;
   /** The system, for what differs on Windows: its sandbox, and folders whatever their case (tests set it). */
   platform?: NodeJS.Platform;
 };
@@ -207,7 +209,8 @@ export class CodexAdapter implements Adapter {
   private retryMs = 1000;
   private retryTimer: NodeJS.Timeout | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
-  private startedDaemonAt = 0;
+  /** When the last start of Codex's daemon ended: the next waits a minute from then. */
+  private daemonEndedAt = 0;
   private refreshing: Promise<void> | null = null;
   private again = false;
   private readonly threads = new Map<string, Thread>();
@@ -288,8 +291,9 @@ export class CodexAdapter implements Adapter {
   }
   private get proxy() { return (this.opts.transport ?? (process.platform === "win32" ? "proxy" : "socket")) === "proxy"; }
   private open(): Promise<CodexRpc> {
-    // The proxy would only say it can't connect: no socket is no daemon, which starts it (attempt).
-    if (this.proxy && !existsSync(this.socketPath)) return Promise.reject(Object.assign(new Error("its daemon isn't running"), { code: "ENOENT" }));
+    // The proxy would only say it can't connect: no socket is no daemon, which starts it (attempt). Not existsSync: on
+    // Windows it stats the file, which Node can't do for a socket's (EACCES), so it's false while the daemon runs.
+    try { if (this.proxy) accessSync(this.socketPath); } catch { return Promise.reject(Object.assign(new Error("its daemon isn't running"), { code: "ENOENT" })); }
     return CodexRpc.connect(this.proxy ? () => this.proxied() : this.socketPath, {
       clientName: "10and2", clientTitle: "10 & 2", version: VERSION, heartbeatMs: this.proxy ? this.opts.heartbeatMs ?? 15_000 : undefined, timeoutMs: this.opts.connectTimeoutMs,
       optOut: ["item/agentMessage/delta", "item/reasoning/textDelta", "item/reasoning/summaryTextDelta", "item/commandExecution/outputDelta",
@@ -330,19 +334,33 @@ export class CodexAdapter implements Adapter {
     this.retryMs = Math.min(this.retryMs * 2, 30_000);
   }
   /**
-   * Starts Codex's shared daemon the way Codex itself does (`codex app-server daemon start`, idempotent), at most once a
-   * minute, unless that's off here or in Codex's config. True when it says it's running.
+   * Starts Codex's shared daemon the way Codex itself does (`codex app-server daemon start`, idempotent), one at a time
+   * (connect) and a minute after the last start ended, unless that's off here or in Codex's config. True when it says
+   * it's running.
    */
   private async startDaemon(): Promise<boolean> {
-    if (this.opts.autoStart === false || this.closed || this.now() - this.startedDaemonAt < 60_000) return false;
+    if (this.opts.autoStart === false || this.closed || this.now() - this.daemonEndedAt < 60_000) return false;
     let config = "";
     try { config = readFileSync(join(this.codexHome, "config.toml"), "utf8"); } catch { /* none: defaults */ }
     if (daemonDisabled(config)) return false;
-    this.startedDaemonAt = this.now();
+    this.opts.log("codex: starting Codex's daemon (the first start after installing or updating Codex can take a few minutes)");
+    // Its first start for a Codex version installs it (on Windows, about 450 MB copied), which a cut-off start leaves
+    // behind, half done. So it's waited for, and one still going past the limit is ended with all it started.
     const { out, said } = await new Promise<{ out: string; said: string }>((done) => {
-      execFileCommand(...this.codex(["app-server", "daemon", "start"]), { timeout: 30_000, maxBuffer: 1024 * 1024, env: this.env },
-        (err, stdout, stderr) => done({ out: err ? "" : stdout, said: err ? stderr || err.message : "" }));
+      let late = false, settled = false, grace: NodeJS.Timeout | undefined;
+      const finish = (r: { out: string; said: string }) => { if (settled) return; settled = true; clearTimeout(timer); clearTimeout(grace); done(r); };
+      const child = execFileCommand(...this.codex(["app-server", "daemon", "start"]), { maxBuffer: 1024 * 1024, env: this.env }, (err, stdout, stderr) =>
+        finish({ out: err ? "" : stdout, said: late ? "it took too long" : err ? stderr || err.message : "" }));
+      // On Windows the whole tree (npm's launcher, and the codex.exe it runs); elsewhere the launcher, which passes it on.
+      // Over either way soon after, so a start nothing could end doesn't stop Codex being tried again.
+      const timer = setTimeout(() => {
+        late = true;
+        if (process.platform === "win32" && child?.pid) execFileCommand("taskkill", ["/pid", String(child.pid), "/T", "/F"], { timeout: 10_000 }, (err) => { if (err) child.kill(); });
+        else child?.kill();
+        grace = setTimeout(() => finish({ out: "", said: "it took too long" }), 15_000);
+      }, this.opts.daemonStartMs ?? 600_000);
     });
+    this.daemonEndedAt = this.now();
     const status = out.trim().split("\n").map((l) => { try { return JSON.parse(l); } catch { return null; } }).find((o) => o && typeof o.status === "string")?.status;
     if (status === "started" || status === "alreadyRunning" || status === "running") { this.opts.log(`codex: started Codex's daemon (${status})`); return true; }
     // Codex says why, such as Windows' "start the Windows daemon from a non-elevated terminal".
@@ -896,7 +914,8 @@ export class CodexAdapter implements Adapter {
   private async reconcile(id: string, clientUserMessageId: string): Promise<Receipt> {
     const deadline = Date.now() + Math.min(this.opts.acceptanceTimeoutMs ?? 20_000, 5000);
     while (Date.now() < deadline && !this.closed) {
-      if (!this.rpc) await this.connect().catch(() => {});
+      // Not past the deadline: connecting may be waiting on Codex's daemon starting, which can take minutes.
+      if (!this.rpc) await Promise.race([this.connect().catch(() => {}), new Promise((r) => setTimeout(r, Math.max(0, deadline - Date.now())))]);
       const rpc = this.rpc;
       if (rpc) {
         try {

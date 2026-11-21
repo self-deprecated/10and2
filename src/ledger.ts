@@ -6,8 +6,21 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Action, Receipt } from "./contract.ts";
 import { describe } from "./util.ts";
-import { stateDirectory } from "./paths.ts";
+import { databasePath, stateDirectory } from "./paths.ts";
 
+
+/**
+ * Whether a connector is running from `directory`: one holds its ledger locked from soon after it starts until it ends,
+ * however it ends, unlike a pid, which Windows soon gives to another process. Undefined when it can't be told (no ledger
+ * there yet). A connector starting meanwhile waits out this brief look (the ledger's busy_timeout).
+ */
+export function ledgerHeld(directory = stateDirectory()): boolean | undefined {
+  let db: DatabaseSync;
+  try { db = new DatabaseSync(databasePath(join(directory, "connector.db")), { readOnly: true }); } catch { return undefined; }
+  try { db.prepare("SELECT 1 FROM sqlite_master").get(); return false; }
+  catch (e) { return (((e as { errcode?: number }).errcode ?? 0) & 0xff) === 5 /* SQLITE_BUSY */ ? true : undefined; }
+  finally { db.close(); }
+}
 
 /** Sorted object keys make retries independent of JSON property order. */
 export function actionHash(action: Action): string {
@@ -26,12 +39,13 @@ export class Ledger {
   constructor(directory = stateDirectory()) {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     const path = join(directory, "connector.db");
-    this.db = new DatabaseSync(path);
+    this.db = new DatabaseSync(databasePath(path));
     chmodSync(path, 0o600);
     try {
       // Keep one owner of the ledger. SQLite releases this lock on a crash, unlike a PID file; another connector
-      // must not mistake this process's in-flight dispatch for crash recovery and send it again.
-      this.db.exec(`PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+      // must not mistake this process's in-flight dispatch for crash recovery and send it again. A second waits a
+      // moment for it, as it does for `10and2 status` looking whether it's held (ledgerHeld), and then fails.
+      this.db.exec(`PRAGMA busy_timeout=1000; PRAGMA locking_mode=EXCLUSIVE; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
         CREATE TABLE IF NOT EXISTS actions (key TEXT PRIMARY KEY, action_hash TEXT NOT NULL, state TEXT NOT NULL, action TEXT NOT NULL, receipt TEXT);`);
     } catch (e) { this.db.close(); throw e; }
     this.audit = openSync(join(directory, "audit.jsonl"), "a", 0o600);

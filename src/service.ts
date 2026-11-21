@@ -3,10 +3,10 @@
 // A revoked or replaced connector exits so that none of them restarts it, and a crash is restarted.
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
-import { basename, delimiter, dirname, join, sep, win32 } from "node:path";
-import { pidState, type ImageOf } from "./claude/registry.ts";
+import { basename, delimiter, dirname, join, sep } from "node:path";
 import { envVar, spawnCommand, which } from "./command.ts";
 import { run, type Runner } from "./credential.ts";
+import { ledgerHeld } from "./ledger.ts";
 import { stateDirectory } from "./paths.ts";
 import { ask, controlPipe, HIDDEN, logFile, loginFile, readLogin, saveLogin, withPath } from "./supervisor.ts";
 
@@ -110,6 +110,7 @@ export const CONNECTOR: Job = {
   name: "connector", label: LABEL, unit: "10and2.service", logName: "10and2.log",
   description: "10and2 connector: lets your 10 & 2 brain read and act on this machine's coding sessions",
   // Started at boot (lingering) or with the session, it can come before the login keyring opens: wait for the credential.
+  // Windows' supervisor runs these too, but there's no keyring there, so the connector doesn't wait (main.ts runConnector).
   args: ["run", "--wait-for-credential"],
   // launchd can't skip one exit status, so a stop that mustn't be restarted exits 0 there.
   launchdArgs: ["run", "--fatal-exit=0"],
@@ -208,13 +209,12 @@ export function runEntry(job: Job, env: NodeJS.ProcessEnv): string {
 export type ServiceState = { installed: boolean; running: boolean; where: string; logs: string; elevated?: true; note?: string };
 
 /**
- * Whether the connector status.json names (with its `startedAt`) is still running. On Windows a pid is soon another
- * process's, so there it counts only while tasklist shows it as the Node this runs on, and not when it was recorded
- * before the computer last started. A pid that answers EPERM counts as not running, a connector run as administrator
- * included, since another account's process answers the same.
+ * Whether the connector status.json names is still running. On Windows a pid is soon another process's, often another
+ * Node's, so there it's whether a connector holds its ledger (ledgerHeld), as one does from soon after it starts until
+ * it ends; when that can't be told, it isn't counted as running. Elsewhere, whether its pid answers.
  */
-export function connectorRunning(pid: number, startedAt?: unknown, platform = process.platform, imageOf?: ImageOf, node = process.execPath): boolean {
-  if (platform === "win32") return pidState(pid, `win32:${win32.basename(node).toLowerCase()}`, "win32", startedAt, imageOf) !== "dead";
+export function connectorRunning(pid: number, platform = process.platform, held: () => boolean | undefined = ledgerHeld): boolean {
+  if (platform === "win32") return held() === true;
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 /** Sends the Windows supervisor one line on its pipe; its answer, or null when none proves itself with `secret` within `ms`. */

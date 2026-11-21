@@ -43,13 +43,16 @@ const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 /**
  * The PowerShell that encrypts (Protect) or decrypts (Unprotect) for this Windows account. Both read base64 on stdin and
  * write base64, so neither the secret's bytes nor the console's code page can be mangled on the way, and fail with
- * exit 1 (as they do where .NET calls aren't allowed: Constrained Language Mode).
+ * exit 1 (as they do where .NET calls aren't allowed: Constrained Language Mode). Protect decrypts what it made again
+ * and fails unless it's what it was given: one start of PowerShell, which takes seconds, rather than two.
  */
 const script = (fn: "Protect" | "Unprotect") => [
   "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'",
   "try { Add-Type -AssemblyName System.Security",
   "$data = [Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())",
-  `[Console]::Out.Write([Convert]::ToBase64String([Security.Cryptography.ProtectedData]::${fn}($data, $null, 'CurrentUser')))`,
+  `$out = [Security.Cryptography.ProtectedData]::${fn}($data, $null, 'CurrentUser')`,
+  ...(fn === "Protect" ? ["if ([Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Unprotect($out, $null, 'CurrentUser')) -cne [Convert]::ToBase64String($data)) { exit 1 }"] : []),
+  "[Console]::Out.Write([Convert]::ToBase64String($out))",
   "exit 0 } catch { exit 1 }",
 ].join("; ");
 /** Windows PowerShell (5.1, on every Windows) by its own path: never another `powershell` on PATH or in the current folder. */
@@ -82,13 +85,12 @@ export class Credentials {
     } else if (store === "libsecret") {
       if (await this.runner("secret-tool", ["store", `--label=10and2 connector (${origin})`, "service", SERVICE, "account", origin], secret) !== null && await this.loadOs(origin) === secret) return "libsecret";
     }
-    // Encrypted only once it's known to decrypt again: otherwise the plain file, rather than a key that can't be read.
+    // Encrypted only once it's known to decrypt again (Protect checks): else the plain file, rather than a key that can't be read.
     const blob = store === "dpapi" ? await this.dpapi("Protect", Buffer.from(secret, "utf8").toString("base64")) : null;
-    const kept = blob && await this.unprotect(blob) === secret ? `${DPAPI}${blob}` : null;
     const all = this.readFile();
-    all[origin] = kept ?? secret;
+    all[origin] = blob ? `${DPAPI}${blob}` : secret;
     this.writeFile(all);
-    return kept ? "dpapi" : "file";
+    return blob ? "dpapi" : "file";
   }
 
   /** The credential for a brain origin; null when there's none, or one this Windows account can't decrypt. */
@@ -101,6 +103,9 @@ export class Credentials {
     const secret = this.platform === "win32" ? await this.unprotect(file.slice(DPAPI.length)) : null;
     return secret ? { secret, store: "dpapi" } : null;
   }
+
+  /** Whether the file holds a key for the origin, readable or not. */
+  stored(origin: string): boolean { return origin in this.readFile(); }
 
   async delete(origin: string): Promise<void> {
     if (this.osStore === "keychain") await this.runner("security", ["delete-generic-password", "-s", SERVICE, "-a", origin]);

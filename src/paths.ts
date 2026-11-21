@@ -1,11 +1,21 @@
 // Where the connector keeps its files: configuration (the policy, which device this is) and state (ledgers, logs).
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 
 export const APP = "10and2";
 export const configDirectory = (env: NodeJS.ProcessEnv = process.env) => join(env.XDG_CONFIG_HOME || join(homedir(), ".config"), APP);
 export const stateDirectory = (env: NodeJS.ProcessEnv = process.env) => join(env.XDG_STATE_HOME || join(homedir(), ".local", "state"), APP);
+/**
+ * A database's path as SQLite can open it. On Windows SQLite passes the path on as it is, and Windows refuses one of
+ * 260 characters or more (unless long paths are turned on), the files SQLite keeps beside it (`-journal`) included, where
+ * Node's own files work: a long one is given as `\\?\C:\…`, which has no such limit.
+ */
+export function databasePath(path: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform !== "win32" || path === ":memory:") return path;
+  const full = win32.resolve(path);
+  return /^[A-Za-z]:\\/.test(full) && full.length + "-journal".length >= 260 ? `\\\\?\\${full}` : path;
+}
 /**
  * Where Claude Code's hooks reach the adapter, and the secret it proves itself with before a hook sends it anything:
  * none for a socket file, which its private folder keeps to the user.

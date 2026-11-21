@@ -190,11 +190,12 @@ export async function relayHook(stdin: string | NodeJS.ReadableStream, socket: H
       notification_type: typeof r.notification_type === "string" ? r.notification_type.slice(0, 100) : undefined };
     const socket = await reach(target);
     if (!socket) return;
+    // Waited for, 150 ms at most: let go of, 10and2 could end first with this still pending (Node's exit 13 and its
+    // warning, which Claude Code shows as the hook failing).
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => { socket.destroy(); resolve(); }, 150); timer.unref();
+      const timer = setTimeout(() => { socket.destroy(); resolve(); }, 150);
       socket.on("error", () => { clearTimeout(timer); resolve(); });
       socket.on("close", () => { clearTimeout(timer); resolve(); });
-      socket.unref();
       socket.end(JSON.stringify(event) + "\n");
     });
   } catch { /* Notifications accelerate local reads; their loss must be invisible to the caller. */ }

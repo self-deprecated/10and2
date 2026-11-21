@@ -5,10 +5,11 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir, uptime } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import type { Runner } from "../src/credential.ts";
+import { Ledger, ledgerHeld } from "../src/ledger.ts";
 import { BRAIN, CONNECTOR, connectorRunning, RUN_KEY, runEntry, Service, STARTUP_APPROVED } from "../src/service.ts";
 import { ask, backoff, controlPipe, HIDDEN, loginFile, mergePath, readLogin, restartsAfter, rotate, saveLogin, supervise, withPath } from "../src/supervisor.ts";
 import { randomHex } from "../src/util.ts";
@@ -441,20 +442,17 @@ test("on Windows, an entry Startup apps turned off doesn't start at login, as st
   assert.equal((await service.state()).installed, false);
 });
 
-test("status counts the connector's pid as running on Windows only while tasklist shows it as this Node, and not from before boot", () => {
-  const node = "C:\\Program Files\\nodejs\\node.exe";
-  const now = new Date().toISOString();
-  assert.equal(connectorRunning(process.pid, now, "win32", () => "node.exe", node), true);
-  assert.equal(connectorRunning(process.pid, undefined, "win32", () => "node.exe", node), true, "no startedAt: by the image alone");
-  assert.equal(connectorRunning(process.pid, now, "win32", () => "svchost.exe", node), false, "its pid since given to another process, perhaps another account's");
-  assert.equal(connectorRunning(process.pid, now, "win32", () => null, node), false, "not listed: gone");
-  assert.equal(connectorRunning(process.pid, now, "win32", () => undefined, node), true, "no listing: as running as it answers");
-  // A status.json a reboot left behind, its pid now another Node's.
-  const beforeBoot = new Date(Date.now() - uptime() * 1000 - 3_600_000).toISOString();
-  assert.equal(connectorRunning(process.pid, beforeBoot, "win32", () => "node.exe", node), false);
-  const gone = spawnSync(process.execPath, ["-e", ""]).pid!;
-  assert.equal(connectorRunning(gone, now, "win32", () => "node.exe", node), false);
+test("status counts the connector as running on Windows only while one holds its ledger, whatever its pid is now", async (t) => {
+  const dir = temp(t);
+  const held = () => ledgerHeld(dir);
+  // This test's pid is a live Node's, as a dead connector's may be by now: there that says nothing.
+  assert.equal(connectorRunning(process.pid, "win32", held), false, "no ledger yet: can't be told, so not running");
+  const ledger = new Ledger(dir);
+  assert.equal(connectorRunning(process.pid, "win32", held), true);
+  await ledger.close();
+  assert.equal(connectorRunning(process.pid, "win32", held), false, "a live Node's pid, but no connector holds the ledger");
   // Elsewhere, whether it answers.
-  assert.equal(connectorRunning(process.pid, now, "linux"), true);
-  assert.equal(connectorRunning(gone, now, "linux"), false);
+  const gone = spawnSync(process.execPath, ["-e", ""]).pid!;
+  assert.equal(connectorRunning(process.pid, "linux"), true);
+  assert.equal(connectorRunning(gone, "linux"), false);
 });

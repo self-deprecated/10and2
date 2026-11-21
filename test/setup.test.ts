@@ -10,6 +10,7 @@ import type { AddressInfo } from "node:net";
 import { Credentials, parseCredential, powershellArgs, type Runner } from "../src/credential.ts";
 import { Expired, linkUrl, originOf, pair } from "../src/pair.ts";
 import { carried, launchAgent, launchFor, NO_SYSTEMD, Service, systemdUnit, temporary } from "../src/service.ts";
+import { opener } from "../src/browser.ts";
 import { assertPrivate, removeDir, WINDOWS } from "./fixtures/platform.ts";
 
 const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
@@ -82,12 +83,13 @@ test("the Keychain and libsecret get the secret on stdin, never as an argument; 
 test("on Windows the credential is encrypted for the Windows account through Windows PowerShell, the secret only on stdin", async (t) => {
   const dir = temp(t, "creds-win-");
   const calls: { command: string; args: string[]; input?: string }[] = [];
-  // DPAPI as a reversible stand-in, so what's kept can be told from the secret: base64 in, base64 out.
+  // DPAPI as a reversible stand-in, so what's kept can be told from the secret: base64 in, base64 out. Protect's script
+  // decrypts what it made again and fails (exit 1) when it can't.
   const flip = (b64: string) => Buffer.from(Buffer.from(b64, "base64").map((x) => x ^ 0x5a)).toString("base64");
   const dpapi = (opts: { protect?: boolean; unprotect?: boolean } = {}): Runner => async (command, args, input) => {
     calls.push({ command, args, input });
     const script = Buffer.from(args.at(-1)!, "base64").toString("utf16le");
-    if (/::Protect\(/.test(script)) return opts.protect === false ? null : flip(input!);
+    if (/::Protect\(/.test(script)) return opts.protect === false || (opts.unprotect === false && /::Unprotect\(\$out/.test(script)) ? null : flip(input!);
     if (/::Unprotect\(/.test(script)) return opts.unprotect === false ? null : flip(input!);
     return null;
   };
@@ -96,6 +98,8 @@ test("on Windows the credential is encrypted for the Windows account through Win
   const file = join(dir, "10and2", "credentials.json");
   const win = new Credentials({ runner: dpapi(), platform: "win32", env });
   assert.equal(await win.save(origin, credential), "dpapi");
+  // Each start of Windows PowerShell takes seconds: one encrypts it and checks it decrypts.
+  assert.equal(calls.length, 1, "saved with one start of PowerShell");
   const kept = JSON.parse(readFileSync(file, "utf8"))[origin] as string;
   assert.match(kept, /^dpapi:[A-Za-z0-9+/]+=*$/);
   assert.ok(!kept.includes(credential) && !kept.includes(Buffer.from(credential).toString("base64")), "never kept as it is");
@@ -334,10 +338,11 @@ test("a login service whose program is gone is stale (systemd and launchd), and 
   assert.equal(mac.missing(), null);
 });
 
-/** Runs the CLI against a fake brain; returns its output and exit status. */
-function cli(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: number | null; out: string }> {
+/** Runs the CLI against a fake brain, with `before` run first (a pretence: "data:text/javascript,…"); returns its output and exit status. */
+function cli(args: string[], env: NodeJS.ProcessEnv, before?: string): Promise<{ status: number | null; out: string }> {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [main, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+    const preload = before ? ["--import", `data:text/javascript,${encodeURIComponent(before)}`] : [];
+    const child = spawn(process.execPath, [...preload, main, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     child.stdout.on("data", (d) => { out += d; });
     child.stderr.on("data", (d) => { out += d; });
@@ -387,6 +392,8 @@ test("setup pairs in the browser, keeps the credential private, writes a policy;
   const setup = await cli(["setup", `--brain=${origin}`, "--name=testbox", "--no-autostart"], env);
   assert.equal(setup.status, 0, setup.out);
   assert.match(setup.out, /ABCD-EFGH/);
+  // Saving it can take seconds (Windows' PowerShell): said while it does, then where it is.
+  assert.match(setup.out, /Saving its key\n.*Approved · its key is in/);
   assert.ok(!setup.out.includes(credential), "the credential is never printed");
   assert.match(seen[0].body, /"name":"testbox"/);
   const creds = join(dir, "config", "10and2", "credentials.json");
@@ -505,4 +512,137 @@ test("uninstall removes everything 10and2 added, and leaves what isn't its own",
   const again = await cli(["uninstall", "--yes"], env);
   assert.equal(again.status, 0);
   assert.doesNotMatch(again.out, /Removed/);
+});
+
+test("on the old Windows console, error lines start with a mark its fonts have, as every other line there does", async (t) => {
+  const dir = temp(t, "mark-");
+  const env = testEnv(dir, { PATH: join(dir, "nonexistent"), XDG_CONFIG_HOME: join(dir, "config"), WT_SESSION: undefined, TERM_PROGRAM: undefined });
+  const windows = `Object.defineProperty(process, "platform", { value: "win32" })`;
+  const refused = await cli(["agents", "x"], env, windows);
+  assert.equal(refused.status, 64);
+  // A line of its own (on Linux, a fake Windows's look at the system's certificates says something first).
+  assert.match(refused.out, /^× 10and2 agents doesn't take "x"/m);
+  const thrown = await cli(["setup", "--token"], env, windows);
+  assert.equal(thrown.status, 1);
+  assert.match(thrown.out, /^× --token is for a brain you run yourself/m);
+});
+
+test("status --verbose says there's no key when there's none it can read, and names TENANDTWO_TOKEN only when that's set", async (t) => {
+  const dir = temp(t, "no-key-");
+  mkdirSync(join(dir, "config", "10and2"), { recursive: true });
+  writeFileSync(join(dir, "config", "10and2", "connector.json"), JSON.stringify({ brain: "ws://127.0.0.1:9/connector", projects: "*" }));
+  const env = testEnv(dir, { PATH: join(dir, "nonexistent"), XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1" });
+  const none = await cli(["status", "--verbose"], env);
+  assert.equal(none.status, 0, none.out);
+  assert.match(none.out, /No key it can read/);
+  assert.doesNotMatch(none.out, /TENANDTWO_TOKEN/);
+  assert.match((await cli(["status", "--verbose"], { ...env, TENANDTWO_TOKEN: "a-token" })).out, /Key in TENANDTWO_TOKEN/);
+});
+
+test("without its key, a brain of your own is still called that, and status gives the command that connects it again", async (t) => {
+  const dir = temp(t, "own-brain-");
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  fakeCommand(bin, "t3", "1.0");
+  const env = testEnv(dir, { PATH: bin, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1" });
+  assert.equal((await cli(["setup", "--yes", "--no-autostart", "--brain=http://127.0.0.1:9", "--token", "--name=box"], env)).status, 0);
+  assert.equal((await cli(["revoke", "--yes"], env)).status, 0);
+  const status = await cli(["status"], env);
+  assert.ok(status.out.includes("Not connected to your brain at 127.0.0.1:9: 10and2 setup --brain=http://127.0.0.1:9 --token connects it."), status.out);
+  assert.ok((await cli(["revoke", "--yes"], env)).out.includes("This computer isn't connected to your brain at 127.0.0.1:9."));
+  // What it says does connect it: a new key, and what the brain needs to accept it.
+  const again = await cli(["setup", "--brain=http://127.0.0.1:9", "--token", "--name=box"], env);
+  assert.equal(again.status, 0, again.out);
+  assert.match(again.out, /10and2 brain add box [0-9a-f]{64}/);
+  // The 10 & 2 service's own addresses are an account, key or not.
+  const policy = join(dir, "config", "10and2", "connector.json");
+  for (const [brain, said] of [["wss://10and2.selfdep.com/connector", "your 10 & 2 account"], ["wss://10and2-stg.selfdep.com/connector", "your 10 & 2 account at 10and2-stg.selfdep.com"]]) {
+    writeFileSync(policy, JSON.stringify({ ...JSON.parse(readFileSync(policy, "utf8")), brain }));
+    const out = (await cli(["status"], env)).out;
+    assert.ok(out.includes(`Not connected to ${said}: 10and2 setup connects it.`), out);
+  }
+});
+
+test("status says once that the login service isn't running", { skip: process.platform !== "linux" && "a systemd unit stands for the login service" }, async (t) => {
+  const dir = temp(t, "status-once-");
+  const config = join(dir, "config");
+  mkdirSync(join(config, "10and2"), { recursive: true });
+  mkdirSync(join(config, "systemd", "user"), { recursive: true });
+  writeFileSync(join(config, "10and2", "connector.json"), JSON.stringify({ brain: "ws://127.0.0.1:9/connector", projects: "*" }));
+  writeFileSync(join(config, "10and2", "credentials.json"), JSON.stringify({ "http://127.0.0.1:9": "a-token" }), { mode: 0o600 });
+  // Installed, and not running: there's no systemctl to say it is.
+  writeFileSync(join(config, "systemd", "user", "10and2.service"), systemdUnit({ program: [process.execPath, main], path: "/usr/bin" }));
+  const env = testEnv(dir, { PATH: join(dir, "nonexistent"), XDG_CONFIG_HOME: config, XDG_STATE_HOME: join(dir, "state"), TENANDTWO_CREDENTIAL_STORE: "file" });
+  const status = await cli(["status"], env);
+  assert.equal(status.status, 0, status.out);
+  assert.match(status.out, /Not running\. It should start at login; see journalctl --user -u 10and2\.service/);
+  assert.equal(status.out.match(/starts? at login/gi)?.length, 1, status.out);
+});
+
+test("autostart on before setup is refused: there'd be nothing for it to run", async (t) => {
+  const dir = temp(t, "autostart-");
+  const env = testEnv(dir, { PATH: join(dir, "nonexistent"), XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), TENANDTWO_NO_SERVICE: "1" });
+  const on = await cli(["autostart", "on"], env);
+  assert.equal(on.status, 1);
+  assert.match(on.out, /This computer isn't set up yet: 10and2 setup connects it\./);
+});
+
+test("over SSH on Windows, with no desktop to open it on, the browser isn't opened; elsewhere it is, as before", () => {
+  const url = "https://10and2.selfdep.com/connect?code=ABCD-EFGH";
+  assert.deepEqual(opener(url, "win32", {}), ["rundll32", "url.dll,FileProtocolHandler", url]);
+  // Windows' OpenSSH sets both.
+  assert.equal(opener(url, "win32", { SSH_CONNECTION: "192.0.2.1 50000 192.0.2.2 22", SSH_CLIENT: "192.0.2.1 50000 22" }), null);
+  assert.equal(opener(url, "win32", { SSH_CLIENT: "192.0.2.1 50000 22" }), null);
+  assert.deepEqual(opener(url, "darwin", { SSH_CONNECTION: "192.0.2.1 50000 192.0.2.2 22" }), ["open", url]);
+  assert.deepEqual(opener(url, "linux", { SSH_CONNECTION: "192.0.2.1 50000 192.0.2.2 22" }), ["xdg-open", url]);
+});
+
+test("off a terminal, setup stops when the code expires, says what to run, and fails", async (t) => {
+  const dir = temp(t, "expired-");
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  fakeCommand(bin, "t3", "1.0");
+  let pairs = 0;
+  const server = createServer(async (req: IncomingMessage, res) => {
+    for await (const _ of req) { /* the body */ }
+    const port = (server.address() as AddressInfo).port;
+    const json = (v: object, status = 200) => res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(v));
+    // A second code would be a renewal nobody is there to approve.
+    if (req.url === "/connector/pair") return ++pairs > 1 ? json({ error: "a second code" }, 500) : json({ deviceCode: "ABCDEFGH.secret", userCode: "ABCD-EFGH", verificationUrl: `http://127.0.0.1:${port}/connect?code=ABCD-EFGH`, expiresIn: 1, interval: 1 });
+    if (req.url === "/connector/pair/poll") return json({ status: "expired" });
+    json({ error: "no" }, 404);
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  t.after(() => server.close());
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const env = testEnv(dir, { PATH: bin, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_CREDENTIAL_STORE: "file", TENANDTWO_NO_SERVICE: "1" });
+  const run = await cli(["setup", `--brain=${origin}`, "--name=box", "--no-autostart"], env);
+  assert.equal(run.status, 1, run.out);
+  assert.equal(pairs, 1);
+  assert.ok(run.out.includes(`The code expired before it was approved. To get a new one, run 10and2 setup --brain=${origin} again.`), run.out);
+  assert.ok(!existsSync(join(dir, "config", "10and2", "credentials.json")), "nothing paired");
+
+  // With --yes, at a terminal nobody may be watching (a scheduled task's console), it doesn't ask for a new code either.
+  pairs = 0;
+  const yes = await cli(["setup", `--brain=${origin}`, "--name=box", "--no-autostart", "--yes"], env, "process.stdin.isTTY = true; process.stdin.setRawMode = () => process.stdin");
+  assert.equal(yes.status, 1, yes.out);
+  assert.equal(pairs, 1, yes.out);
+  assert.doesNotMatch(yes.out, /Get a new code/);
+  assert.ok(yes.out.includes("The code expired before it was approved."), yes.out);
+});
+
+test("setup --yes starts at login without asking, even with a terminal on stdin", { skip: process.platform !== "linux" && "a fake systemctl stands for the login service" }, async (t) => {
+  const dir = temp(t, "setup-yes-");
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  fakeCommand(bin, "t3", "1.0");
+  // systemd, saying the unit runs.
+  fakeCommand(bin, "systemctl", "active");
+  const env = testEnv(dir, { PATH: bin, XDG_CONFIG_HOME: join(dir, "config"), XDG_STATE_HOME: join(dir, "state"), CLAUDE_CONFIG_DIR: join(dir, "claude"), TENANDTWO_CREDENTIAL_STORE: "file" });
+  // As a Windows scheduled task's console runs it: stdin a terminal, the output going to a file nobody reads.
+  const run = await cli(["setup", "--yes", "--brain=http://127.0.0.1:9", "--token", "--name=box"], env, "process.stdin.isTTY = true");
+  assert.equal(run.status, 0, run.out);
+  assert.doesNotMatch(run.out, /Keep it connected/);
+  assert.match(run.out, /Starts at login/);
+  assert.ok(existsSync(join(dir, "config", "systemd", "user", "10and2.service")));
 });

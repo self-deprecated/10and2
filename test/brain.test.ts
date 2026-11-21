@@ -105,6 +105,7 @@ test("brain setup links this computer to a brain of its own, and another compute
   // The phone's access code is shown; the AI key and the token never are.
   assert.match(setup.out, new RegExp(`Access code +${vars.DRIVER_ACCESS_CODE}`));
   assert.match(setup.out, /Self-hosted brain/);
+  assert.match(setup.out, /Saving this computer's key\n/, "said while it's saved, which takes seconds on Windows");
   assert.ok(!setup.out.includes(KEY) && !setup.out.includes(token));
   assert.match((await cli(["brain", "setup"], env)).out, /already set up/);
 
