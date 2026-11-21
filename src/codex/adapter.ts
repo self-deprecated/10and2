@@ -12,7 +12,7 @@ import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, s
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Duplex } from "node:stream";
-import type { Action, Adapter, FirstAsk, ItemStatus, CodingModel, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import type { Action, ActionKind, Adapter, FirstAsk, ItemStatus, CodingModel, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, ceilingFor, RUNTIME_MODES, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy, RuntimeMode } from "../policy.ts";
 import { Store } from "../claude/store.ts";
@@ -558,6 +558,11 @@ export class CodexAdapter implements Adapter {
       const id = hash(this.placeKey(root)).slice(0, 12);
       if (!this.roots.has(id)) this.roots.set(id, root);
     }
+  }
+  /** Where a process 10 & 2 starts for this would work: new work's project, or any session's folder, since every turn runs in Codex's daemon, which this connector may have started (local.ts). */
+  workFolder(kind: ActionKind, id: string): string | null {
+    if (kind === "start_work") return this.roots.get(id) ?? null;
+    return kind === "follow_up" ? this.rows.get(id)?.thread.cwd ?? null : null;
   }
   places(): Place[] {
     if (!this.loaded || this.closed || !this.opts.policy.codex || !allows(this.opts.policy, "start_work", "codex")) return [];

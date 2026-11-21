@@ -21,20 +21,26 @@ export function knownVersion(v: unknown, log: (s: string) => void = console.warn
   return true;
 }
 
-/** Darwin ps emits a local-time English date, with second precision. */
+/**
+ * Darwin ps's `lstart`, an English date with second precision, read as UTC: `ps` runs here with TZ=UTC, and Claude Code
+ * writes its registry's `procStart` the same way whatever the session's TZ (measured on 2.1.325, Quartz).
+ */
 export function parsePsStart(text: string): number | null {
   const value = text.trim();
   if (!/^[A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4}$/.test(value)) return null;
-  const at = Date.parse(value);
+  const at = Date.parse(`${value} UTC`);
   return Number.isFinite(at) ? at : null;
 }
 const ps = (pid: number, field: string) => execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], {
-  encoding: "utf8", timeout: 1000, env: { ...process.env, LC_ALL: "C" },
+  encoding: "utf8", timeout: 1000, env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
 });
 export function darwinIdentity(command: string, lstart: string, start: string | null, startedAt?: unknown): "dead" | "verified" | "unverified" {
-  if (!/^(claude|node|nodejs)(?:$|[-.])/.test(basename(command.trim()))) return "dead";
+  // `comm` is the process's title where it sets one: Claude Code's background sessions show `claude bg-spare`.
+  if (!/^(claude|node|nodejs)(?:$|[-.\s])/.test(basename(command.trim()))) return "dead";
   const actual = parsePsStart(lstart);
-  const expected = start?.startsWith("darwin:") ? Number(start.slice(7)) :
+  // Claude Code's own `procStart` is ps's lstart. Without it, `startedAt` is when the session began, which can be well
+  // after the process did (its folder-trust question comes first), so a session open there would read as gone.
+  const expected = start?.startsWith("darwin:") ? Number(start.slice(7)) : start && parsePsStart(start) !== null ? parsePsStart(start) :
     start && /^\d{13}$/.test(start) ? Number(start) :
     start && /^\d{10}$/.test(start) ? Number(start) * 1000 :
     start?.includes("T") && iso(start) ? Date.parse(iso(start)!) : iso(startedAt) ? Date.parse(iso(startedAt)!) : null;

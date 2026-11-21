@@ -6,7 +6,7 @@ import type { FSWatcher } from "node:fs";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import type { Action, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import type { Action, ActionKind, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy } from "../policy.ts";
 import { addWorktree, firstAsk, folderOf, gitRoot, group } from "../work.ts";
@@ -275,6 +275,12 @@ export class PiAdapter implements Adapter {
     }
   }
 
+  /** Where a process 10 & 2 starts for this would work: new work's project, or a session nothing has open (local.ts). */
+  workFolder(kind: ActionKind, id: string): string | null {
+    if (kind === "start_work") return this.roots.get(id) ?? null;
+    const row = kind === "follow_up" ? this.rows.get(id) : undefined;
+    return row && !row.live ? row.cwd : null;
+  }
   places(): Place[] {
     if (!this.loaded || this.closed || !this.opts.policy.pi || !allows(this.opts.policy, "start_work", "pi")) return [];
     const roots = [...this.roots].filter(([, root]) => visible(this.opts.policy, root));

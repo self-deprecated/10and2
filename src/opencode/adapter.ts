@@ -7,7 +7,7 @@ import { watch, existsSync, mkdirSync } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { basename, dirname, join, win32 } from "node:path";
 import { createHash } from "node:crypto";
-import type { Action, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import type { Action, ActionKind, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, ceilingFor, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy, RuntimeMode } from "../policy.ts";
 import { Store } from "../claude/store.ts";
@@ -112,6 +112,8 @@ export class OpenCodeAdapter implements Adapter {
   private rows = new Map<string, Row>();
   private live: Live = { endpoints: [], busy: new Map(), pending: [], unreachable: [] };
   private roots = new Map<string, string>();
+  /** The last error reading OpenCode's database, until a read works again. */
+  private dbError: string | null = null;
   private keys = new Map<string, string>();
   private questions = new Map<string, string | null>();
   private cache = new Map<string, { signature: string; v: View }>();
@@ -251,12 +253,16 @@ export class OpenCodeAdapter implements Adapter {
       });
     } catch (e) {
       // Locked past the busy timeout, or not there yet: keep what was read last; the next event or rescan retries.
-      if (existsSync(this.dbPath)) this.opts.log(`opencode: couldn't read OpenCode's database (${(e as Error).message}); will retry`);
+      const why = (e as Error).message;
+      // Said once while it lasts: a database this version can't read stays so on every rescan.
+      if (existsSync(this.dbPath)) { if (why !== this.dbError) this.opts.log(`opencode: couldn't read OpenCode's database (${why}); will retry`); }
       else this.rows = new Map();
+      this.dbError = why;
       this.live = live; this.scannedAt = Date.now(); this.watchPaths(); this.follow(live);
       return;
     }
     this.scannedAt = Date.now();
+    this.dbError = null;
     this.live = live;
     const next = new Map<string, Row>();
     const linux = process.platform === "linux" && this.opts.scanProcesses !== false;
@@ -309,7 +315,9 @@ export class OpenCodeAdapter implements Adapter {
   private watchPaths() {
     if (this.closing || this.closed) return;
     const wanted = new Map<string, (name: string | null) => boolean>([
-      [dirname(this.dbPath), (name) => !name || name.startsWith(basename(this.dbPath))],
+      // Not its -shm: reading the database changes that, and macOS reports it (Linux doesn't), so each read would start
+      // the next, about four a second for good (Quartz, 21 November). OpenCode's own writes change the -wal.
+      [dirname(this.dbPath), (name) => !name || (name.startsWith(basename(this.dbPath)) && !name.endsWith("-shm"))],
       [this.liveDir, (name) => !name || name.endsWith(".json")],
     ]);
     for (const [path, w] of this.watchers) if (!wanted.has(path)) { w.close(); this.watchers.delete(path); }
@@ -345,6 +353,12 @@ export class OpenCodeAdapter implements Adapter {
       const root = gitRoot(dir);
       if (root && visible(this.opts.policy, root) && !t3Cwd(root)) this.roots.set(hash(root).slice(0, 12), root);
     }
+  }
+  /** Where a process 10 & 2 starts for this would work: new work's project, or a session only 10 & 2's own OpenCode server has open, or none (local.ts). */
+  workFolder(kind: ActionKind, id: string): string | null {
+    if (kind === "start_work") return this.roots.get(id) ?? null;
+    const row = kind === "follow_up" ? this.rows.get(id) : undefined;
+    return row && !row.pending && (!row.holder || row.holder.via === "serve") ? row.s.directory : null;
   }
   places(): Place[] {
     if (!this.loaded || this.closed || !this.opts.policy.opencode || !allows(this.opts.policy, "start_work", "opencode")) return [];

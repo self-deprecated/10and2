@@ -4,10 +4,18 @@ import type { Action, ActionKind, Adapter, FirstAsk, PastReply, Place, Receipt, 
 import { allows, withinCeiling, type Agent, type Policy } from "./policy.ts";
 import { NAMES } from "./agents.ts";
 import type { Refusals } from "./view.ts";
+import { privacyRefusal } from "./privacy.ts";
 
 export type LocalAdapter = {
   prefix: string;
-  adapter: Adapter & { readonly isLoaded?: boolean; refusals?(): Refusals };
+  adapter: Adapter & {
+    readonly isLoaded?: boolean; refusals?(): Refusals;
+    /**
+     * The folder a process this connector starts for the action would work in: new work's project (`start_work`, by
+     * place id), or a session nothing has open (`follow_up`). Null when it goes to something already running.
+     */
+    workFolder?(kind: ActionKind, id: string): string | null;
+  };
   /** Only adapters with backend idempotency may resend an outcome lost in a crash. */
   retrySafe?: boolean;
 };
@@ -89,6 +97,18 @@ export class Local implements Adapter {
     return out;
   }
   places(): Place[] { return this.entries.filter((e) => e.adapter.isLoaded !== false).flatMap((e) => (e.adapter.places?.() ?? []).map((p) => ({ ...p, id: this.id(e, p.id) }))); }
+  /**
+   * Whether macOS lets this program into the protected folders (privacy.ts) that projects where new work can start
+   * are in; asking makes macOS show its prompt, so the login service asks once it has read every work system.
+   */
+  async privacy(): Promise<string[]> {
+    const refusals = new Set<string>();
+    for (const e of this.entries) {
+      if (e.adapter.isLoaded === false) continue;
+      for (const p of e.adapter.places?.() ?? []) { const why = await privacyRefusal(e.adapter.workFolder?.("start_work", p.id)); if (why) refusals.add(why); }
+    }
+    return [...refusals];
+  }
   report(id: string): Promise<Report> { const r = this.route(id); return r.e.adapter.report(r.id); }
   replies(id: string): Promise<PastReply[]> { const r = this.route(id); return r.e.adapter.replies?.(r.id) ?? Promise.resolve([]); }
   firstAsk(id: string): Promise<FirstAsk | null> { const r = this.route(id); return r.e.adapter.firstAsk?.(r.id) ?? Promise.resolve(null); }
@@ -99,6 +119,9 @@ export class Local implements Adapter {
     if (!r.e.adapter.actions.includes(a.kind)) return `This work system can't ${a.kind.replaceAll("_", " ")}.`;
     const why = await r.e.adapter.check?.(this.action(a, r.id)) ?? null;
     if (why) return why;
+    // A folder macOS keeps closed to this program would leave the work waiting on a prompt nobody sees (privacy.ts).
+    const closed = await privacyRefusal(r.e.adapter.workFolder?.(a.kind, r.id));
+    if (closed) return closed;
     // A model the place doesn't list now would start on something nobody chose, or not at all: nothing is sent.
     if (a.kind === "start_work" && a.model !== undefined) {
       const { adapter } = r.e;

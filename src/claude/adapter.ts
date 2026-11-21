@@ -6,7 +6,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { createConnection, createServer } from "node:net";
 import type { Server } from "node:net";
-import type { Action, Adapter, FirstAsk, CodingModel, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import type { Action, ActionKind, Adapter, FirstAsk, CodingModel, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, ceilingFor, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy, RuntimeMode } from "../policy.ts";
 import { iso, pidState, procStart, readRegistry, registrySnapshot, sessionId, versionAtLeast } from "./registry.ts";
@@ -460,6 +460,12 @@ export class ClaudeAdapter implements Adapter {
       this.trusted = { mtimeMs: st.mtimeMs, folders };
       return folders;
     } catch { return []; }
+  }
+  /** Where a process 10 & 2 starts for this would work: new work's project, or a session nothing has open (local.ts). */
+  workFolder(kind: ActionKind, id: string): string | null {
+    if (kind === "start_work") return this.roots.get(id) ?? null;
+    const row = kind === "follow_up" ? this.rows.get(id) : undefined;
+    return row && !row.live.length && !this.asks.has(id) ? row.cwd : null;
   }
   places(): Place[] {
     if (!this.loaded || this.closed || !this.opts.policy.claude || !allows(this.opts.policy, "start_work", "claude")) return [];

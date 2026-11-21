@@ -481,7 +481,7 @@ async function runConnector() {
   // Windows' supervisor asks it to stop over IPC, where SIGTERM never arrives: shutdown() below runs for both.
   stopLikeSigterm();
   const fatalExit = Number(flags.get("fatal-exit") ?? 78);
-  let state = { pid: process.pid, version: VERSION, startedAt: new Date().toISOString(), brain: "", linked: false, since: null as string | null, error: null as string | null, fatal: false, threads: undefined as number | undefined, projects: undefined as number | undefined };
+  let state = { pid: process.pid, version: VERSION, startedAt: new Date().toISOString(), brain: "", linked: false, since: null as string | null, error: null as string | null, fatal: false, threads: undefined as number | undefined, projects: undefined as number | undefined, privacy: [] as string[] };
   const record = (s: Partial<typeof state>) => { state = { ...state, ...s }; try { writePrivate(statusFile(), JSON.stringify(state) + "\n"); } catch { /* status is a convenience */ } };
   let policy;
   try { policy = loadPolicy(); }
@@ -545,10 +545,22 @@ async function runConnector() {
     ...(copilot ? [{ prefix: "copilot", adapter: copilot }] : []),
     ...(cursor ? [{ prefix: "cursor", adapter: cursor }] : []),
   ], policy);
+  let privacyAsking = false;
   link = new Link({
     url: policy.brain, token, adapter, ledger, log,
     onFatal: () => { record({ error: "this computer was disconnected (revoked on the website, or set up again elsewhere)", fatal: true }); stop(fatalExit); },
-    onView: (n) => record(n),
+    onView: (n) => {
+      record(n);
+      // Once every work system has been read: which protected folders macOS keeps from this program. The first ask
+      // makes macOS show its prompt, at login, while someone is at the Mac; later views ask again (at most every 30 s
+      // per folder), so `status` stops saying it once it's allowed (privacy.ts).
+      if (!adapter.allLoaded || privacyAsking) return;
+      privacyAsking = true;
+      void adapter.privacy().then((privacy) => {
+        for (const why of privacy) if (!state.privacy.includes(why)) log(`connector: ${why}`);
+        if (JSON.stringify(privacy) !== JSON.stringify(state.privacy)) record({ privacy });
+      }, () => {}).finally(() => { privacyAsking = false; });
+    },
     onState: (s) => record({ linked: s.linked, ...(s.linked !== state.linked ? { since: new Date().toISOString() } : {}), ...(s.linked ? { error: null } : s.error ? { error: s.error } : {}) }),
   });
   link.start();
@@ -596,6 +608,8 @@ async function status() {
   else if (!alive) bad(`Not running. ${s.installed ? `It should start at login; see ${s.logs}` : `${cmd("10and2 autostart on")} keeps it running.`}`);
   else if (st.linked) ok(`Connected to ${account(origin, key)} ${dim(`· ${Date.now() - Date.parse(st.since) < 10_000 ? "just now" : `for ${ago(st.since)}`}`)}${st.threads !== undefined ? ` ${dim("·")} ${sizeText(st)}` : ""}`);
   else warn(`Connecting to ${account(origin, key)}${st.error ? `: ${st.error}` : ""}`);
+  // What macOS keeps from the running connector (privacy.ts), as it last found.
+  if (alive) for (const why of Array.isArray(st.privacy) ? st.privacy : []) warn(why);
   if (cred || token) {
     if (s.installed) (s.running ? ok : warn)(s.running ? "Starts at login" : `Starts at login, but isn't running: see ${s.logs}`);
     else if (alive) note(dim(`Doesn't start at login (${cmd("10and2 autostart on")})`));

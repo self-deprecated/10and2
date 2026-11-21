@@ -21,6 +21,8 @@ Setup finds the coding agents on this computer and lets you switch off any you d
 
 New work in T3 Code, Claude Code, Codex, Gemini CLI and Copilot CLI can start on a coding model you name (in T3 Code, on the provider you name too), or the one you choose in the app's Settings → New threads → Coding model; otherwise, and in Pi and OpenCode, on the agent's own default.
 
+On a Mac, if your projects are in Documents, Desktop, Downloads or iCloud Drive, macOS asks whether “node” may open them once 10and2 runs at login: choose Allow, or turn it on later in System Settings, Privacy & Security, Files & Folders. `10and2 status` says when it's still off.
+
 Needs Node 22.13 or newer. Setup and `10and2 status` say when one of your agents is too old for something 10 & 2 does, and how to update it.
 
 Without a terminal (a script, Nix), every agent found is connected with everything allowed, and flags narrow it: `--agents=claude,pi` (only these), `--off=codex`, `--no-steer`, `--no-answer`, `--no-start`, `--no-tidy`, `--read-only`. Given names, as in `--no-steer=codex`, a flag narrows only those agents.

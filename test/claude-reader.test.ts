@@ -381,6 +381,14 @@ test("Darwin ps parsing verifies Claude/node identity and detects reused pids", 
   assert.equal(darwinIdentity("node", stamp, `darwin:${at - 60_000}`), "dead");
   assert.equal(darwinIdentity("/usr/bin/python3", stamp, null), "dead");
   assert.equal(darwinIdentity("claude", stamp, null), "verified");
+  // Claude Code's registry: `procStart` is ps's lstart in UTC, and `startedAt` can be 25 s later (the folder-trust
+  // question came first, Quartz, 2.1.325). The process's own start decides.
+  assert.equal(at, Date.UTC(2026, 9, 30, 10, 12, 34));
+  assert.equal(darwinIdentity("claude", stamp, stamp, at + 25_482), "verified");
+  assert.equal(darwinIdentity("claude", stamp, "Fri Oct 30 10:11:34 2026", at), "dead");
+  // A background session (`claude --bg`) titles itself; Claude Code claims it from a spare started earlier.
+  assert.equal(darwinIdentity("claude bg-spare\n", stamp, stamp, at + 180_000), "verified");
+  assert.equal(darwinIdentity("claudette", stamp, stamp), "dead");
 });
 
 test("a transcript whose first records rule it out is read no further, however big it grows", async (t) => {
