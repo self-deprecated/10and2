@@ -149,7 +149,7 @@ export const TOOLS = [
   {
     name: "hold",
     description:
-      "Hang up and put the call on hold: no minutes are used, the phone listens for the user's wake word to bring them back to this conversation, and the app calls back if the thread they dealt with last replies. Use when the user says hold, pause, go on hold or hang up for now without naming threads to hear back from.",
+      "Hang up and put the call on hold: no minutes are used, the phone listens for the user's wake word to bring them back to this conversation, and the app calls back if the thread they dealt with last replies. Use when the user says hold, pause or go on hold without naming threads to hear back from. Not for \"hang up\" or \"end the call\": that ends the call (end_session).",
     parameters: { type: "object", additionalProperties: false, required: [], properties: {} },
   },
   {
@@ -197,7 +197,7 @@ export const TOOLS = [
   },
   {
     name: "end_session",
-    description: "End the conversation after the user says they are done or says goodbye.",
+    description: "End the call after the user says they are done, says goodbye, or asks to hang up or end the call.",
     parameters: { type: "object", additionalProperties: false, required: [], properties: {} },
   },
 ] as const;
@@ -588,6 +588,18 @@ const BEFORE_THE_USER_AGAIN: Readonly<Record<string, string>> = {
   wait_for: "nothing is waited for.",
 };
 
+/** Ends the call with a goodbye (`end_session`, or a `hold` the user asked for with "hang up"). */
+async function endCall(deps: ToolDeps, ctx: { requestEnd: (reason: EndReason) => void }, why = ""): Promise<ToolResult> {
+  ctx.requestEnd({ kind: "goodbye" });
+  const working = await starredWorking(deps);
+  return {
+    ending: true,
+    instruction: working.length
+      ? `${why}Say a short goodbye, and that you'll call back when ${working.map((w) => withGroup(w.handle, w.item.group, true)).join(" or ")} replies.`
+      : `${why}Say a short goodbye.`,
+  };
+}
+
 export async function runTool(
   name: string,
   args: any,
@@ -615,6 +627,8 @@ export async function runTool(
     onlyStopped?: () => boolean;
     /** The user's latest turn only greeted Driver or asked if it's there (16 November): `hold` and `end_session` are refused. */
     onlyGreeted?: () => boolean;
+    /** The user's latest turn asked to hang up ("hang up", "end the call"): `hold` ends the call instead (21 November). */
+    askedToHangUp?: () => boolean;
     /**
      * A call opened to send a dictated reply, before the user has answered it: nothing else may be proposed, since a new
      * proposal replaces the open one and their yes would then find the reply gone.
@@ -988,6 +1002,9 @@ export async function runTool(
     case "hold": {
       if (ctx.onlyStopped?.()) return { error: ONLY_STOPPED };
       if (ctx.onlyGreeted?.()) return { error: ONLY_GREETED };
+      // "Hang up" ends the call; only "hold", "pause" or "go on hold" holds it. On 21 November "Nah, it's all good. Hang
+      // up" got `hold`, and the call went on hold.
+      if (ctx.askedToHangUp?.()) return endCall(deps, ctx, "The user asked to hang up, which ends the call, not a hold. ");
       deps.store.saveHandoff(ctx.conversationId, { handle: "", hold: true });
       ctx.requestEnd({ kind: "paused", handOff: true });
       return { holding: true, instruction: HOLDING };
@@ -998,14 +1015,7 @@ export async function runTool(
       if (ctx.onlyFlagged?.()) {
         return { error: "The user only asked the app to flag this moment for review; the call goes on. Don't say goodbye: answer anything else they said, or wait for them." };
       }
-      ctx.requestEnd({ kind: "goodbye" });
-      const working = await starredWorking(deps);
-      return {
-        ending: true,
-        instruction: working.length
-          ? `Say a short goodbye, and that you'll call back when ${working.map((w) => withGroup(w.handle, w.item.group, true)).join(" or ")} replies.`
-          : "Say a short goodbye.",
-      };
+      return endCall(deps, ctx);
     }
   }
   return { error: `Unknown tool ${name}.` };

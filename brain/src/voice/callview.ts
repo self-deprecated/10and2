@@ -100,7 +100,8 @@ export function receiptOf(name: string, args: any, result: Record<string, unknow
     case "end_session":
       return result.ending ? { kind: "call", text: "Ended the call", threads: [] } : null;
     case "hold":
-      return result.holding ? { kind: "call", text: "Put the call on hold", threads: [] } : null;
+      // A `hold` for "hang up" ends the call (tools.ts).
+      return result.holding ? { kind: "call", text: "Put the call on hold", threads: [] } : result.ending ? { kind: "call", text: "Ended the call", threads: [] } : null;
   }
   return null;
 }

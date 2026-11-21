@@ -36,7 +36,18 @@ const LEAD = /^(?:(?:ok(?:ay)?|alright|all right|right|so|well|yes|yeah|yep|plea
  * hold" is one (3 November: Driver refused it twice, "I can't pause the call"); "hold on" is not: it's an objection.
  */
 const PAUSE_COMMAND =
-  /^(?:pause|hold$|hang up|(?:go|put (?:me|it|this|the call|us)) on hold|hold (?:the call|mode)|call me back|ring me back|get back to me|keep me (?:posted|updated|in the loop)|(?:let me know|tell me|ping me) (?:when|once|if|as soon as) (?:it|they|that|this)(?: one| thread)?(?:(?:'s|’s) (?:done|finished)| (?:comes? back|repl(?:y|ies)|responds?|answers?|finish(?:es)?|is done|is finished|gets back|writes back|updates?|says? something|has (?:news|an update|something)|changes?)))\b/i;
+  /^(?:pause|hold$|(?:go|put (?:me|it|this|the call|us)) on hold|hold (?:the call|mode)|call me back|ring me back|get back to me|keep me (?:posted|updated|in the loop)|(?:let me know|tell me|ping me) (?:when|once|if|as soon as) (?:it|they|that|this)(?: one| thread)?(?:(?:'s|’s) (?:done|finished)| (?:comes? back|repl(?:y|ies)|responds?|answers?|finish(?:es)?|is done|is finished|gets back|writes back|updates?|says? something|has (?:news|an update|something)|changes?)))\b/i;
+/**
+ * "Hang up and call me back", "hang up, let me know when it replies": a hang-up that asks to hear back is a pause. Its
+ * "hang up" is taken off the front, so a bare "hang up" is not one (`asksToHangUp`).
+ */
+const HANG_UP_THEN = /^hang up(?: now)?(?:,|\s+and)?\s+/i;
+/**
+ * A command to end the call: "hang up", "end the call", "you can hang up now". Since Hold has been a mode of its own
+ * (8 November, docs/launch/voice-modes.md), hanging up ends the call and "hold" holds it. On 21 November "Nah, it's all
+ * good. Hang up" got `hold` from the backend, and the call went on hold.
+ */
+const HANG_UP_COMMAND = /^(?:hang up(?: the (?:call|phone))?|end (?:the |this )?call)(?:\s+(?:now|please|then|for now|on me))*$/i;
 /** "Keep me posted, but don't hang up": staying on the line wins over anything else in the turn. */
 const STAY_ON = /\b(?:don'?t|don’t|do not|never|no need to)\s+(?:\w+\s+){0,2}(?:hang(?:ing)? up|pause|go\b|leave)|\bstay (?:on|connected)\b/i;
 /**
@@ -64,7 +75,21 @@ export const asksToPause = (said: string, wake = STANDARD_WAKE_WORD) =>
   !/\?\s*$/.test(said) &&
   !DICTATING.test(said) &&
   !STAY_ON.test(said) &&
-  said.split(/[.!?;]+/).some((sentence) => PAUSE_COMMAND.test(withoutWakeWord(sentence.trim(), wake).replace(LEAD, "")));
+  said.split(/[.!?;]+/).some((sentence) =>
+    PAUSE_COMMAND.test(withoutWakeWord(sentence.trim(), wake).replace(LEAD, "").replace(HANG_UP_THEN, "")),
+  );
+
+/**
+ * The user asks to end the call ("Nah, it's all good. Hang up", "10 & 2, end the call"), not to hold it or hear back.
+ * Only short turns count, as for a pause; "don't hang up", "tell it to hang up" and "hang up and call me back" don't.
+ */
+export const asksToHangUp = (said: string, wake = STANDARD_WAKE_WORD) =>
+  said.trim().split(/\s+/).length <= 12 &&
+  !DICTATING.test(said) &&
+  !STAY_ON.test(said) &&
+  said.split(/[.!?;]+/).some((sentence) =>
+    HANG_UP_COMMAND.test(withoutWakeWord(sentence.trim(), wake).replace(LEAD, "").replace(/[\s,]+$/, "")),
+  );
 
 /** One sentence that only tells Driver to stop talking: "Stop", "okay, stop", "stop it", "please stop talking", "shh". */
 const STOP_ONLY =
@@ -122,7 +147,7 @@ export const keepsTalking = (said: string, wake = STANDARD_WAKE_WORD) => {
   if (STAY_ON.test(said)) return true;
   if (endsWithGoodbye(said)) return false;
   // Asking again for the hang-up under way ("Go on hold mode" twice, 8 November) isn't talking over it.
-  if (asksToPause(said, wake)) return false;
+  if (asksToPause(said, wake) || asksToHangUp(said, wake)) return false;
   return OBJECTION.test(said.trim()) || (words.length >= 4 && !/\b(?:thanks|thank you|cheers|ta)[\s.!]*$/i.test(said));
 };
 
@@ -244,6 +269,8 @@ export function step(previous: EndState, input: EndInput, now: number, correct: 
       // Backstop for a voice reply that ends the conversation without delegating.
       if (state.userTurn && !state.endRequestedAt && endsWithGoodbye(correct(state.userTurn))) {
         request({ kind: "goodbye" }, "user said goodbye");
+      } else if (state.userTurn && !state.endRequestedAt && asksToHangUp(correct(state.userTurn), state.wake)) {
+        request({ kind: "goodbye" }, "user asked to hang up");
       } else if (state.userTurn && !state.endRequestedAt && !state.pauseAnswered && asksToPause(correct(state.userTurn), state.wake)) {
         request({ kind: "paused" }, "user asked to pause");
       }

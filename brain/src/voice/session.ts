@@ -14,7 +14,7 @@ import { namedItems, runTool, seenOf, TOOLS, type ToolDeps, type Watched } from 
 import { masked, type ReadingStyle } from "../reading.ts";
 import { datedLine, driveBlock, historyLine } from "../drives.ts";
 import { ago, describe, realClock, type Clock, type Timer } from "../util.ts";
-import { asksOnlyToStop, endsWithGoodbye, initialEndState, onlyGreets, step, type EndInput, type EndState } from "./endPolicy.ts";
+import { asksOnlyToStop, asksToHangUp, endsWithGoodbye, initialEndState, onlyGreets, step, type EndInput, type EndState } from "./endPolicy.ts";
 import { deliberate, reasonText, type EndReason } from "./endReason.ts";
 import { asksToFlag, issueIn, noteIsTheirs, type Flags } from "../flags.ts";
 import { fill, type Prompts } from "./sections.ts";
@@ -25,7 +25,7 @@ import { asksAbout, asksRecap, CLAIM_OF, claimsIn, claimsOf, isRecap, type Claim
 import { correctArgs, vocabularyOf } from "../vocabulary.ts";
 import { tokensOf, type RecordSpend } from "../spend.ts";
 
-export { asksOnlyToStop, asksToPause, endsWithGoodbye, onlyGreets } from "./endPolicy.ts";
+export { asksOnlyToStop, asksToHangUp, asksToPause, endsWithGoodbye, onlyGreets } from "./endPolicy.ts";
 
 /** What each conversation has said, across the sessions (bursts) it spans. */
 export class Conversations {
@@ -759,6 +759,8 @@ export class VoiceSession {
   private onlyStopped = false;
   /** The user's latest turn only greeted Driver or asked if it's there (`onlyGreets`): `hold` and `end_session` are refused. */
   private onlyGreeted = false;
+  /** The user's latest turn asked to hang up (`asksToHangUp`): that ends the call, so a `hold` for it ends it instead. */
+  private askedToHangUp = false;
   /**
    * The user's latest turn asked to dictate (`asksToDictate`) and the voice model began answering it, at `at`, with no
    * hand-off to the backend yet. On 9 November it said "Go ahead, I'm listening." and "Okay." and handed nothing over,
@@ -1447,6 +1449,7 @@ export class VoiceSession {
       onlyFlagged: () => this.onlyFlagged,
       onlyStopped: () => this.onlyStopped,
       onlyGreeted: () => this.onlyGreeted,
+      askedToHangUp: () => this.askedToHangUp,
       keepReplies: this.deps.keepReplies,
       confirm: this.deps.confirm,
       awaitingDraft: () => this.deps.opening === "draft" && this.endState.userWords.trim() === "",
@@ -1542,6 +1545,7 @@ export class VoiceSession {
     if (spokenWords(said)) this.onlyFlagged = asksToFlag(spokenWords(said)) && !endsWithGoodbye(said);
     if (spokenWords(said)) this.onlyStopped = asksOnlyToStop(spokenWords(said), this.deps.wakeWord);
     if (spokenWords(said)) this.onlyGreeted = onlyGreets(spokenWords(said), this.deps.wakeWord);
+    if (spokenWords(said)) this.askedToHangUp = asksToHangUp(spokenWords(said), this.deps.wakeWord);
     // What the user says next, in a turn begun once the voice was saying the answer (not a listening sound over it), ends a
     // purpose answer's hold.
     if (
