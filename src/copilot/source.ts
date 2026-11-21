@@ -2,12 +2,15 @@
 // `<COPILOT_HOME or ~/.copilot>/session-state/` (copilot/session.ts); one a Copilot has open holds `inuse.<pid>.lock`.
 // Its ACP session has a mode (agent, plan, autopilot: autopilot allows every tool by itself) and an `allow_all` option
 // (off: it asks before any tool that changes something, which Driver refuses). Copilot has no mode that accepts edits
-// without also running commands, so a launch below full access runs with `allow_all` off.
+// without also running commands, so a launch below full access runs with `allow_all` off. A Copilot that runs 10 & 2's
+// extension (copilot/extension.ts) can be sent to and have its question answered while it's open (copilot/bridge.ts).
 import { readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { RuntimeMode } from "../policy.ts";
-import type { Found, Source } from "../acp/adapter.ts";
+import type { Found, Reach, Source } from "../acp/adapter.ts";
+import { readLive } from "./bridge.ts";
+import { copilotExtensionStatus } from "./extension.ts";
 import type { Settings } from "../acp/turn.ts";
 import { CopilotSession } from "./session.ts";
 
@@ -75,6 +78,17 @@ export class CopilotSource implements Source {
       if (holders.some((pid) => !own.has(pid) && alive(pid))) out.add(f.id);
     }
     return out;
+  }
+
+  live(): Map<string, Reach> {
+    return new Map([...readLive(this.dir)].map(([id, l]) => [id, { status: l.status, questions: l.questions, socket: l.socket }]));
+  }
+  reachHint(): string | null {
+    let state;
+    try { state = copilotExtensionStatus(this.dir).state; } catch { return null; }
+    if (state === "installed" || state === "outdated") return "Restarting Copilot there lets 10 & 2 reach it.";
+    if (state === "foreign") return null;
+    return "Running 10and2 copilot install on this computer, then restarting Copilot, lets 10 & 2 reach it.";
   }
 
   launch(runtime: RuntimeMode, plan: boolean): Settings {

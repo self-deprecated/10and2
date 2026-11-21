@@ -32,7 +32,8 @@ import { runPiTurn } from "./pi/turn.ts";
 import { AcpAdapter } from "./acp/adapter.ts";
 import { runAcpTurn } from "./acp/turn.ts";
 import { GeminiSource } from "./gemini/source.ts";
-import { CopilotSource } from "./copilot/source.ts";
+import { CopilotSource, copilotDir } from "./copilot/source.ts";
+import { copilotExtensionStatus, installCopilotExtension, uninstallCopilotExtension, updateCopilotExtension } from "./copilot/extension.ts";
 import { installOpenCodePlugin, OpenCodeAdapter, openCodePluginStatus, uninstallOpenCodePlugin } from "./opencode/index.ts";
 import { describe, replaceFile } from "./util.ts";
 import { openBrowser, opener } from "./browser.ts";
@@ -56,6 +57,7 @@ More
   ${cmd("10and2 hooks install|uninstall|status")}  10 & 2 answers Claude Code's questions; updates are instant
   ${cmd("10and2 pi install|uninstall|status")}     10 & 2 reaches the Pi sessions you have open
   ${cmd("10and2 opencode install|uninstall|status")}  10 & 2 reaches the OpenCode sessions you have open
+  ${cmd("10and2 copilot install|uninstall|status")}   10 & 2 reaches the Copilot CLI sessions you have open
   ${cmd("10and2 run")}                         run in this terminal instead of at login
   ${cmd("10and2 token")}                       a token, for a brain you configure by hand
 
@@ -106,6 +108,7 @@ const TAKES: Record<string, { words: number; flags: string[] }> = {
   hooks: { words: 1, flags: [] },
   pi: { words: 1, flags: [] },
   opencode: { words: 1, flags: [] },
+  copilot: { words: 1, flags: [] },
   "pi-turn": { words: 0, flags: [] },
   "acp-turn": { words: 0, flags: [] },
   "login-service": { words: 1, flags: [] },
@@ -147,6 +150,7 @@ try {
     case "hooks": await hooks(); break;
     case "pi": piCommand(); break;
     case "opencode": await openCodeCommand(); break;
+    case "copilot": copilotCommand(); break;
     case "pi-turn": process.exitCode = await runPiTurn(); break; // the connector runs this; it must stay silent
     case "acp-turn": process.exitCode = await runAcpTurn(); break; // the connector runs this; it must stay silent
     // Windows runs this at login (service.ts runEntry); it must stay silent.
@@ -379,6 +383,7 @@ async function offerHelpers(choice: Choice) {
   if (wants("opencode") && !(await openCodePluginStatus().catch(() => null))?.current) {
     helpers.push({ name: "OpenCode plugin", undo: "10and2 opencode uninstall", add: async () => { await installOpenCodePlugin(); } });
   }
+  await offerCopilotExtension(wants("copilot"));
   if (!helpers.length) return;
   const names = helpers.map((h) => h.name).join(" and ");
   if (!flags.has("yes") && !await confirm(`Let 10 & 2 answer questions and reach open sessions? It adds the ${names}`, true)) {
@@ -389,6 +394,23 @@ async function offerHelpers(choice: Choice) {
     try { await h.add(); ok(`${h.name} added ${dim(`· ${cmd(h.undo)} removes ${h.name.endsWith("s") ? "them" : "it"}`)}`); }
     catch (e) { warn(`Couldn't add the ${h.name} (${describe(e)}). ${cmd(h.undo.replace("uninstall", "install"))} tries again.`); }
   }
+}
+
+/**
+ * Copilot's extension, asked for on its own: Copilot loads extensions only with its experimental features on, which it
+ * turns on for everything Copilot does, so it's never added without a yes here (not with --yes, nor off a terminal).
+ */
+async function offerCopilotExtension(wanted: boolean) {
+  let state;
+  try { state = copilotExtensionStatus(copilotDir()).state; } catch { return; }
+  if (!wanted || state === "installed" || state === "foreign") return;
+  const later = `${cmd("10and2 copilot install")} adds it later.`;
+  if (flags.has("yes") || !process.stdin.isTTY) { note(dim(`10 & 2 reaches open Copilot CLI sessions with its Copilot extension, which needs Copilot's experimental features on: ${later}`)); return; }
+  if (!await confirm("Let 10 & 2 send to Copilot CLI sessions you have open, and answer their questions? It adds 10and2's Copilot extension and turns on Copilot's experimental features, which extensions need", true)) {
+    note(dim(`Not added. ${later}`)); return;
+  }
+  try { installCopilotExtension(copilotDir()); ok(`Copilot extension added ${dim(`· restart any open Copilot · ${cmd("10and2 copilot uninstall")} removes it`)}`); }
+  catch (e) { warn(`Couldn't add the Copilot extension (${describe(e)}). ${cmd("10and2 copilot install")} tries again.`); }
 }
 
 function sha256(s: string) { return createHash("sha256").update(s).digest("hex"); }
@@ -539,6 +561,7 @@ async function runConnector() {
     : null;
   // A copy of 10and2's Pi extension from an older 10and2 is brought up to this one's: Pi loads it in each Pi started after.
   if (policy.pi) { try { if (piExtensionStatus(piAgentDir()).state === "outdated") { installPiExtension(piAgentDir()); log("pi: updated 10and2's Pi extension"); } } catch (e) { log(`pi: ${describe(e)}`); } }
+  if (policy.copilot) { try { if (updateCopilotExtension(copilotDir())) log("copilot: updated 10and2's Copilot extension"); } catch (e) { log(`copilot: ${describe(e)}`); } }
   if (policy.opencode) { try { const s = await openCodePluginStatus(); if (s.installed && !s.current) { await installOpenCodePlugin(); log("opencode: updated 10and2's OpenCode plugin"); } } catch (e) { log(`opencode: ${describe(e)}`); } }
   // Codex doesn't dedupe a message it's sent twice, so a lost outcome is never sent again.
   const codex = policy.codex ? new CodexAdapter({ policy, codexHome: defaultCodexHome(), db: join(stateDirectory(), "codex.db"), stateDir: join(stateDirectory(), "codex"), log }) : null;
@@ -783,6 +806,20 @@ function piCommand() {
     installed: `10and2's Pi extension is installed (${s.path}). Pi sessions started from now on can be reached; one already open needs restarting.`,
     outdated: `An older copy of 10and2's Pi extension is installed (${s.path}). ${cmd("10and2 pi install")} updates it.`,
     missing: `10and2's Pi extension isn't installed${sub === "uninstall" ? " anymore" : ""}. ${cmd("10and2 pi install")} adds it.`,
+    foreign: `${s.path} is another extension, not 10and2's, so it's left as it is.`,
+  }[s.state]);
+}
+
+/** `10and2 copilot …`: 10and2's extension in Copilot's own extensions folder, with Copilot's experimental features on. */
+function copilotCommand() {
+  const dir = copilotDir();
+  const s = sub === "install" ? installCopilotExtension(dir) : sub === "uninstall" ? uninstallCopilotExtension(dir) : sub === "status" ? copilotExtensionStatus(dir) : null;
+  if (!s) throw new Error(`${cmd("10and2 copilot")} takes install, uninstall or status.`);
+  say({
+    installed: `10and2's Copilot extension is installed (${s.path}), and Copilot's experimental features are on. A Copilot started from now on, in a folder you trust in it, can be reached; one already open needs restarting.`,
+    outdated: `An older copy of 10and2's Copilot extension is installed (${s.path}). ${cmd("10and2 copilot install")} updates it.`,
+    off: `10and2's Copilot extension is installed (${s.path}), but Copilot's experimental features are off, so Copilot doesn't load it. ${cmd("10and2 copilot install")} turns them on.`,
+    missing: `10and2's Copilot extension isn't installed${sub === "uninstall" ? " anymore" : ""}. ${cmd("10and2 copilot install")} adds it, and turns on Copilot's experimental features, which extensions need.`,
     foreign: `${s.path} is another extension, not 10and2's, so it's left as it is.`,
   }[s.state]);
 }

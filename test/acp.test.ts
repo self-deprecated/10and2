@@ -13,6 +13,9 @@ import { GeminiSession } from "../src/gemini/session.ts";
 import { GeminiSource, isGemini } from "../src/gemini/source.ts";
 import { askText, CopilotSession, parseWorkspace } from "../src/copilot/session.ts";
 import { AGENT, CopilotSource, PLAN } from "../src/copilot/source.ts";
+import { copilotExtensionStatus, installCopilotExtension, MARKER, uninstallCopilotExtension, updateCopilotExtension } from "../src/copilot/extension.ts";
+import { readLive } from "../src/copilot/bridge.ts";
+import { createServer } from "node:net";
 import type { Action, LaunchProfile } from "../src/contract.ts";
 import type { Policy } from "../src/policy.ts";
 import { nodeCommand, removeDir, SLOW } from "./fixtures/platform.ts";
@@ -233,8 +236,8 @@ test("Gemini through ACP: a permission is never granted, a plan starts in plan m
   const refused = await h.adapter.check(follow(s.id, "x"));
   assert.match(refused ?? "", /open in Gemini CLI/);
   assert.deepEqual(await h.adapter.execute(follow(s.id, "x"), "p2"), { ok: false, error: refused });
-  // Not what Driver's own run wrote, though: that's its own.
-  assert.equal(await h.adapter.check(follow(id, "x")), null);
+  // Not what Driver's own run wrote, though: that's its own (once that run has ended).
+  await until(async () => (await h.adapter.check(follow(id, "x"))) === null);
 });
 
 test("Gemini through ACP: a mode the agent refuses stops the turn before anything is sent, and says why", async (t) => {
@@ -244,4 +247,79 @@ test("Gemini through ACP: a mode the agent refuses stops the turn before anythin
   const r = await h.adapter.execute({ kind: "start_work", placeId: h.adapter.places()[0]!.id, message: "go", profile: profile() }, "u1");
   assert.deepEqual(r, { ok: false, error: "Gemini CLI said: Cannot enable privileged approval modes in an untrusted folder." });
   assert.ok(!h.requests().some((q) => q.method === "session/prompt"));
+});
+
+test("10 & 2's Copilot extension: installed with Copilot's experimental features on, kept up to date, removed with them off again", () => {
+  const home = mkdtempSync(join(tmpdir(), "copilot-ext-"));
+  assert.equal(copilotExtensionStatus(home).state, "missing");
+  writeFileSync(join(home, "settings.json"), JSON.stringify({ theme: "dark" }));
+  assert.equal(installCopilotExtension(home).state, "installed");
+  assert.deepEqual(JSON.parse(readFileSync(join(home, "settings.json"), "utf8")), { theme: "dark", experimental: true }, "the user's own settings kept");
+  assert.ok(readFileSync(join(home, "extensions", "10and2", "extension.mjs"), "utf8").startsWith(MARKER));
+  // Turned off by hand: Copilot loads no extension, which status says.
+  writeFileSync(join(home, "settings.json"), JSON.stringify({ theme: "dark", experimental: false }));
+  assert.equal(copilotExtensionStatus(home).state, "off");
+  installCopilotExtension(home);
+  writeFileSync(join(home, "extensions", "10and2", "extension.mjs"), `${MARKER}\nold`);
+  assert.equal(copilotExtensionStatus(home).state, "outdated");
+  assert.equal(updateCopilotExtension(home), true);
+  assert.equal(copilotExtensionStatus(home).state, "installed");
+  // Removed: the experimental features off again, as 10 & 2 turned them on.
+  assert.equal(uninstallCopilotExtension(home).state, "missing");
+  assert.deepEqual(JSON.parse(readFileSync(join(home, "settings.json"), "utf8")), { theme: "dark", experimental: false });
+  // On already: left on when it goes. Someone else's file there, or settings that aren't plain JSON: never touched.
+  writeFileSync(join(home, "settings.json"), JSON.stringify({ experimental: true }));
+  installCopilotExtension(home); uninstallCopilotExtension(home);
+  assert.equal(JSON.parse(readFileSync(join(home, "settings.json"), "utf8")).experimental, true);
+  mkdirSync(join(home, "extensions", "10and2"), { recursive: true }); writeFileSync(join(home, "extensions", "10and2", "extension.mjs"), "// mine");
+  assert.equal(copilotExtensionStatus(home).state, "foreign");
+  assert.throws(() => installCopilotExtension(home), /another extension/);
+  assert.equal(uninstallCopilotExtension(home).state, "foreign");
+  const other = mkdtempSync(join(tmpdir(), "copilot-ext-"));
+  writeFileSync(join(other, "settings.json"), "// comments\n{}");
+  assert.throws(() => installCopilotExtension(other), /isn't plain JSON/);
+  removeDir(home); removeDir(other);
+});
+
+test("through 10 & 2's Copilot extension, an open session is sent to (steered while busy) and its question answered", async (t) => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "copilot-live-"))), cwd = join(home, "project"), id = randomUUID();
+  mkdirSync(join(cwd, ".git"), { recursive: true });
+  const dir = join(home, "session-state", id);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "workspace.yaml"), `id: ${id}\ncwd: ${JSON.stringify(cwd)}\n`);
+  writeFileSync(join(dir, "events.jsonl"), lines({ type: "user.message", data: { content: "Hi" }, id: "1", timestamp: new Date().toISOString() },
+    { type: "assistant.message", data: { content: "Hello.", toolRequests: [] }, id: "2", timestamp: new Date().toISOString() }));
+  // The extension's end: its registry entry and socket, answering as the real one does.
+  mkdirSync(join(home, "10and2"));
+  const socket = process.platform === "win32" ? `\\\\.\\pipe\\10and2-copilot-${randomUUID()}` : join(home, "10and2", `${process.pid}.sock`);
+  const got: any[] = [];
+  const entry = (o: object) => writeFileSync(join(home, "10and2", `${process.pid}.json`), JSON.stringify({ sessionId: id, cwd, pid: process.pid, status: "idle", questions: [], socket, updatedAt: new Date().toISOString(), ...o }));
+  const server = createServer((c) => c.on("data", (b) => { for (const line of b.toString().split("\n").filter(Boolean)) { const m = JSON.parse(line); got.push(m); c.write(JSON.stringify(m.type === "answer" && m.value === "taken" ? { type: "error", id: m.id, error: "answered" } : { type: "ack", id: m.id }) + "\n"); } }));
+  await new Promise<void>((r) => server.listen(socket, r));
+  entry({});
+  const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [cwd], actions: ["follow_up"], maxRuntimeMode: "approval-required",
+    claude: false, t3: false, codex: false, opencode: false, pi: false, copilot: true, steer: true, answer: true, limits: {}, worktreeBase: "HEAD" };
+  const adapter = new AcpAdapter({ policy, source: new CopilotSource({ dir: home, command: nodeCommand(agentScript) }), db: join(home, "c.db"), stateDir: join(home, "state"), log: () => {}, readCacheMs: 0 });
+  t.after(async () => { await adapter.close(); server.close(); removeDir(home); });
+  await adapter.start();
+  assert.equal(readLive(home).get(id)?.socket, socket);
+  assert.equal(await adapter.check(follow(id, "x")), null);
+  assert.deepEqual(await adapter.execute(follow(id, "Carry on"), "l1"), { ok: true });
+  assert.deepEqual({ type: got[0].type, text: got[0].text }, { type: "user", text: "Carry on" });
+  entry({ status: "busy" });
+  assert.equal((await adapter.list())[0]!.status, "running");
+  // A question: read out, and the option the user named sent as the answer.
+  entry({ status: "waiting", questions: [{ questionId: "q1", title: "Which one?", options: ["Alpha", "Beta"] }] });
+  const [w] = await adapter.list();
+  assert.equal(w!.status, "waiting"); assert.equal(w!.pendingQuestion, true);
+  assert.equal((await adapter.report(id)).question, "Which one? Options: Alpha / Beta.");
+  assert.deepEqual(await adapter.execute(follow(id, "beta please"), "l2"), { ok: true });
+  assert.deepEqual({ type: got[1].type, questionId: got[1].questionId, value: got[1].value }, { type: "answer", questionId: "q1", value: "Beta" });
+  assert.deepEqual(await adapter.execute(follow(id, "taken"), "l3"), { ok: false, error: "That question was already answered in Copilot CLI." });
+  // This computer's settings say no: refused in words, nothing sent.
+  (policy as any).answer = false;
+  assert.match(await adapter.check(follow(id, "Alpha")) ?? "", /doesn't let 10 & 2 answer/);
+  entry({}); (policy as any).steer = false;
+  assert.match(await adapter.check(follow(id, "x")) ?? "", /doesn't let 10 & 2 send to open sessions/);
+  assert.equal(got.length, 3);
 });

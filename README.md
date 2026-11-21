@@ -60,7 +60,9 @@ Without systemd (a container, WSL without systemd, Alpine), nothing starts it fo
 
 ## Gemini CLI and Copilot CLI
 
-10 & 2 works with your Gemini CLI and GitHub Copilot CLI sessions: it reads them, and continues one you've closed, or starts new work in the project or a fresh worktree inside it, through the agent's own ACP mode (`gemini --acp`, `copilot --acp`), within what this computer allows. It never grants either a permission: a tool that asks first doesn't run, so give new work full access for it to edit and run things. A session open in a terminal or an editor isn't sent to yet: say it there, or close it and 10 & 2 can continue it. A question it asks there is read out, and answered there. Gemini CLI refuses full access in a folder you haven't trusted in it. Needs Gemini CLI 0.68.0 or newer, or Copilot CLI 1.0.112 or newer.
+10 & 2 works with your Gemini CLI and GitHub Copilot CLI sessions: it reads them, and continues one you've closed, or starts new work in the project or a fresh worktree inside it, through the agent's own ACP mode (`gemini --acp`, `copilot --acp`), within what this computer allows. It never grants either a permission: a tool that asks first doesn't run, so give new work full access for it to edit and run things.
+
+What you tell it reaches a Copilot session open in a terminal as if you'd typed it there, during its turn when it's busy, and it can answer Copilot's questions. That needs 10and2's Copilot extension, which setup offers to add (`10and2 copilot install` adds it later, `10and2 copilot uninstall` removes it); Copilot loads extensions only with its experimental features on, so adding it turns them on, and only in folders you trust in Copilot. A Copilot already open needs restarting. A Gemini session open in a terminal, or a Copilot one in an editor, isn't sent to yet: say it there, or close it and 10 & 2 can continue it. Gemini CLI refuses full access in a folder you haven't trusted in it. Needs Gemini CLI 0.68.0 or newer, or Copilot CLI 1.0.112 or newer.
 
 ## Your own brain
 

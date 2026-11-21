@@ -8,10 +8,12 @@
 import { watch, existsSync, mkdirSync, openSync, closeSync, statSync, readdirSync, unlinkSync } from "node:fs";
 import type { FSWatcher } from "node:fs";
 import { basename, join } from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import type { Action, Adapter, CodingModel, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
-import { allows, ceilingFor, visible, withinCeiling, RUNTIME_MODES, type Policy, type RuntimeMode } from "../policy.ts";
+import { allows, answers, ceilingFor, steers, visible, withinCeiling, RUNTIME_MODES, type Policy, type RuntimeMode } from "../policy.ts";
+import { talk, type Question } from "../pi/bridge.ts";
+import { answersFor } from "../claude/adapter.ts";
 import { addWorktree, firstAsk, folderOf, gitRoot, group } from "../work.ts";
 import { Store } from "../claude/store.ts";
 import { pidState, procStart } from "../claude/registry.ts";
@@ -55,7 +57,17 @@ export interface Source {
   allowed(ceiling: RuntimeMode): { modes: string[]; options: Record<string, string[]> };
   /** The agent's environment for Driver's runs. */
   env(): NodeJS.ProcessEnv;
+  /**
+   * Sessions open in an agent that runs 10 & 2's extension (Copilot's), by id: what it's doing, the questions it can
+   * take an answer to, and where it listens. Open sessions without it can't be reached.
+   */
+  live?(): Map<string, Reach>;
+  /** What to say about an open session the agent's extension isn't reaching, when there's something to do about it. */
+  reachHint?(): string | null;
 }
+
+/** An open session 10 & 2's extension reaches. */
+export type Reach = { status: "idle" | "busy" | "waiting"; questions: Question[]; socket: string };
 
 export type Options = {
   policy: Policy; source: Source; db: string; stateDir: string; log: (m: string) => void; now?: () => number;
@@ -81,10 +93,13 @@ export function shortTitle(text: string): string {
 /** The words as the agent's prompt gets them: one starting with "/" would be taken as a command, so a space keeps it words. */
 export const promptText = (message: string) => message.startsWith("/") ? ` ${message}` : message;
 
+/** A question as Driver reads it out: "Which one? Options: Alpha / Beta." */
+const questionText = (q: Question) => `${q.title}${q.options.length ? ` Options: ${q.options.join(" / ")}.` : ""}`;
+
 /** The narrower of two runtime modes. */
 const lower = (a: RuntimeMode, b: RuntimeMode): RuntimeMode => RUNTIME_MODES.indexOf(a) <= RUNTIME_MODES.indexOf(b) ? a : b;
 
-type Row = { found: Found; open: boolean; item: WorkItem };
+type Row = { found: Found; open: boolean; live: Reach | null; item: WorkItem };
 
 export class AcpAdapter implements Adapter {
   readonly name: string;
@@ -196,6 +211,7 @@ export class AcpAdapter implements Adapter {
     const cutoff = this.now() - (this.opts.days ?? 14) * 86_400_000;
     const found = this.source.sessions(cutoff, new Set(running.keys())).filter((f) => f.started && visible(policy, f.cwd));
     const open = this.source.open(found, new Set(running.values()));
+    const lives = this.source.live?.() ?? new Map<string, Reach>();
     const next = new Map<string, Row>();
     for (const f of found) {
       if (!policy[agent]) continue;
@@ -204,9 +220,11 @@ export class AcpAdapter implements Adapter {
       // Open where the agent says so, but not for what Driver's own last run wrote (a source that can only guess from
       // when a session was written would take that for a terminal's).
       const ranAt = this.remembered(f.id).ranAt;
-      const p = f.projection, isOpen = open.has(f.id) && !running.has(f.id) && !(ranAt !== null && f.mtimeMs <= ranAt + 3000);
-      const pending = isOpen && !!f.question;
-      const busy = running.has(f.id) || (isOpen && p.unanswered);
+      const live = running.has(f.id) ? null : lives.get(f.id) ?? null;
+      const p = f.projection, isOpen = !!live || (open.has(f.id) && !running.has(f.id) && !(ranAt !== null && f.mtimeMs <= ranAt + 3000));
+      const question = live?.questions[0] ? questionText(live.questions[0]) : f.question;
+      const pending = isOpen && !!question;
+      const busy = running.has(f.id) || (live ? live.status === "busy" : isOpen && p.unanswered);
       const updatedAt = [p.updatedAt, new Date(f.mtimeMs).toISOString()].filter((x): x is string => !!x).sort().at(-1)!;
       if (!isOpen && !running.has(f.id) && Date.parse(updatedAt) < cutoff) continue;
       const lastRunAt = p.lastRunAt;
@@ -217,10 +235,10 @@ export class AcpAdapter implements Adapter {
         status: pending ? "waiting" : busy ? "running" : p.status,
         updatedAt, settled: !!overlay.settledAt && !newer(overlay.settledAt),
         snoozedUntil: overlay.snoozedUntil && Date.parse(overlay.snoozedUntil) > this.now() && !pending && !newer(overlay.snoozedAt) ? overlay.snoozedUntil : null,
-        parentId: null, pendingQuestion: pending, questionId: pending ? hash(f.id + f.question).slice(0, 16) : null,
+        parentId: null, pendingQuestion: pending, questionId: pending ? hash(f.id + question).slice(0, 16) : null,
         lastRunAt, wroteAt: p.wroteAt, createdAt: f.createdAt,
       };
-      next.set(f.id, { found: f, open: isOpen, item });
+      next.set(f.id, { found: f, open: isOpen, live, item });
     }
     this.rows = next;
     this.roots.clear();
@@ -271,7 +289,7 @@ export class AcpAdapter implements Adapter {
   async report(id: string): Promise<Report> {
     this.fresh();
     const r = this.row(id), p = r.found.projection, last = p.replies[0] ?? null;
-    return { text: last?.text ?? "", progress: r.item.status === "running" ? p.progress : null, question: r.item.pendingQuestion ? r.found.question : null,
+    return { text: last?.text ?? "", progress: r.item.status === "running" ? p.progress : null, question: r.item.pendingQuestion ? (r.live?.questions[0] ? questionText(r.live.questions[0]) : r.found.question) : null,
       reply: last ? { runId: last.runId, messageId: last.messageId, at: last.at } : null };
   }
   async replies(id: string): Promise<PastReply[]> { this.fresh(); return this.row(id).found.projection.replies.map((r) => ({ ...r })); }
@@ -301,10 +319,16 @@ export class AcpAdapter implements Adapter {
     return null;
   }
   private followUpRefusal(id: string, row: Row): string | null {
-    const name = this.source.name;
+    const name = this.source.name, policy = this.opts.policy, agent = this.source.agent;
+    // Open where 10 & 2's extension reaches it: its question takes the answer; otherwise the words go in as typed.
+    if (row.live) {
+      if (row.live.questions.length) return answers(policy, agent) ? null : `It's waiting for an answer in ${name}, and this computer doesn't let 10 & 2 answer.`;
+      return steers(policy, agent) ? null : `It's open in ${name}, and this computer doesn't let 10 & 2 send to open sessions.`;
+    }
+    const hint = this.source.reachHint?.();
     if (row.open) return row.found.question
-      ? `It's waiting for your answer in ${name}. Answer it there: 10 & 2 can't yet.`
-      : `It's open in ${name}, and 10 & 2 can't send to a session that's open there yet. Close it there, or say it there.`;
+      ? `It's waiting for your answer in ${name}. Answer it there${hint ? `. ${hint}` : ": 10 & 2 can't reach it."}`
+      : `It's open in ${name}, where 10 & 2 can't reach it. Say it there, or close it${hint ? `. ${hint}` : "."}`;
     if (this.store.run(id)) return "10 & 2 is already running that session, or can't yet tell that its last run ended.";
     if (!existsSync(row.found.cwd)) return "That session's folder isn't on this computer anymore.";
     return null;
@@ -332,6 +356,10 @@ export class AcpAdapter implements Adapter {
       if (!receipt) return this.execute(action, key);
       this.scan(); return receipt;
     }
+    if (action.kind === "follow_up") {
+      const live = this.rows.get(action.itemId)?.live;
+      if (live) return this.tracked(this.reach(action, key, digest, live));
+    }
     // New work's session has no id until the agent makes one: its run is kept under one made from the key meanwhile.
     const id = action.kind === "start_work" ? `new-${hash(key).slice(0, 24)}` : action.itemId;
     if (this.store.run(id)) return { ok: false, error: "10 & 2 is already running that session." };
@@ -347,6 +375,25 @@ export class AcpAdapter implements Adapter {
   private async tracked(pending: Promise<Receipt>): Promise<Receipt> {
     this.writes.add(pending);
     try { return await pending; } finally { this.writes.delete(pending); }
+  }
+
+  /**
+   * Words to a session open where 10 & 2's extension reaches it: the answer to its question (the option the user named,
+   * else their words), or the words as if typed there (a busy one takes them into the turn running now). It counts as
+   * sent when the extension says the agent took them.
+   */
+  private async reach(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string, live: Reach): Promise<Receipt> {
+    if (!this.store.begin(key, digest)) return this.repeat(key, digest) ?? this.unknown();
+    const name = this.source.name, q = live.questions[0];
+    const request = q
+      ? { id: randomUUID(), type: "answer", questionId: q.questionId, value: answersFor([{ question: q.title, options: q.options, multiSelect: false }], action.message)[q.title]! }
+      : { id: randomUUID(), type: "user", text: action.message };
+    const r = await talk(live.socket, request, this.opts.acceptanceTimeoutMs ? Math.min(this.opts.acceptanceTimeoutMs, 10_000) : 10_000);
+    this.schedule();
+    if (r === "unreachable") return this.store.finish(key, { ok: false, error: `10 & 2 couldn't reach that session in ${name}. Is it still open?` });
+    if (r === "silent") return this.store.finish(key, { ok: false, unknown: true, error: `${name} didn't confirm that. 10 & 2 won't send it again.` });
+    if (r?.type === "ack") return this.store.finish(key, { ok: true });
+    return this.store.finish(key, { ok: false, error: q && r?.error === "answered" ? `That question was already answered in ${name}.` : `${name} didn't take that.` });
   }
 
   /** What a turn runs with: a new session's profile; a follow-up, what Driver started it with, else what it has, lowered to the ceiling. */

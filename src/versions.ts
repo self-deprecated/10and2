@@ -33,9 +33,10 @@ export const MINIMUM: Record<Agent, Partial<Record<Feature, string>>> = {
   // (through 10and2's plugin) show there from 1.14.49; before it they reach the model but never the terminal.
   opencode: { read: "1.14.34", follow_up: "1.14.49", steer: "1.14.49", answer: "1.14.49", continue: "1.14.34", start: "1.14.34", start_worktree: "1.14.34" },
   // Measured on one release each so far (docs/launch/more-agents.md): Gemini CLI 0.68.0, whose ACP mode loads, lists
-  // modes and models and refuses YOLO in an untrusted folder, and Copilot CLI 1.0.112. Older ones aren't measured yet.
+  // modes and models and refuses YOLO in an untrusted folder, and Copilot CLI 1.0.112, whose extensions (joinSession,
+  // send's "immediate", handlePendingElicitation) reach an open session. Older ones aren't measured yet.
   gemini: { read: "0.68.0", follow_up: "0.68.0", continue: "0.68.0", start: "0.68.0", start_worktree: "0.68.0" },
-  copilot: { read: "1.0.112", follow_up: "1.0.112", continue: "1.0.112", start: "1.0.112", start_worktree: "1.0.112" },
+  copilot: { read: "1.0.112", follow_up: "1.0.112", steer: "1.0.112", answer: "1.0.112", continue: "1.0.112", start: "1.0.112", start_worktree: "1.0.112" },
   // Cursor's CLI agent names its releases by date. Its chats' meta.json (with the folder) and transcripts are laid out
   // as read here from 2026.08.11 (read in each release's own code); the rest was measured on 2026.11.19 only.
   cursor: { read: "2026.08.11", follow_up: "2026.11.19", continue: "2026.11.19", start: "2026.11.19", start_worktree: "2026.11.19" },
