@@ -2,7 +2,7 @@
 // (docs/launch/mockups/connector-setup). What's chosen becomes the policy's `actions`, `steer`, `answer`,
 // `maxRuntimeMode` and `agents`; this file turns one into the other, and parses the flags for doing it without a terminal.
 import type { ActionKind } from "./contract.ts";
-import { AGENTS, GUARD_MAX, RULES, RUNTIME_MODES, type Agent, type Rules, type RuntimeMode } from "./policy.ts";
+import { AGENTS, DOCUMENT_MODES, GUARD_MAX, RULES, RUNTIME_MODES, type Agent, type DocumentAccess, type Rules, type RuntimeMode } from "./policy.ts";
 import { describeFound, NAMES, ORDER, type Found } from "./agents.ts";
 import { ask, checklist, cmd, type Row } from "./ui.ts";
 import { versionAtLeast } from "./claude/registry.ts";
@@ -23,6 +23,8 @@ export const CAP_SHORT: Record<Cap, string> = { follow_up: "follow up", steer: "
 export const CEILING_LABEL: Record<RuntimeMode, string> = { "approval-required": "ask first", "auto-accept-edits": "accept edits", auto: "auto", "full-access": "full access" };
 /** What sends and starts set up for later may do here (the policy's `rules`, docs/launch/engine.md §5), as read. */
 export const RULES_LABEL: Record<Rules, string> = { off: "nothing", send: "send messages", start: "send messages and start threads" };
+/** Whether linked prose documents may be read from this computer (`policy.documents`), as read. */
+export const DOCUMENTS_LABEL: Record<DocumentAccess, string> = { off: "off", project: "project folders", all: "project and plan folders" };
 
 export type Choice = {
   on: Record<Agent, boolean>;
@@ -32,6 +34,8 @@ export type Choice = {
   off: Partial<Record<Agent, Cap[]>>;
   /** What a send or start set up for later may do when this computer runs it: `send` until its owner chooses. */
   rules: Rules;
+  /** Whether prose documents linked by agents may be read (`off` until its owner chooses). */
+  documents: DocumentAccess;
 };
 
 const TIDY: ActionKind[] = ["settle", "snooze", "archive"];
@@ -63,16 +67,17 @@ export function choiceOf(raw: any): Choice {
     caps: { follow_up: actions.includes("follow_up"), steer: raw?.steer !== false, answer: raw?.answer !== false, start_work: actions.includes("start_work"), tidy: TIDY.some((t) => actions.includes(t)) },
     ceiling: RUNTIME_MODES.includes(raw?.maxRuntimeMode) ? raw.maxRuntimeMode : "approval-required",
     rules: RULES.includes(raw?.rules) ? raw.rules : "send",
+    documents: DOCUMENT_MODES.includes(raw?.documents) ? raw.documents : "off",
   };
 }
 
 /**
  * Everything allowed, every agent found on: what setup offers first, and what applies off a terminal. Threads started
- * later are the one thing not offered on: messages for later are, and starting threads later is turned on here by hand.
+ * later and linked documents are not offered on: messages for later are, and the others are turned on here by hand.
  */
 export function defaultChoice(found: Found[]): Choice {
   const on = Object.fromEntries(AGENTS.map((a) => [a, found.find((f) => f.agent === a)?.installed ?? false])) as Record<Agent, boolean>;
-  return { on, off: {}, caps: { follow_up: true, steer: true, answer: true, start_work: true, tidy: true }, ceiling: "full-access", rules: "send" };
+  return { on, off: {}, caps: { follow_up: true, steer: true, answer: true, start_work: true, tidy: true }, ceiling: "full-access", rules: "send", documents: "off" };
 }
 
 /**
@@ -103,7 +108,11 @@ export function policyFields(c: Choice): Record<string, unknown> {
     }
     agents[a] = narrowed;
   }
-  return { actions: actionsOf(c.caps), steer: c.caps.steer, answer: c.caps.answer, maxRuntimeMode: c.ceiling, agents, ...(c.rules !== "send" ? { rules: c.rules } : {}) };
+  return {
+    actions: actionsOf(c.caps), steer: c.caps.steer, answer: c.caps.answer, maxRuntimeMode: c.ceiling, agents,
+    ...(c.rules !== "send" ? { rules: c.rules } : {}),
+    ...(c.documents !== "off" ? { documents: c.documents } : {}),
+  };
 }
 
 /** Writes a choice over an existing policy object (brain, projects, worktreeBase stay). */
@@ -111,6 +120,7 @@ export function applyChoice(policy: Record<string, unknown>, c: Choice): Record<
   const out = { ...policy };
   for (const a of AGENTS) delete out[a];
   delete out.rules;
+  delete out.documents;
   return { ...out, ...policyFields(c) };
 }
 
@@ -134,6 +144,7 @@ export function summary(c: Choice, found: Found[]): string[] {
   const starts = c.rules === "start" && c.caps.start_work;
   if (c.caps.follow_up && c.rules !== "off") lines.push(`What you set up for later in a call, it ${starts ? "sends or starts" : "sends"} at its time, from this computer.`);
   else if (starts) lines.push("New work you set up for later in a call, it starts at its time, from this computer.");
+  if (c.documents !== "off") lines.push(`Linked documents: ${DOCUMENTS_LABEL[c.documents]}.`);
   return lines;
 }
 
@@ -148,7 +159,7 @@ export function applyFlags(c: Choice, flags: Map<string, string>, found: Found[]
     if (!AGENTS.includes(s as Agent)) throw new Error(`There's no agent called "${s}" (${AGENTS.join(", ")}).`);
     return s as Agent;
   });
-  const out: Choice = { on: { ...c.on }, caps: { ...c.caps }, ceiling: c.ceiling, off: Object.fromEntries(Object.entries(c.off).map(([k, v]) => [k, [...v!]])), rules: c.rules };
+  const out: Choice = { on: { ...c.on }, caps: { ...c.caps }, ceiling: c.ceiling, off: Object.fromEntries(Object.entries(c.off).map(([k, v]) => [k, [...v!]])), rules: c.rules, documents: c.documents };
   if (flags.has("agents")) {
     const only = names(flags.get("agents")!);
     const missing = only.filter((a) => !found.find((f) => f.agent === a)?.installed).map((a) => NAMES[a]);
@@ -163,6 +174,11 @@ export function applyFlags(c: Choice, flags: Map<string, string>, found: Found[]
     if (!RULES.includes(v as Rules)) throw new Error(`--later takes ${RULES.join(", ")}.`);
     out.rules = v as Rules;
   }
+  if (flags.has("documents")) {
+    const v = flags.get("documents")!;
+    if (!DOCUMENT_MODES.includes(v as DocumentAccess)) throw new Error(`--documents takes ${DOCUMENT_MODES.join(", ")}.`);
+    out.documents = v as DocumentAccess;
+  }
   for (const [flag, cap] of [["no-steer", "steer"], ["no-answer", "answer"], ["no-start", "start_work"], ["no-follow-up", "follow_up"], ["no-tidy", "tidy"]] as const) {
     if (!flags.has(flag)) continue;
     const v = flags.get(flag)!;
@@ -174,7 +190,7 @@ export function applyFlags(c: Choice, flags: Map<string, string>, found: Found[]
 
 /** The two screens (agents, then what Driver may do), with → on an agent for its own narrowing. */
 export async function chooseInteractively(found: Found[], start: Choice): Promise<Choice> {
-  const c: Choice = { ...start, on: { ...start.on }, caps: { ...start.caps }, off: { ...start.off }, rules: start.rules };
+  const c: Choice = { ...start, on: { ...start.on }, caps: { ...start.caps }, off: { ...start.off }, rules: start.rules, documents: start.documents };
   for (;;) {
     const rows: Row[] = ORDER.map((a) => {
       const f = found.find((x) => x.agent === a)!;
@@ -195,12 +211,14 @@ export async function chooseInteractively(found: Found[], start: Choice): Promis
     ...CAPS.map((cap): Row => ({ kind: "box", label: CAP_LABEL[cap], detail: CAP_DETAIL[cap] ?? "", on: c.caps[cap] })),
     { kind: "choice", label: "New work may run with", options: RUNTIME_MODES.map((m) => CEILING_LABEL[m]), index: RUNTIME_MODES.indexOf(c.ceiling) },
     { kind: "choice", label: "Set up for later, it may", options: RULES.map((r) => RULES_LABEL[r]), index: RULES.indexOf(c.rules) },
+    { kind: "choice", label: "Linked documents", options: DOCUMENT_MODES.map((d) => DOCUMENTS_LABEL[d]), index: DOCUMENT_MODES.indexOf(c.documents) },
   ];
   const got = await checklist("What 10 & 2 may do (each only after you hear it read back and say yes)", rows, "space switch · ←→ change · enter continue · q quit");
   CAPS.forEach((cap, i) => { const r = got.rows[i]!; if (r.kind === "box") c.caps[cap] = r.on; });
-  const ceiling = got.rows.at(-2)!, later = got.rows.at(-1)!;
+  const ceiling = got.rows.at(-3)!, later = got.rows.at(-2)!, docs = got.rows.at(-1)!;
   if (ceiling.kind === "choice") c.ceiling = RUNTIME_MODES[ceiling.index]!;
   if (later.kind === "choice") c.rules = RULES[later.index]!;
+  if (docs.kind === "choice") c.documents = DOCUMENT_MODES[docs.index]!;
   return c;
 }
 

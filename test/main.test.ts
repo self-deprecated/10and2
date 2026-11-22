@@ -211,11 +211,18 @@ test("status says what this computer may do for later, and lists what it holds, 
   const hm = `${String(at.getUTCHours()).padStart(2, "0")}:${String(at.getUTCMinutes()).padStart(2, "0")}`;
   assert.match(r.stdout, /For later +send messages and start threads/);
   assert.ok(r.stdout.includes(`Holding 2 for later: ${hm}${at.getUTCDate() === new Date().getUTCDate() ? "" : " tomorrow"} Send “carry on” to API; Sending “rebase” to API when Schema finishes`), r.stdout);
-  writeFileSync(join(config, "connector.json"), JSON.stringify({ brain: "ws://127.0.0.1:9/connector", projects: "*", actions: ["follow_up"], t3: false, claude: true, rules: "start" }));
+  writeFileSync(join(config, "connector.json"), JSON.stringify({ brain: "ws://127.0.0.1:9/connector", projects: "*", actions: ["follow_up"], t3: false, claude: true, rules: "start", documents: "all" }));
   writeFileSync(join(state, "status.json"), JSON.stringify({ pid: process.pid, linked: true, since: new Date().toISOString(), schedules: [] }));
   const narrowed = spawnSync(process.execPath, [main, "status"], { env, encoding: "utf8", timeout: 10_000 * SLOW });
   assert.match(narrowed.stdout, /For later +send messages\n/, "starting threads later needs new work allowed too");
+  assert.match(narrowed.stdout, /Documents +project and plan folders\n/);
   assert.doesNotMatch(narrowed.stdout, /Holding/);
+
+  const changed = spawnSync(process.execPath, [main, "agents", "--yes", "--documents=project"], { env, encoding: "utf8", timeout: 10_000 * SLOW });
+  assert.equal(changed.status, 0, changed.stderr);
+  assert.equal(JSON.parse(readFileSync(join(config, "connector.json"), "utf8")).documents, "project");
+  const after = spawnSync(process.execPath, [main, "status"], { env, encoding: "utf8", timeout: 10_000 * SLOW });
+  assert.match(after.stdout, /Documents +project folders\n/);
 });
 
 /** A computer of the test's own: nothing of this one's agents, settings or login services is read or changed. */

@@ -266,3 +266,19 @@ test("sends and starts for later: send until chosen, written only when chosen, a
   assert.equal(summary(defaultChoice(all), all).at(-1), "What you set up for later in a call, it sends at its time, from this computer.");
   assert.ok(!summary({ ...defaultChoice(all), rules: "off" }, all).some((l) => l.includes("later")));
 });
+
+test("linked documents: off until chosen, written only when chosen, and --documents chooses without a terminal", () => {
+  const all = found({ claude: true });
+  assert.equal(defaultChoice(all).documents, "off", "linked documents are opt-in, off by default");
+  assert.equal(policyFields(defaultChoice(all)).documents, undefined, "a file stays without documents until opted in");
+  assert.equal(parsePolicy(JSON.stringify({ ...base })).documents, "off");
+  const docsAll = applyFlags(defaultChoice(all), flags({ documents: "all" }), all);
+  const written = applyChoice({ ...base }, docsAll);
+  assert.equal(written.documents, "all");
+  assert.equal(choiceOf(written).documents, "all");
+  assert.equal(parsePolicy(JSON.stringify(written)).documents, "all");
+  assert.equal(applyChoice(written, defaultChoice(all)).documents, undefined, "back to off: the field goes");
+  assert.throws(() => applyFlags(defaultChoice(all), flags({ documents: "yes" }), all), /--documents takes off, project, all/);
+  assert.equal(summary(docsAll, all).at(-1), "Linked documents: project and plan folders.");
+  assert.ok(!summary(defaultChoice(all), all).some((l) => l.includes("Linked documents")));
+});

@@ -29,7 +29,7 @@ in
       ln -s $sourceRoot/brain brain
     '';
     nodejs = nodejs_24;
-    npmDepsHash = "sha256-p5+zYskyQQhrIpjVEJ/tDz0qedWU5vm36WjxmI+RM6U=";
+    npmDepsHash = "sha256-g5jpHZ1g7PaF9Da3RYN4d1pEP43HnCSWeJJ12oyE5Bk=";
     # The same bundled files npm publishes (`npm run build`): no TypeScript or node_modules at runtime.
     installPhase = ''
       runHook preInstall

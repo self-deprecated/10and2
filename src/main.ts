@@ -14,11 +14,11 @@ import { Local } from "./local.ts";
 import { Expired, linkUrl, originOf, pair } from "./pair.ts";
 import { configDirectory, databasePath, hookSocket, stateDirectory } from "./paths.ts";
 import { addMachine, brainDb, brainEnvPath, brainOrigin, brainPort, DEFAULT_PORT, machines, readBrainEnv, removeMachine, validName, writeBrainEnv } from "./brain.ts";
-import { AGENTS, type Agent, defaultPolicyPath, DOCUMENT_MODES, type DocumentAccess, loadPolicy, parsePolicy, readGuard, readSettings, rulesOf, validBase, visible } from "./policy.ts";
+import { AGENTS, type Agent, defaultPolicyPath, loadPolicy, parsePolicy, readGuard, readSettings, rulesOf, validBase, visible } from "./policy.ts";
 import type { HeldSummary } from "./gate.ts";
 import { describeFound, detect, NAMES, ORDER, type Found } from "./agents.ts";
 import { versionWarning } from "./versions.ts";
-import { applyChoice, applyFlags, capsFor, CAP_SHORT, CEILING_LABEL, chooseInteractively, chooseWaiting, choiceOf, openSessionsNote, RULES_LABEL, startingChoice, summary, WAIT_WORDS, waitKinds, type Choice } from "./choose.ts";
+import { applyChoice, applyFlags, capsFor, CAP_SHORT, CEILING_LABEL, chooseInteractively, chooseWaiting, choiceOf, DOCUMENTS_LABEL, openSessionsNote, RULES_LABEL, startingChoice, summary, WAIT_WORDS, waitKinds, type Choice } from "./choose.ts";
 import { VERSION } from "./protocol.ts";
 import { proxyAdvice, useSystemNetwork } from "./net.ts";
 import { BRAIN, checkout, CONNECTOR, connectorRunning, launchFor, Service, temporary, type ServiceState } from "./service.ts";
@@ -101,7 +101,7 @@ const account = (origin: string, secret?: string) => !paired(origin, secret) ? `
 const wantsHelp = command !== "hook" && (flags.has("help") || argv.includes("-h"));
 
 /** The flags that choose agents and permissions without a terminal (choose.ts `applyFlags`). */
-const CHOOSING = ["agents", "off", "no-steer", "no-answer", "no-start", "no-follow-up", "no-tidy", "read-only", "later"];
+const CHOOSING = ["agents", "off", "no-steer", "no-answer", "no-start", "no-follow-up", "no-tidy", "read-only", "later", "documents"];
 /** What each command takes after its name: at most how many words, and which flags. */
 const TAKES: Record<string, { words: number; flags: string[] }> = {
   setup: { words: 0, flags: ["brain", "token", "name", "worktree-base", "yes", "no-autostart", ...CHOOSING] },
@@ -305,8 +305,6 @@ function warnOld(found: Found[]) {
 async function policyFor(origin: string, existing: any, choice: Choice) {
   const policy: any = applyChoice(existing ? { ...existing, brain: linkUrl(origin) } : { brain: linkUrl(origin), projects: "*" }, choice);
   if (choice.on.t3 && policy.worktreeBase === undefined) policy.worktreeBase = await worktreeBase();
-  const docs = await documentAccess(policy.documents);
-  if (docs !== "off" || flags.has("documents") || policy.documents !== undefined) policy.documents = docs;
   parsePolicy(JSON.stringify(policy));
   return policy;
 }
@@ -332,18 +330,6 @@ function withWaiting(policy: any, guard: string[] | undefined) {
   return out;
 }
 
-/** Opt-in linked-document reading: `--documents=off|project|all`, or asked at a terminal (off by default). */
-async function documentAccess(existing: unknown): Promise<DocumentAccess> {
-  if (flags.has("documents")) {
-    const v = flags.get("documents")!;
-    if (!DOCUMENT_MODES.includes(v as DocumentAccess)) throw new Error(`"${v}" isn't valid for --documents (use ${DOCUMENT_MODES.join(", ")}).`);
-    return v as DocumentAccess;
-  }
-  if (existing !== undefined && existing !== false && DOCUMENT_MODES.includes(existing as DocumentAccess)) return existing as DocumentAccess;
-  if (flags.has("yes") || !process.stdin.isTTY || !process.stdout.isTTY) return "off";
-  if (!await confirm("Let 10 & 2 read prose documents your agents link (plans, design docs)?", false)) return "off";
-  return await confirm("Include coding apps' own plan folders outside your projects (e.g. ~/.claude/plans, T3 artifacts)?", true) ? "all" : "project";
-}
 /** A branch fetched from origin by default: a checkout left on older work would otherwise start every new thread stale. */
 async function worktreeBase() {
   const wanted = flags.get("worktree-base") ?? (flags.has("yes") ? "main"
@@ -389,9 +375,6 @@ function canDo(policy: any, choice: Choice, found: Found[]) {
   for (const line of summary(choice, found)) say(`  ${line}`);
   if (policy.projects !== "*") say(`  It sees ${seesText(policy)}.`);
   if (choice.on.t3 && choice.caps.start_work) say(`  New T3 Code worktrees start from ${baseText(policy.worktreeBase ?? "HEAD")}.`);
-  if (policy.documents && policy.documents !== "off") {
-    say(`  Linked documents: ${policy.documents === "all" ? "project and coding-app plan folders" : "project folders only"}.`);
-  }
   if (choice.caps.steer && AGENTS.some((a) => choice.on[a] && a !== "t3")) say(`  ${dim("Messages reach a session open in a terminal between its steps, or as its next turn.")}`);
   say(`  ${dim(`${cmd("10and2 agents")} changes this.`)}`);
 }
@@ -406,10 +389,6 @@ async function agentsCommand() {
   const { found, choice } = await chooseAgents("10and2 agents", raw);
   const next: any = withWaiting(applyChoice(raw, choice), await waitingFor(raw, choice, found));
   if (choice.on.t3 && next.worktreeBase === undefined) next.worktreeBase = await worktreeBase();
-  if (flags.has("documents") || next.documents === undefined) {
-    const docs = await documentAccess(next.documents);
-    if (docs !== "off" || flags.has("documents") || next.documents !== undefined) next.documents = docs;
-  }
   parsePolicy(JSON.stringify(next));
   writePrivate(defaultPolicyPath(), JSON.stringify(next, null, 2) + "\n");
   ok(`Saved ${dim(`· ${defaultPolicyPath()}`)}`);
@@ -779,6 +758,7 @@ async function status() {
   // What a send or start set up for later may do here, as far as the actions allow it too.
   const rules = !policy.actions.includes("follow_up") ? "off" : rulesOf(policy) === "start" && !policy.actions.includes("start_work") ? "send" : rulesOf(policy);
   note(`For later    ${RULES_LABEL[rules]}`);
+  note(`Documents    ${DOCUMENTS_LABEL[policy.documents ?? "off"]}`);
   const later: { at: string | null; said: string }[] = Array.isArray(st?.schedules) ? st.schedules : [];
   if (later.length) note(`Holding ${later.length} for later: ${later.map(heldText).join("; ")}`);
   if (policy.claude) {

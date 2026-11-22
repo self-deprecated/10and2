@@ -661,7 +661,7 @@ test("the gate's entry names this computer's settings, so a session with another
   const h = harness(t), root = mkdtempSync(join(tmpdir(), "gate-")), file = join(root, "it's here", "connector.json");
   mkdirSync(join(root, "it's here"));
   writeFileSync(file, JSON.stringify({ brain: "wss://brain.example/connector", guard: ["terraform apply*"] }));
-  await installHooks(h.config, `${process.execPath} ${join(import.meta.dirname, "..", "src", "hook.ts")}`, true, file);
+  await installHooks(h.config, `${process.execPath} ${join(import.meta.dirname, "..", "src", "hook.ts")}`, true, file, ipcPath(root, "absent.sock"));
   const entry = JSON.parse(readFileSync(join(h.config, "settings.json"), "utf8")).hooks.PreToolUse.at(-1).hooks[0].command as string;
   // A session started where the config and runtime dirs are elsewhere (an IDE, a direnv or Nix shell, T3 Code).
   const elsewhere = mkdtempSync(join(tmpdir(), "gate-elsewhere-"));
