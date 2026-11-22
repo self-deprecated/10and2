@@ -34,8 +34,6 @@ export type Choice = {
   off: Partial<Record<Agent, Cap[]>>;
   /** What a send or start set up for later may do when this computer runs it: `send` until its owner chooses. */
   rules: Rules;
-  /** Whether prose documents linked by agents may be read (`off` until its owner chooses). */
-  documents: DocumentAccess;
 };
 
 const TIDY: ActionKind[] = ["settle", "snooze", "archive"];
@@ -67,17 +65,16 @@ export function choiceOf(raw: any): Choice {
     caps: { follow_up: actions.includes("follow_up"), steer: raw?.steer !== false, answer: raw?.answer !== false, start_work: actions.includes("start_work"), tidy: TIDY.some((t) => actions.includes(t)) },
     ceiling: RUNTIME_MODES.includes(raw?.maxRuntimeMode) ? raw.maxRuntimeMode : "approval-required",
     rules: RULES.includes(raw?.rules) ? raw.rules : "send",
-    documents: DOCUMENT_MODES.includes(raw?.documents) ? raw.documents : "off",
   };
 }
 
 /**
  * Everything allowed, every agent found on: what setup offers first, and what applies off a terminal. Threads started
- * later and linked documents are not offered on: messages for later are, and the others are turned on here by hand.
+ * later are the one thing not offered on: messages for later are, and starting threads later is turned on here by hand.
  */
 export function defaultChoice(found: Found[]): Choice {
   const on = Object.fromEntries(AGENTS.map((a) => [a, found.find((f) => f.agent === a)?.installed ?? false])) as Record<Agent, boolean>;
-  return { on, off: {}, caps: { follow_up: true, steer: true, answer: true, start_work: true, tidy: true }, ceiling: "full-access", rules: "send", documents: "off" };
+  return { on, off: {}, caps: { follow_up: true, steer: true, answer: true, start_work: true, tidy: true }, ceiling: "full-access", rules: "send" };
 }
 
 /**
@@ -108,19 +105,14 @@ export function policyFields(c: Choice): Record<string, unknown> {
     }
     agents[a] = narrowed;
   }
-  return {
-    actions: actionsOf(c.caps), steer: c.caps.steer, answer: c.caps.answer, maxRuntimeMode: c.ceiling, agents,
-    ...(c.rules !== "send" ? { rules: c.rules } : {}),
-    ...(c.documents !== "off" ? { documents: c.documents } : {}),
-  };
+  return { actions: actionsOf(c.caps), steer: c.caps.steer, answer: c.caps.answer, maxRuntimeMode: c.ceiling, agents, ...(c.rules !== "send" ? { rules: c.rules } : {}) };
 }
 
-/** Writes a choice over an existing policy object (brain, projects, worktreeBase stay). */
+/** Writes a choice over an existing policy object (brain, projects, worktreeBase, documents stay). */
 export function applyChoice(policy: Record<string, unknown>, c: Choice): Record<string, unknown> {
   const out = { ...policy };
   for (const a of AGENTS) delete out[a];
   delete out.rules;
-  delete out.documents;
   return { ...out, ...policyFields(c) };
 }
 
@@ -144,7 +136,6 @@ export function summary(c: Choice, found: Found[]): string[] {
   const starts = c.rules === "start" && c.caps.start_work;
   if (c.caps.follow_up && c.rules !== "off") lines.push(`What you set up for later in a call, it ${starts ? "sends or starts" : "sends"} at its time, from this computer.`);
   else if (starts) lines.push("New work you set up for later in a call, it starts at its time, from this computer.");
-  if (c.documents !== "off") lines.push(`Linked documents: ${DOCUMENTS_LABEL[c.documents]}.`);
   return lines;
 }
 
@@ -159,7 +150,7 @@ export function applyFlags(c: Choice, flags: Map<string, string>, found: Found[]
     if (!AGENTS.includes(s as Agent)) throw new Error(`There's no agent called "${s}" (${AGENTS.join(", ")}).`);
     return s as Agent;
   });
-  const out: Choice = { on: { ...c.on }, caps: { ...c.caps }, ceiling: c.ceiling, off: Object.fromEntries(Object.entries(c.off).map(([k, v]) => [k, [...v!]])), rules: c.rules, documents: c.documents };
+  const out: Choice = { on: { ...c.on }, caps: { ...c.caps }, ceiling: c.ceiling, off: Object.fromEntries(Object.entries(c.off).map(([k, v]) => [k, [...v!]])), rules: c.rules };
   if (flags.has("agents")) {
     const only = names(flags.get("agents")!);
     const missing = only.filter((a) => !found.find((f) => f.agent === a)?.installed).map((a) => NAMES[a]);
@@ -174,11 +165,6 @@ export function applyFlags(c: Choice, flags: Map<string, string>, found: Found[]
     if (!RULES.includes(v as Rules)) throw new Error(`--later takes ${RULES.join(", ")}.`);
     out.rules = v as Rules;
   }
-  if (flags.has("documents")) {
-    const v = flags.get("documents")!;
-    if (!DOCUMENT_MODES.includes(v as DocumentAccess)) throw new Error(`--documents takes ${DOCUMENT_MODES.join(", ")}.`);
-    out.documents = v as DocumentAccess;
-  }
   for (const [flag, cap] of [["no-steer", "steer"], ["no-answer", "answer"], ["no-start", "start_work"], ["no-follow-up", "follow_up"], ["no-tidy", "tidy"]] as const) {
     if (!flags.has(flag)) continue;
     const v = flags.get(flag)!;
@@ -190,7 +176,7 @@ export function applyFlags(c: Choice, flags: Map<string, string>, found: Found[]
 
 /** The two screens (agents, then what Driver may do), with → on an agent for its own narrowing. */
 export async function chooseInteractively(found: Found[], start: Choice): Promise<Choice> {
-  const c: Choice = { ...start, on: { ...start.on }, caps: { ...start.caps }, off: { ...start.off }, rules: start.rules, documents: start.documents };
+  const c: Choice = { ...start, on: { ...start.on }, caps: { ...start.caps }, off: { ...start.off }, rules: start.rules };
   for (;;) {
     const rows: Row[] = ORDER.map((a) => {
       const f = found.find((x) => x.agent === a)!;
@@ -211,14 +197,12 @@ export async function chooseInteractively(found: Found[], start: Choice): Promis
     ...CAPS.map((cap): Row => ({ kind: "box", label: CAP_LABEL[cap], detail: CAP_DETAIL[cap] ?? "", on: c.caps[cap] })),
     { kind: "choice", label: "New work may run with", options: RUNTIME_MODES.map((m) => CEILING_LABEL[m]), index: RUNTIME_MODES.indexOf(c.ceiling) },
     { kind: "choice", label: "Set up for later, it may", options: RULES.map((r) => RULES_LABEL[r]), index: RULES.indexOf(c.rules) },
-    { kind: "choice", label: "Linked documents", options: DOCUMENT_MODES.map((d) => DOCUMENTS_LABEL[d]), index: DOCUMENT_MODES.indexOf(c.documents) },
   ];
   const got = await checklist("What 10 & 2 may do (each only after you hear it read back and say yes)", rows, "space switch · ←→ change · enter continue · q quit");
   CAPS.forEach((cap, i) => { const r = got.rows[i]!; if (r.kind === "box") c.caps[cap] = r.on; });
-  const ceiling = got.rows.at(-3)!, later = got.rows.at(-2)!, docs = got.rows.at(-1)!;
+  const ceiling = got.rows.at(-2)!, later = got.rows.at(-1)!;
   if (ceiling.kind === "choice") c.ceiling = RUNTIME_MODES[ceiling.index]!;
   if (later.kind === "choice") c.rules = RULES[later.index]!;
-  if (docs.kind === "choice") c.documents = DOCUMENT_MODES[docs.index]!;
   return c;
 }
 
@@ -350,4 +334,33 @@ export async function chooseWaiting(current: readonly string[] | null, agents: R
     // Too many to keep: said, and asked again, with nothing saved meanwhile.
     io.say(`  ${tooMany}`);
   }
+}
+
+/** The words the Linked documents screen shows in `10and2 setup` and `10and2 agents`. */
+export const DOCS_WORDS = {
+  heading: "Linked documents",
+  intro: 'Coding agents often finish with "I wrote the plan to plan.md" or link a design doc. Turn this on so 10 & 2 can offer to read those docs aloud and answer questions about them while you drive — e.g. "Read the plan" or "What does the rollout section say?".',
+  privacy: "Only markdown and text files linked by a reply are read, redacted before leaving this computer; code and .env files are never sent.",
+  project: { label: "Read linked documents in your projects", detail: "markdown & text files inside visible projects and worktrees" },
+  plans: { label: "Include coding apps' plan folders", detail: "e.g. ~/.claude/plans, T3 artifacts, Copilot session plans (needs the first on)" },
+} as const;
+
+/**
+ * The Linked documents screen, at a terminal (`10and2 setup` and `10and2 agents`): explains the feature with an
+ * example and offers two toggles. `current` null (never chosen yet): both start ticked so pressing Enter opts in,
+ * while unticking the first turns it off (`"off"`). Headless / `--yes` never runs this and stays `"off"`.
+ */
+export async function chooseDocuments(
+  current: DocumentAccess | null,
+  io: { checklist: typeof checklist; say: (s: string) => void } = { checklist, say: (s) => console.log(s) },
+): Promise<DocumentAccess> {
+  const rows: Row[] = [
+    { kind: "box", label: DOCS_WORDS.project.label, detail: DOCS_WORDS.project.detail, on: current === null ? true : current !== "off" },
+    { kind: "box", label: DOCS_WORDS.plans.label, detail: DOCS_WORDS.plans.detail, on: current === null ? true : current === "all" },
+  ];
+  io.say(`\n  ${DOCS_WORDS.heading}`);
+  const got = await io.checklist(DOCS_WORDS.intro, rows, `space switch · enter continue · q quit · ${DOCS_WORDS.privacy}`);
+  const project = got.rows[0]!.kind === "box" && got.rows[0]!.on;
+  const plans = got.rows[1]!.kind === "box" && got.rows[1]!.on;
+  return !project ? "off" : plans ? "all" : "project";
 }

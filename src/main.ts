@@ -14,11 +14,11 @@ import { Local } from "./local.ts";
 import { Expired, linkUrl, originOf, pair } from "./pair.ts";
 import { configDirectory, databasePath, hookSocket, stateDirectory } from "./paths.ts";
 import { addMachine, brainDb, brainEnvPath, brainOrigin, brainPort, DEFAULT_PORT, machines, readBrainEnv, removeMachine, validName, writeBrainEnv } from "./brain.ts";
-import { AGENTS, type Agent, defaultPolicyPath, loadPolicy, parsePolicy, readGuard, readSettings, rulesOf, validBase, visible } from "./policy.ts";
+import { AGENTS, type Agent, defaultPolicyPath, DOCUMENT_MODES, type DocumentAccess, loadPolicy, parsePolicy, readGuard, readSettings, rulesOf, validBase, visible } from "./policy.ts";
 import type { HeldSummary } from "./gate.ts";
 import { describeFound, detect, NAMES, ORDER, type Found } from "./agents.ts";
 import { versionWarning } from "./versions.ts";
-import { applyChoice, applyFlags, capsFor, CAP_SHORT, CEILING_LABEL, chooseInteractively, chooseWaiting, choiceOf, DOCUMENTS_LABEL, openSessionsNote, RULES_LABEL, startingChoice, summary, WAIT_WORDS, waitKinds, type Choice } from "./choose.ts";
+import { applyChoice, applyFlags, capsFor, CAP_SHORT, CEILING_LABEL, chooseDocuments, chooseInteractively, chooseWaiting, choiceOf, DOCUMENTS_LABEL, openSessionsNote, RULES_LABEL, startingChoice, summary, WAIT_WORDS, waitKinds, type Choice } from "./choose.ts";
 import { VERSION } from "./protocol.ts";
 import { proxyAdvice, useSystemNetwork } from "./net.ts";
 import { BRAIN, checkout, CONNECTOR, connectorRunning, launchFor, Service, temporary, type ServiceState } from "./service.ts";
@@ -238,7 +238,7 @@ async function setup() {
   const proxy = proxyAdvice();
   if (proxy) warn(proxy);
   const { found, choice } = await chooseAgents("10and2 setup", existing);
-  const policy = withWaiting(await policyFor(origin, existing, choice), await waitingFor(existing, choice, found));
+  const policy = withDocuments(withWaiting(await policyFor(origin, existing, choice), await waitingFor(existing, choice, found)), await documentsFor(existing));
   const name = await machineName();
   if (byToken && !validName(name)) throw new Error(`Your brain can't call it "${name}": start with a letter or digit (${cmd("--name=")}).`);
   say();
@@ -330,6 +330,26 @@ function withWaiting(policy: any, guard: string[] | undefined) {
   return out;
 }
 
+/**
+ * Linked documents: opt-in reading of prose docs linked by agent replies (plans, design docs). Asked on its own
+ * screen at a terminal in `setup` and `agents` (with an explanation and example); off unless chosen or passed via `--documents`.
+ */
+async function documentsFor(raw: any): Promise<DocumentAccess | undefined> {
+  if (flags.has("documents")) {
+    const v = flags.get("documents")!;
+    if (!DOCUMENT_MODES.includes(v as DocumentAccess)) throw new Error(`--documents takes ${DOCUMENT_MODES.join(", ")}.`);
+    return v as DocumentAccess;
+  }
+  const current: DocumentAccess | null = DOCUMENT_MODES.includes(raw?.documents) ? raw.documents : null;
+  if (flags.has("yes") || !process.stdin.isTTY || !process.stdout.isTTY) return current ?? undefined;
+  return chooseDocuments(current);
+}
+function withDocuments(policy: any, documents: DocumentAccess | undefined) {
+  const out = { ...policy };
+  if (documents !== undefined) out.documents = documents; else delete out.documents;
+  return out;
+}
+
 /** A branch fetched from origin by default: a checkout left on older work would otherwise start every new thread stale. */
 async function worktreeBase() {
   const wanted = flags.get("worktree-base") ?? (flags.has("yes") ? "main"
@@ -375,6 +395,7 @@ function canDo(policy: any, choice: Choice, found: Found[]) {
   for (const line of summary(choice, found)) say(`  ${line}`);
   if (policy.projects !== "*") say(`  It sees ${seesText(policy)}.`);
   if (choice.on.t3 && choice.caps.start_work) say(`  New T3 Code worktrees start from ${baseText(policy.worktreeBase ?? "HEAD")}.`);
+  if (policy.documents && policy.documents !== "off") say(`  Linked documents: ${DOCUMENTS_LABEL[policy.documents as DocumentAccess]}.`);
   if (choice.caps.steer && AGENTS.some((a) => choice.on[a] && a !== "t3")) say(`  ${dim("Messages reach a session open in a terminal between its steps, or as its next turn.")}`);
   say(`  ${dim(`${cmd("10and2 agents")} changes this.`)}`);
 }
@@ -387,7 +408,7 @@ async function agentsCommand() {
   const raw = readPolicyFile();
   if (!raw) throw new Error(`This computer isn't set up yet: ${cmd("10and2 setup")} connects it.`);
   const { found, choice } = await chooseAgents("10and2 agents", raw);
-  const next: any = withWaiting(applyChoice(raw, choice), await waitingFor(raw, choice, found));
+  const next: any = withDocuments(withWaiting(applyChoice(raw, choice), await waitingFor(raw, choice, found)), await documentsFor(raw));
   if (choice.on.t3 && next.worktreeBase === undefined) next.worktreeBase = await worktreeBase();
   parsePolicy(JSON.stringify(next));
   writePrivate(defaultPolicyPath(), JSON.stringify(next, null, 2) + "\n");
@@ -395,6 +416,7 @@ async function agentsCommand() {
   await offerHelpers(choice);
   say();
   for (const line of summary(choice, found)) say(`  ${line}`);
+  if (next.documents && next.documents !== "off") say(`  Linked documents: ${DOCUMENTS_LABEL[next.documents as DocumentAccess]}.`);
   const service = new Service();
   if (service.supported && (await service.state()).running) { await service.restart(); ok("The connector restarted with it"); }
   else note(dim(`It applies when the connector next starts (${cmd("10and2 run")}, or ${cmd("10and2 autostart on")}).`));
@@ -1016,7 +1038,7 @@ async function brainSetup(service: Service, path: string) {
   say();
 
   const origin = `http://127.0.0.1:${port}`;
-  const policy = await policyFor(origin, existing, choice);
+  const policy = withDocuments(await policyFor(origin, existing, choice), await documentsFor(existing));
   // This computer's own connector, linked to it over loopback with a token only the two of them know.
   const token = randomBytes(32).toString("base64url");
   const vars = addMachine({

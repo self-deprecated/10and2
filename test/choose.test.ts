@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { applyChoice, applyFlags, capsFor, choiceOf, defaultChoice, policyFields, startingChoice, summary, type Choice } from "../src/choose.ts";
+import { applyChoice, applyFlags, capsFor, choiceOf, chooseDocuments, defaultChoice, DOCS_WORDS, policyFields, startingChoice, summary, type Choice } from "../src/choose.ts";
 import { describeFound, detect, type Found } from "../src/agents.ts";
 import { allows, answers, ceilingFor, parsePolicy, steers } from "../src/policy.ts";
 import { drawList, listStep, marks, type ListState } from "../src/ui.ts";
@@ -267,18 +267,33 @@ test("sends and starts for later: send until chosen, written only when chosen, a
   assert.ok(!summary({ ...defaultChoice(all), rules: "off" }, all).some((l) => l.includes("later")));
 });
 
-test("linked documents: off until chosen, written only when chosen, and --documents chooses without a terminal", () => {
-  const all = found({ claude: true });
-  assert.equal(defaultChoice(all).documents, "off", "linked documents are opt-in, off by default");
-  assert.equal(policyFields(defaultChoice(all)).documents, undefined, "a file stays without documents until opted in");
-  assert.equal(parsePolicy(JSON.stringify({ ...base })).documents, "off");
-  const docsAll = applyFlags(defaultChoice(all), flags({ documents: "all" }), all);
-  const written = applyChoice({ ...base }, docsAll);
-  assert.equal(written.documents, "all");
-  assert.equal(choiceOf(written).documents, "all");
-  assert.equal(parsePolicy(JSON.stringify(written)).documents, "all");
-  assert.equal(applyChoice(written, defaultChoice(all)).documents, undefined, "back to off: the field goes");
-  assert.throws(() => applyFlags(defaultChoice(all), flags({ documents: "yes" }), all), /--documents takes off, project, all/);
-  assert.equal(summary(docsAll, all).at(-1), "Linked documents: project and plan folders.");
-  assert.ok(!summary(defaultChoice(all), all).some((l) => l.includes("Linked documents")));
+test("linked documents screen explains the feature with an example and maps the two toggles to off, project or all", async () => {
+  const said: string[] = [];
+  let seenTitle = "";
+  let seenHint = "";
+  const run = async (current: "off" | "project" | "all" | null, toggle: [boolean, boolean] | null) =>
+    chooseDocuments(current, {
+      say: (s) => said.push(s),
+      checklist: async (title, rows, hint) => {
+        seenTitle = title;
+        seenHint = hint;
+        return {
+          rows: toggle ? rows.map((r, i) => (r.kind === "box" ? { ...r, on: toggle[i]! } : r)) : rows,
+        };
+      },
+    });
+  // First time (null): both start ticked with the pitch, example and privacy note.
+  assert.equal(await run(null, null), "all");
+  assert.match(seenTitle, /plan\.md/);
+  assert.match(seenTitle, /Read the plan/);
+  assert.match(seenHint, /redacted/i);
+  assert.ok(said.some((s) => s.includes(DOCS_WORDS.heading)));
+  // Respects saved state when unchanged.
+  assert.equal(await run("off", null), "off");
+  assert.equal(await run("project", null), "project");
+  assert.equal(await run("all", null), "all");
+  // Toggling rows maps cleanly.
+  assert.equal(await run(null, [true, false]), "project");
+  assert.equal(await run(null, [false, true]), "off");
+  assert.equal(await run("off", [true, true]), "all");
 });
