@@ -75,3 +75,9 @@ test("places go with their models packed: each list once, in `catalogs`, under a
   assert.equal(sent.changed(view(undefined, { places: [places[0]!, { ...places[1]!, models: claude.slice(0, 1) }, places[2]!, places[3]!] })).any, true);
   assert.deepEqual(new Sent().read(view(), null).catalogs, {}, "always there, empty when nothing offers a model");
 });
+
+test("you writing in a thread yourself (typed, the engine's stage 3.9) tells the brain to read, not urgently", () => {
+  const sent = new Sent();
+  sent.read(view(), null);
+  assert.deepEqual(sent.changed(view([{ ...item("a"), typed: { at: "2026-11-14T03:00:00.000Z", desk: "2026-11-14T03:00:00.000Z" } }, item("b")])), { any: true, urgent: false });
+});

@@ -6,12 +6,21 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve, sep, dirname, basename } from "node:path";
 import type { ActionKind, LaunchProfile } from "./contract.ts";
 import { configDirectory } from "./paths.ts";
+import type { CheckKind, OwnChecks } from "./checks.ts";
 
 export type RuntimeMode = LaunchProfile["runtimeMode"];
 
 /** The coding agents a connector can read, each with its own adapter. */
 export const AGENTS = ["t3", "claude", "codex", "opencode", "pi", "gemini", "copilot", "cursor"] as const;
 export type Agent = (typeof AGENTS)[number];
+/**
+ * Whether this connector may read prose documents linked by an agent's reply (opt-in, off by default):
+ * - "off": never inspect or serve linked documents.
+ * - "project": only prose documents inside visible project folders (and a visible thread's worktree).
+ * - "all": project folders plus the fixed allowlist of coding-agent plan/artifact folders outside projects.
+ */
+export const DOCUMENT_MODES = ["off", "project", "all"] as const;
+export type DocumentAccess = (typeof DOCUMENT_MODES)[number];
 /**
  * What one agent may do, narrower than the machine's own: an agent's entry in `agents` may switch off steering or
  * answering, keep fewer actions, or lower the ceiling. It never grants more than the top level.
@@ -23,6 +32,11 @@ export type Policy = {
   brain: string;
   /** Folders whose work Driver may see, or "*" for everything. A project or session is visible when its folder is one of these or inside one. */
   projects: string[] | "*";
+  /**
+   * Folders listed in `projects` that couldn't be resolved (a dangling link, an unmounted drive, one it may not read):
+   * left out, and said, rather than stopping the connector. Every listed one gone: it sees no projects.
+   */
+  unresolved?: string[];
   /** What Driver may do. Empty: read only. */
   actions: ActionKind[];
   /** The most any launch may run with, whatever profile the brain names. */
@@ -54,7 +68,35 @@ export type Policy = {
    * is here when origin hasn't got it), or "HEAD", whatever the project's checkout is on now.
    */
   worktreeBase: string;
+  /**
+   * This machine's own checks (docs/launch/engine.md §11 stage 3.10), beyond the fixed table in checks.ts, by how the
+   * command starts: `{ "just ci": "test", "./scripts/check": "test" }`. Its first two words are the label that leaves
+   * the machine with a run's pass or fail; nothing else of it does. Absent when the file has none.
+   */
+  checks?: OwnChecks;
+  /**
+   * What a send or start set up for later may do when this machine runs it (docs/launch/engine.md §5, "Each computer's
+   * say"): `send` messages (every install, new or existing, until its owner chooses), `start` threads too (only once
+   * turned on here, `10and2 agents`), or `off`. Enforced when a schedule is handed over and again when it fires. Absent
+   * from a file that doesn't choose: `send` (`rulesOf`).
+   */
+  rules?: Rules;
+  /**
+   * Commands that wait (docs/launch/engine.md §11 stage 4; Fable's 4-H1): the commands held until the user lets them run
+   * from the phone when an agent runs one, as shell globs (`*` any text, `?` one character) over each command a Bash
+   * call runs (guard.ts `guarded`). Claude Code's hook (claude/hooks.ts), so Claude Code's sessions and T3 Code's Claude
+   * threads. Set only here, at the computer (`10and2 agents`): never sent to the brain, and the brain can't change it.
+   * Empty (or absent, in a policy made by hand) when the file has none: nothing is held until its owner chooses.
+   */
+  guard?: string[];
+  /** Whether linked prose documents may be served to the brain (opt-in; absent: "off"). */
+  documents?: DocumentAccess;
 };
+
+/** What schedules set up for later may do here: nothing, send messages, or send messages and start threads. */
+export const RULES = ["off", "send", "start"] as const;
+export type Rules = (typeof RULES)[number];
+export const rulesOf = (policy: Pick<Policy, "rules">): Rules => policy.rules ?? "send";
 
 /** A branch name or "HEAD": no option, revset or range syntax, since T3 hands it to git and jj. */
 export const validBase = (b: unknown): b is string =>
@@ -63,6 +105,31 @@ export const validBase = (b: unknown): b is string =>
 const ACTIONS: readonly ActionKind[] = ["follow_up", "settle", "snooze", "archive", "start_work"];
 /** Narrowest first. */
 export const RUNTIME_MODES: readonly RuntimeMode[] = ["approval-required", "auto-accept-edits", "auto", "full-access"];
+
+/** The most commands a computer's list holds (Fable's 4-H1). */
+export const GUARD_MAX = 50;
+
+/** A list of commands that wait as the settings have it, each pattern's spaces collapsed; none when absent, null when it isn't one. */
+export function guardOf(v: unknown): string[] | null {
+  if (v === undefined) return [];
+  if (!Array.isArray(v) || v.length > GUARD_MAX || v.some((p) => typeof p !== "string" || !p.trim() || p.length > 200 || /[\r\n]/.test(p))) return null;
+  return [...new Set((v as string[]).map((p) => p.trim().replace(/\s+/g, " ")))];
+}
+
+/**
+ * The list alone, as the hook reads it on each Bash call (claude/hooks.ts), without the rest of the policy's checks:
+ * none when there are no settings (`missing`: what no file is; the hook's gate, installed only with a list, takes it as
+ * not known); null (not known) when they're there but can't be read, aren't JSON or the list isn't one, so the hook
+ * fails closed (then the connector refuses to start too, and says why).
+ */
+export function readGuard(path = defaultPolicyPath(), missing: string[] | null = []): string[] | null {
+  let text: string;
+  try { text = readFileSync(path, "utf8"); } catch (e) { return (e as NodeJS.ErrnoException).code === "ENOENT" ? missing : null; }
+  try {
+    const raw = JSON.parse(text);
+    return raw && typeof raw === "object" && !Array.isArray(raw) ? guardOf(raw.guard) : null;
+  } catch { return null; }
+}
 
 export function defaultPolicyPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(configDirectory(env), "connector.json");
@@ -106,6 +173,7 @@ export function parsePolicy(text: string): Policy {
   // Plain ws only to this machine: anything else would send the token and every thread in the clear.
   if (endpoint.protocol === "ws:" && !["127.0.0.1", "localhost", "[::1]"].includes(endpoint.hostname)) throw bad("brain must use wss:// unless it's on this machine");
   let projects: Policy["projects"] = [];
+  const unresolved: string[] = [];
   if (raw.projects === "*") projects = "*";
   else if (raw.projects !== undefined) {
     if (!Array.isArray(raw.projects) || raw.projects.some((p: unknown) => typeof p !== "string" || !p.trim())) throw bad('projects must be "*" or a list of folders');
@@ -114,9 +182,9 @@ export function parsePolicy(text: string): Policy {
       // On Windows `\home\me\code` counts as absolute, but means that folder on whichever drive is current.
       if (process.platform === "win32" && !/^([A-Za-z]:[\\/]|[\\/]{2})/.test(expand(p))) throw bad(`project folder "${p}" must start with a drive, such as C:\\`);
       const root = real(p);
-      if (root === null) throw bad(`project folder "${p}" cannot be resolved`);
+      if (root === null) unresolved.push(p);
       return root;
-    });
+    }).filter((root: string | null): root is string => root !== null);
   }
   const actions = raw.actions ?? [];
   if (!Array.isArray(actions) || actions.some((a: unknown) => !ACTIONS.includes(a as ActionKind))) throw bad(`actions must be a list of ${ACTIONS.join(", ")}`);
@@ -158,8 +226,25 @@ export function parsePolicy(text: string): Policy {
   for (const k of ["steer", "answer"]) if (raw[k] !== undefined && typeof raw[k] !== "boolean") throw bad(`${k} must be true or false`);
   const worktreeBase = raw.worktreeBase ?? "HEAD";
   if (!validBase(worktreeBase)) throw bad('worktreeBase must be a branch name, such as "main", or "HEAD"');
+  let checks: Record<string, CheckKind> | undefined;
+  if (raw.checks !== undefined) {
+    if (typeof raw.checks !== "object" || raw.checks === null || Array.isArray(raw.checks)) throw bad('checks must be an object, such as { "just ci": "test" }');
+    checks = {};
+    for (const [start, kind] of Object.entries(raw.checks)) {
+      if (!start.trim() || start.length > 200) throw bad("each of checks must be how a command starts");
+      if (!["test", "build", "lint"].includes(kind as string)) throw bad(`checks."${start}" must be "test", "build" or "lint"`);
+      checks[start.trim()] = kind as CheckKind;
+    }
+  }
+  const rules = raw.rules ?? "send";
+  if (!RULES.includes(rules)) throw bad(`rules must be one of ${RULES.join(", ")}`);
+  const guard = guardOf(raw.guard);
+  if (!guard) throw bad(`guard must be a list of at most ${GUARD_MAX} commands, each one line, such as "terraform apply*"`);
+  const rawDocs = raw.documents === undefined || raw.documents === false ? "off" : raw.documents;
+  if (!DOCUMENT_MODES.includes(rawDocs)) throw bad(`documents must be one of ${DOCUMENT_MODES.join(", ")}`);
+  const documents = rawDocs as DocumentAccess;
   return { brain: raw.brain, projects, actions: [...new Set(actions as ActionKind[])], maxRuntimeMode, ...on,
-    steer: raw.steer ?? true, answer: raw.answer ?? true, limits, worktreeBase };
+    steer: raw.steer ?? true, answer: raw.answer ?? true, limits, worktreeBase, ...(checks ? { checks } : {}), rules, guard, documents, ...(unresolved.length ? { unresolved } : {}) };
 }
 
 export function loadPolicy(path = defaultPolicyPath()): Policy {

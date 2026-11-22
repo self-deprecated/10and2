@@ -9,7 +9,6 @@ import { createServer as createHttpServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import type { TestContext } from "node:test";
 import { OpenCodeAdapter, answersFor, openCodeCounts, sameFolder } from "../src/opencode/adapter.ts";
 import { installOpenCodePlugin, openCodePluginStatus, uninstallOpenCodePlugin, MARKER, pluginSource } from "../src/opencode/plugin.ts";
@@ -24,6 +23,8 @@ import { FakeDb } from "./fixtures/opencode/db.ts";
 import { fakeOpenCode, AGENTS } from "./fixtures/opencode/server.ts";
 import { fakeBun } from "./fixtures/opencode/bun.ts";
 import { assertPrivate, nodeCommand, removeDir, SLOW, WINDOWS } from "./fixtures/platform.ts";
+import { Local } from "../src/local.ts";
+import { ANSWERED } from "../src/util.ts";
 
 const pause = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 async function until(check: () => boolean | Promise<boolean>, ms = 3000 * SLOW) {
@@ -308,6 +309,52 @@ test("OpenCode's own question is answered with the option the user named, throug
   assert.equal(await off.adapter.check(follow(q, "x")), "It's asking you a question in OpenCode, and this computer doesn't let 10 & 2 answer questions.");
 });
 
+test("a question OpenCode holds is input, its own options its choices, and a tap answers it; a permission is an approval, with none", async (t) => {
+  const h = harness(t);
+  const asking = h.db.session({ directory: h.cwd, title: "Asking" }); h.db.assistant(asking, h.db.user(asking, "Pick one"), { completed: false });
+  const open = h.db.session({ directory: h.cwd, title: "Open" }); h.db.assistant(open, h.db.user(open, "Ask me"), { completed: false });
+  const permit = h.db.session({ directory: h.cwd, title: "Permit" }); h.db.assistant(permit, h.db.user(permit, "Clean up"), { completed: false });
+  const done = h.db.finished(h.cwd);
+  const fake = await h.tui();
+  fake.state.status = { [asking]: { type: "busy" }, [open]: { type: "busy" }, [permit]: { type: "busy" } };
+  fake.state.questions = [
+    { id: "que_1", sessionID: asking, questions: [{ question: "Which one?", header: "Pick", options: [{ label: "C++", description: "a" }, { label: "C#", description: "b" }] }] },
+    { id: "que_2", sessionID: open, questions: [{ question: "What should it be called?", options: [] }] },
+  ];
+  fake.state.permissions = [{ id: "per_1", sessionID: permit, permission: "bash", patterns: ["rm -rf build"], metadata: { command: "rm -rf build" } }];
+  await h.adapter.start();
+  const by = Object.fromEntries((await h.adapter.list()).map((i) => [i.id, i]));
+  assert.deepEqual([asking, open, permit, done].map((id) => by[id]!.questionKind), ["input", "input", "approval", undefined]);
+  assert.deepEqual((await h.adapter.report(asking)).choices, ["C++", "C#"]);
+  assert.equal((await h.adapter.report(open)).choices, null, "an open question: no options to tap");
+  assert.equal((await h.adapter.report(permit)).choices, null);
+  assert.deepEqual(await h.adapter.execute({ kind: "follow_up", itemId: asking, message: "C#", questionId: "que_1" }, "tap"), { ok: true });
+  assert.deepEqual(fake.writes().map((w) => [w.path, w.body]), [["/question/que_1/reply", { answers: [["C#"]] }]]);
+});
+
+test("a tap answers only the question it was for: one asked instead, or none, while Local's check awaited sends nothing", async (t) => {
+  for (const asksAgain of [true, false]) {
+    const h = harness(t);
+    const asking = h.db.session({ directory: h.cwd, title: "Asking" }); h.db.assistant(asking, h.db.user(asking, "Pick one"), { completed: false });
+    const fake = await h.tui();
+    const options = [{ label: "C++", description: "a" }, { label: "C#", description: "b" }];
+    fake.state.status = { [asking]: { type: "busy" } };
+    fake.state.questions = [{ id: "que_1", sessionID: asking, questions: [{ question: "Which one?", header: "Pick", options }] }];
+    await h.adapter.start();
+    const local = new Local([{ prefix: "", adapter: h.adapter }], h.policy);
+    // After Local looked, while the adapter's check yields: OpenCode asks another question instead, or none and works on.
+    const check = h.adapter.check.bind(h.adapter);
+    let moved = false;
+    h.adapter.check = async (a) => {
+      const why = await check(a);
+      if (!moved) { moved = true; fake.state.questions = asksAgain ? [{ id: "que_2", sessionID: asking, questions: [{ question: "Delete production?", header: "Sure", options }] }] : []; }
+      return why;
+    };
+    assert.deepEqual(await local.execute({ kind: "follow_up", itemId: asking, message: "C#", questionId: "que_1" }, "old-tap"), { ok: false, error: ANSWERED });
+    assert.deepEqual(fake.writes(), [], asksAgain ? "never the answer to the question asked since" : "never sent as a message");
+  }
+});
+
 test("an answer is the option named (each one, when several may be chosen), else the user's own words", () => {
   const q = [{ question: "Seconds or milliseconds?", options: ["Seconds", "Milliseconds"], multiple: false }];
   assert.deepEqual(answersFor(q, "milliseconds, please."), [["Milliseconds"]]);
@@ -449,7 +496,10 @@ test("on Windows the plugin serves OpenCode on 127.0.0.1 behind a token (elsewhe
   // A short name: on macOS the temporary folder alone is ~49 characters, and a socket's path must fit in 104 bytes there.
   const root = mkdtempSync(join(tmpdir(), "oc-live-")), dir = join(root, "proj");
   const bun = fakeBun(await freePort());
-  t.after(async () => { await bun.close(); removeDir(root); });
+  // Under `bun test` the plugin serves with Bun's own serve, as it does in OpenCode: Bun can't be replaced there, and
+  // the fake's Node http is made with that serve. Each server it makes is stopped with the test.
+  const g = globalThis as any, serve: ((o: object) => { stop(force?: boolean): void }) | undefined = g.Bun?.serve, served: { stop(force?: boolean): void }[] = [];
+  t.after(async () => { for (const s of served) s.stop(true); await bun.close(); removeDir(root); });
   const seen: Request[] = [];
   const client = { _client: { getConfig: () => ({ baseUrl: "http://opencode.internal", fetch: async (req: Request) => { seen.push(req); return Response.json({ ses_1: { type: "busy" } }); } }) } };
   /** The plugin as OpenCode loads it on `platform` (which this process pretends to be while it loads), started in `dir`. */
@@ -458,14 +508,17 @@ test("on Windows the plugin serves OpenCode on 127.0.0.1 behind a token (elsewhe
     const real = Object.getOwnPropertyDescriptor(process, "platform")!;
     process.env.TENANDTWO_OPENCODE_DIR = live;
     if (mark) process.env.TENANDTWO_OPENCODE_SERVE = mark; else delete process.env.TENANDTWO_OPENCODE_SERVE;
-    Object.defineProperty(process, "platform", { ...real, value: platform });
-    (globalThis as any).Bun = bun.Bun;
     try {
-      const { TenAndTwo } = await import(`${pathToFileURL(pluginSource()).href}?${platform}`);
+      Object.defineProperty(process, "platform", { ...real, value: platform });
+      if (serve) g.Bun.serve = (o: object) => { const s = serve.call(g.Bun, o); served.push(s); return s; }; else g.Bun = bun.Bun;
+      // The shipped file's source, a fresh module for each platform: Bun keeps one module per file, whatever its URL's
+      // query, and its first import of a file under a /tmp as full as Lattice's took 0.4 s (it reads the folder).
+      const source = `${readFileSync(pluginSource(), "utf8")}\n// ${platform}\n`;
+      const { TenAndTwo } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
       assert.notDeepEqual(await TenAndTwo({ client, directory: dir, worktree: dir, project: { id: "prj_1" } }), {}, "it started");
     } finally {
       Object.defineProperty(process, "platform", real);
-      delete (globalThis as any).Bun;
+      if (serve) g.Bun.serve = serve; else delete g.Bun;
       for (const [k, v] of Object.entries(env)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
     return JSON.parse(readFileSync(join(live, `${process.pid}-0.json`), "utf8"));
@@ -583,4 +636,134 @@ test("on Windows a terminal in the same folder, spelled with other case, has the
   assert.deepEqual(await h.adapter.execute(follow(id, "Same folder"), "k"), { ok: true });
   assert.equal(fake.writes().length, 1);
   assert.equal(h.serve.log().length, 0, "not continued in 10 & 2's own server");
+});
+
+// Receipts (docs/launch/spikes/run-receipts.md): the reply's turn's checks, from its bash parts' exits
+// (`state.metadata.exit`) and edits, read from OpenCode's database: only the command and the exit, never the output.
+test("receipts: a report carries its turn's checks from bash parts' exits; an edit after the last test run makes it stale", async (t) => {
+  const h = harness(t);
+  const id = h.db.session({ directory: h.cwd, title: "Billing" });
+  const u1 = h.db.user(id, "Earlier", { at: Date.now() - 9000 });
+  const old = h.db.assistant(id, u1, { finish: "tool-calls", at: Date.now() - 8900 });
+  h.db.tool(id, old.id, "bash", { status: "completed", input: { command: "go test ./..." }, output: "", metadata: { exit: 1 } });
+  h.db.assistant(id, u1, { text: "Earlier answer", at: Date.now() - 8800 });
+  const u2 = h.db.user(id, "Fix the test", { at: Date.now() - 5000 });
+  const step = h.db.assistant(id, u2, { finish: "tool-calls", at: Date.now() - 4900 });
+  h.db.tool(id, step.id, "bash", { status: "completed", input: { command: "cd SECRET_DIR && go test ./...", description: "SECRET" }, output: "SECRET_OUTPUT\nFAIL\tSECRET_PKG\t0.01s\n", metadata: { exit: 1, output: "SECRET_OUTPUT\nFAIL\tSECRET_PKG\t0.01s\n" } });
+  h.db.tool(id, step.id, "edit", { status: "completed", input: { filePath: "/SECRET_PATH" }, output: "", metadata: {} });
+  // Run again where it failed: a run elsewhere isn't at least as broad as the failing one (checks.ts `receipts`).
+  h.db.tool(id, step.id, "bash", { status: "completed", input: { command: "cd SECRET_DIR && go test ./..." }, output: "ok", metadata: { exit: 0 } });
+  h.db.tool(id, step.id, "bash", { status: "error", input: { command: "go vet ./..." }, error: "aborted" });
+  h.db.tool(id, step.id, "write", { status: "completed", input: { filePath: "/SECRET_PATH2" }, output: "", metadata: {} });
+  h.db.assistant(id, u2, { text: "Fixed; tests pass.", at: Date.now() - 4000 });
+  await h.adapter.start();
+  const report = await h.adapter.report(id);
+  assert.equal(report.text, "Fixed; tests pass.");
+  assert.deepEqual(report.checks, { tests: { ok: true, runs: 2, failed: 1, label: "go test", stale: true, edited: true } });
+  assert.doesNotMatch(JSON.stringify(report), /SECRET/);
+});
+
+// The skeptic on 5828b30370cf: OpenCode's bash runs in its `workdir` (from the session's folder) when it's given one. A
+// failing run in api, then a passing one in the session's folder, isn't the tests passing.
+test("receipts: a bash part's workdir is where it ran; a pass in another folder never covers a failure", async (t) => {
+  const h = harness(t);
+  const id = h.db.session({ directory: h.cwd, title: "Api" });
+  const u = h.db.user(id, "Fix api's test", { at: Date.now() - 5000 });
+  const step = h.db.assistant(id, u, { finish: "tool-calls", at: Date.now() - 4900 });
+  h.db.tool(id, step.id, "bash", { status: "completed", input: { command: "go test ./...", workdir: "api" }, output: "FAIL", metadata: { exit: 1 } });
+  h.db.tool(id, step.id, "edit", { status: "completed", input: { filePath: "/x" }, output: "", metadata: {} });
+  h.db.tool(id, step.id, "bash", { status: "completed", input: { command: "go test ./..." }, output: "ok", metadata: { exit: 0 } });
+  h.db.assistant(id, u, { text: "Fixed.", at: Date.now() - 4000 });
+  await h.adapter.start();
+  assert.deepEqual((await h.adapter.report(id)).checks, { tests: { ok: false, runs: 1, failed: 1, label: "go test", stale: true } }, "was a pass");
+  // The same folder, by its workdir or a cd, is.
+  h.db.tool(id, step.id, "bash", { status: "completed", input: { command: "cd api && go test ./..." }, output: "ok", metadata: { exit: 0 } });
+  h.db.assistant(id, u, { text: "Fixed, really.", at: Date.now() - 3000 });
+  assert.deepEqual((await h.adapter.report(id)).checks, { tests: { ok: true, runs: 2, failed: 1, label: "go test", edited: true } });
+});
+
+// "Call me when the tests pass" mid-run (the skeptic, 16 November): a busy session's turn still going, its checks so far.
+test("receipts: a busy session's unfinished turn carries its checks so far as running", async (t) => {
+  const h = harness(t);
+  const id = h.db.session({ directory: h.cwd, title: "Flaky" });
+  const u = h.db.user(id, "Fix the flaky test");
+  const step = h.db.assistant(id, u, { finish: "tool-calls" });
+  h.db.tool(id, step.id, "bash", { status: "completed", input: { command: "go test ./..." }, output: "FAIL", metadata: { exit: 1 } });
+  h.db.tool(id, step.id, "edit", { status: "completed", input: { filePath: "/x" }, output: "", metadata: {} });
+  h.db.tool(id, step.id, "bash", { status: "completed", input: { command: "go test ./..." }, output: "ok", metadata: { exit: 0 } });
+  h.db.assistant(id, u, { completed: false, text: "Checking the other packages" });
+  const fake = await h.tui();
+  fake.state.status = { [id]: { type: "busy" } };
+  await h.adapter.start();
+  const report = await h.adapter.report(id);
+  assert.equal(report.progress, "Checking the other packages");
+  assert.deepEqual(report.running, { tests: { ok: true, runs: 2, failed: 1, label: "go test", edited: true } });
+  assert.equal(report.runningId, u, "its run, as its reply will carry it (F6)");
+});
+
+// The Skeptic on 3.10: an answer to OpenCode's question is no message at all, so the Ledger drops its record of it
+// (`sendLeftOut`); a message to a session is written as the user's, and its record takes it.
+test("an answer to OpenCode's question is never a person's message (sendLeftOut); a message is", async (t) => {
+  const h = harness(t);
+  const id = h.db.session({ directory: h.cwd, title: "Asking" }); h.db.assistant(id, h.db.user(id, "Pick one"), { completed: false });
+  const fake = await h.tui();
+  fake.state.status = { [id]: { type: "busy" } };
+  fake.state.questions = [{ id: "que_9", sessionID: id, questions: [{ question: "Which one?", header: "Pick", options: [{ label: "Alpha", description: "a" }, { label: "Beta", description: "b" }] }] }];
+  await h.adapter.start();
+  assert.deepEqual(await h.adapter.execute(follow(id, "Beta"), "a1"), { ok: true });
+  assert.equal(h.adapter.sendLeftOut(follow(id, "Beta"), "a1"), true);
+  assert.equal(h.adapter.sendLeftOut(follow(id, "Beta"), "a1"), false, "asked once");
+  assert.equal(h.adapter.sendLeftOut(follow(id, "Carry on"), "m1"), false);
+});
+
+// The review's finding on 3.10: a database locked as the checks are read said nothing of them, which the brain took for
+// "no test ran". It says so (`checksUnread`).
+test("receipts: a database that can't be opened as its checks are read says they weren't read, not that none ran", async (t) => {
+  const h = harness(t);
+  const id = h.db.session({ directory: h.cwd, title: "Billing" });
+  const u = h.db.user(id, "Fix the test", { at: Date.now() - 5000 });
+  const step = h.db.assistant(id, u, { finish: "tool-calls", at: Date.now() - 4900 });
+  h.db.tool(id, step.id, "bash", { status: "completed", input: { command: "go test ./..." }, output: "FAIL", metadata: { exit: 1 } });
+  h.db.assistant(id, u, { text: "Fixed; tests pass.", at: Date.now() - 4000 });
+  await h.adapter.start();
+  assert.deepEqual((await h.adapter.report(id)).checks, { tests: { ok: false, runs: 1, failed: 1, label: "go test" } });
+  // The session as last scanned (no scan due), and the checks' own read can't open the database.
+  const adapter = h.adapter as any, real = adapter.dbPath;
+  adapter.scannedAt = Date.now() + 60_000;
+  adapter.dbPath = real + ".unreadable";
+  const report = await h.adapter.report(id);
+  adapter.dbPath = real;
+  assert.equal(report.text, "Fixed; tests pass.");
+  assert.equal(report.checks, undefined);
+  assert.equal(report.checksUnread, true);
+});
+
+test("a finished parent session with a busy or asking child subagent stays running or waiting", async (t) => {
+  const h = harness(t);
+  const parent = h.db.finished(h.cwd, "Design the game", "Delegated to workers.", { title: "Game design" });
+  const sub = h.db.session({ directory: h.cwd, parentId: parent, title: "Balance pass (@general subagent)" });
+  const nested = h.db.session({ directory: h.cwd, parentId: sub, title: "Wave simulator" });
+  const fake = await h.tui();
+  fake.state.status = { [nested]: { type: "busy" } };
+  await h.adapter.start();
+  const running = (await h.adapter.list()).find((i) => i.id === parent)!;
+  assert.equal(running.status, "running");
+  const rep = await h.adapter.report(parent);
+  assert.equal(rep.text, "Delegated to workers.");
+  assert.match(rep.progress ?? "", /Waiting on subagent: Wave simulator/);
+
+  // A child subagent asking a question surfaces as waiting on the parent.
+  fake.state.questions = [{ id: "que_sub", sessionID: nested, questions: [{ question: "Hard mode?", header: "Difficulty", options: [{ label: "Yes", description: "y" }, { label: "No", description: "n" }] }] }];
+  const waiting = (await h.adapter.list()).find((i) => i.id === parent)!;
+  assert.equal(waiting.status, "waiting");
+  assert.equal(waiting.pendingQuestion, true);
+  assert.equal(waiting.questionId, "que_sub");
+  assert.equal((await h.adapter.report(parent)).question, "Hard mode? Options: Yes / No.");
+
+  // Once the subagent clears, the parent returns to completed.
+  fake.state.status = {};
+  fake.state.questions = [];
+  const done = (await h.adapter.list()).find((i) => i.id === parent)!;
+  assert.equal(done.status, "completed");
+  assert.equal((await h.adapter.report(parent)).progress, null);
 });

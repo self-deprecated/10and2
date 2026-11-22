@@ -4,6 +4,8 @@ import { createConnection } from "node:net";
 import { createHash } from "node:crypto";
 import type { RuntimeMode } from "../policy.ts";
 import { PIPE } from "./registry.ts";
+import type { How } from "../local.ts";
+import { clockOf, prevDate, validZone } from "../../brain/src/zone.ts";
 
 /**
  * A live Claude Code session's inbox (Claude Code 2.1.224+, "cross-session messaging"): a Unix socket each session binds
@@ -34,11 +36,28 @@ export function heldFor(sessionMode: string | null, mode: "bypass" | "prompting"
 /**
  * The message as Claude Code's own peer envelope, so the session names its sender and checks its class: the user's
  * confirmed words, unchanged and first (the terminal shows a message's first line), then one line saying whose they are.
+ * One set up for later says when it was set up and when it was to go, on the user's clock (docs/launch/engine.md §5).
  */
-export function envelope(message: string, mode: "bypass" | "prompting"): string {
+export function envelope(message: string, mode: "bypass" | "prompting", scheduled?: How["scheduled"]): string {
   // A closing tag inside the words would end the envelope early, and Claude Code would then reject it whole.
   const words = message.replaceAll("</cross-session-message>", "</cross-session-message >");
-  return `<cross-session-message from-name="${SENDER}" from-mode="${mode}">\n${words}\n\n(Your user said this to 10 & 2, their voice assistant, and confirmed it.)\n</cross-session-message>`;
+  const whose = scheduled ? setUp(scheduled) : "(Your user said this to 10 & 2, their voice assistant, and confirmed it.)";
+  return `<cross-session-message from-name="${SENDER}" from-mode="${mode}">\n${words}\n\n${whose}\n</cross-session-message>`;
+}
+
+const pad = (n: number) => String(n).padStart(2, "0");
+/**
+ * "(Your user set this up with 10 & 2 at 22:14, to be sent at 03:00, and confirmed it then.)", in the zone the user
+ * agreed in (this computer's when that one isn't known here); the day said when it was set up on another ("yesterday at
+ * 22:14", "on Thursday at 22:14"). A chain's: "to be sent when another thread finished".
+ */
+export function setUp(s: NonNullable<How["scheduled"]>): string {
+  const zone = validZone(s.zone) ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+  const agreed = clockOf(Date.parse(s.agreedAt), zone);
+  const due = clockOf(s.at ? Date.parse(s.at) : Date.now(), zone);
+  const hm = (c: { hour: number; minute: number }) => `${pad(c.hour)}:${pad(c.minute)}`;
+  const when = agreed.date === due.date ? `at ${hm(agreed)}` : agreed.date === prevDate(due.date) ? `yesterday at ${hm(agreed)}` : `on ${agreed.weekday} at ${hm(agreed)}`;
+  return `(Your user set this up with 10 & 2 ${when}, ${s.at ? `to be sent at ${hm(due)}` : "to be sent when another thread finished"}, and confirmed it then.)`;
 }
 
 /**

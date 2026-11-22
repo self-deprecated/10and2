@@ -7,23 +7,25 @@ import { homedir, hostname } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { Credentials, parseCredential, run as runCommand, type Store } from "./credential.ts";
+import { hookLauncher } from "./command.ts";
 import { Ledger } from "./ledger.ts";
 import { Link } from "./link.ts";
 import { Local } from "./local.ts";
 import { Expired, linkUrl, originOf, pair } from "./pair.ts";
 import { configDirectory, databasePath, hookSocket, stateDirectory } from "./paths.ts";
 import { addMachine, brainDb, brainEnvPath, brainOrigin, brainPort, DEFAULT_PORT, machines, readBrainEnv, removeMachine, validName, writeBrainEnv } from "./brain.ts";
-import { AGENTS, type Agent, defaultPolicyPath, loadPolicy, parsePolicy, readSettings, validBase, visible } from "./policy.ts";
+import { AGENTS, type Agent, defaultPolicyPath, DOCUMENT_MODES, type DocumentAccess, loadPolicy, parsePolicy, readGuard, readSettings, rulesOf, validBase, visible } from "./policy.ts";
+import type { HeldSummary } from "./gate.ts";
 import { describeFound, detect, NAMES, ORDER, type Found } from "./agents.ts";
 import { versionWarning } from "./versions.ts";
-import { applyChoice, applyFlags, capsFor, CAP_SHORT, CEILING_LABEL, chooseInteractively, choiceOf, startingChoice, summary, type Choice } from "./choose.ts";
+import { applyChoice, applyFlags, capsFor, CAP_SHORT, CEILING_LABEL, chooseInteractively, chooseWaiting, choiceOf, openSessionsNote, RULES_LABEL, startingChoice, summary, WAIT_WORDS, waitKinds, type Choice } from "./choose.ts";
 import { VERSION } from "./protocol.ts";
 import { proxyAdvice, useSystemNetwork } from "./net.ts";
 import { BRAIN, checkout, CONNECTOR, connectorRunning, launchFor, Service, temporary, type ServiceState } from "./service.ts";
 import { pidState } from "./claude/registry.ts";
 import { loginService, stopLikeSigterm } from "./supervisor.ts";
 import { T3Adapter } from "./t3/adapter.ts";
-import { ClaudeAdapter, hooksStatus, hooksUnavailable, installHooks, relayHook, uninstallHooks } from "./claude/index.ts";
+import { ClaudeAdapter, hooksStatus, hooksUnavailable, installHooks, refreshGate, runHook, uninstallHooks } from "./claude/index.ts";
 import { CodexAdapter, defaultCodexHome } from "./codex/adapter.ts";
 import { PiAdapter } from "./pi/adapter.ts";
 import { CursorAdapter } from "./cursor/adapter.ts";
@@ -37,9 +39,13 @@ import { copilotExtensionStatus, installCopilotExtension, uninstallCopilotExtens
 import { installOpenCodePlugin, OpenCodeAdapter, openCodePluginStatus, uninstallOpenCodePlugin } from "./opencode/index.ts";
 import { describe, replaceFile } from "./util.ts";
 import { openBrowser, opener } from "./browser.ts";
+import { cancelWaiting, deviceOf, Schedules } from "./schedules.ts";
+import { shownClock } from "../brain/src/zone.ts";
 import { accent, ago, ask, bad, bold, Cancelled, cmd, confirm, dim, keys, mark, note, ok, say, secret, spinner, warn } from "./ui.ts";
 
 const DEFAULT_ORIGIN = "https://10and2.selfdep.com";
+/** Said once setup is done (and in the README): a computer asleep is offline. */
+const AWAKE = "Keep this computer awake while you drive: closing a laptop's lid sleeps it, and takes it offline.";
 /** The 10 & 2 service's own addresses (production and staging): any other is a brain of your own. */
 const SERVICE = [DEFAULT_ORIGIN, "https://10and2-stg.selfdep.com"];
 /** Someone running their own brain needs to know which key to make (Jordan, 5 Nov: the CLI may say OpenAI). */
@@ -61,7 +67,7 @@ More
   ${cmd("10and2 run")}                         run in this terminal instead of at login
   ${cmd("10and2 token")}                       a token, for a brain you configure by hand
 
-Setup options: --name=<what 10 & 2 calls it>  --worktree-base=<branch, or HEAD>  --yes  --no-autostart  --brain=<url>  --token (a brain of your own)
+Setup options: --name=<what 10 & 2 calls it>  --worktree-base=<branch, or HEAD>  --documents=off|project|all  --yes  --no-autostart  --brain=<url>  --token (a brain of your own)
 Choosing without a terminal: --agents=claude,pi  --off=codex  --read-only  --no-steer  --no-answer  --no-start  --no-tidy  (--no-steer=codex: that agent only)
 Settings: ${defaultPolicyPath()}
 
@@ -95,7 +101,7 @@ const account = (origin: string, secret?: string) => !paired(origin, secret) ? `
 const wantsHelp = command !== "hook" && (flags.has("help") || argv.includes("-h"));
 
 /** The flags that choose agents and permissions without a terminal (choose.ts `applyFlags`). */
-const CHOOSING = ["agents", "off", "no-steer", "no-answer", "no-start", "no-follow-up", "no-tidy", "read-only"];
+const CHOOSING = ["agents", "off", "no-steer", "no-answer", "no-start", "no-follow-up", "no-tidy", "read-only", "later"];
 /** What each command takes after its name: at most how many words, and which flags. */
 const TAKES: Record<string, { words: number; flags: string[] }> = {
   setup: { words: 0, flags: ["brain", "token", "name", "worktree-base", "yes", "no-autostart", ...CHOOSING] },
@@ -146,7 +152,7 @@ try {
     case "revoke": await revoke(); break;
     case "uninstall": await uninstall(); break;
     case "autostart": await autostart(); break;
-    case "hook": await relayHook(process.stdin, hookSocket()); break; // Claude Code runs this; it must stay silent
+    case "hook": await runHook(argv); break; // Claude Code runs this (bin/10and2.js loads hook.ts's bundle for it); it must stay silent
     case "hooks": await hooks(); break;
     case "pi": piCommand(); break;
     case "opencode": await openCodeCommand(); break;
@@ -213,6 +219,14 @@ async function setup() {
   const origin = given ? originOf(given.includes("://") ? given : `https://${given}`) : existing?.brain ? originOf(existing.brain) : DEFAULT_ORIGIN;
   const creds = new Credentials();
   const had = await creds.load(origin);
+  if (had && readStatus()?.fatal) {
+    // Its key is still here, but 10 & 2 refused it (revoked on the website, or set up again elsewhere): forgetting it
+    // is what connects it again.
+    bad(`This computer was disconnected from ${account(origin, had.secret)}${readStatus()?.error ? ` (${readStatus().error})` : ""}.`);
+    say(`  To connect it again: ${cmd("10and2 revoke")}, then ${cmd("10and2 setup")}.`);
+    process.exitCode = 1;
+    return;
+  }
   if (had) {
     say(`This computer is already connected to ${account(origin, had.secret)}.\n`);
     await status();
@@ -224,7 +238,7 @@ async function setup() {
   const proxy = proxyAdvice();
   if (proxy) warn(proxy);
   const { found, choice } = await chooseAgents("10and2 setup", existing);
-  const policy = await policyFor(origin, existing, choice);
+  const policy = withWaiting(await policyFor(origin, existing, choice), await waitingFor(existing, choice, found));
   const name = await machineName();
   if (byToken && !validName(name)) throw new Error(`Your brain can't call it "${name}": start with a letter or digit (${cmd("--name=")}).`);
   say();
@@ -250,6 +264,7 @@ async function setup() {
   else if (!login?.elevated) note(`To connect: ${cmd("10and2 run")} in a terminal you keep open, or ${cmd("10and2 autostart on")}.`);
   canDo(policy, choice, found);
   if (started && !byToken) say(`\n  ${bold("Next:")} open 10 & 2 on your phone and tap Start.`);
+  note(dim(AWAKE));
 }
 
 /**
@@ -290,10 +305,45 @@ function warnOld(found: Found[]) {
 async function policyFor(origin: string, existing: any, choice: Choice) {
   const policy: any = applyChoice(existing ? { ...existing, brain: linkUrl(origin) } : { brain: linkUrl(origin), projects: "*" }, choice);
   if (choice.on.t3 && policy.worktreeBase === undefined) policy.worktreeBase = await worktreeBase();
+  const docs = await documentAccess(policy.documents);
+  if (docs !== "off" || flags.has("documents") || policy.documents !== undefined) policy.documents = docs;
   parsePolicy(JSON.stringify(policy));
   return policy;
 }
 
+/**
+ * Commands that wait (docs/launch/engine.md §11 stage 4; Fable's 4-H1): which commands an agent waits on until the user
+ * lets them run from the phone. Asked at a terminal with Claude Code on (the only agent that holds one, with T3 Code's
+ * Claude threads); otherwise the list stays as it is, so nothing is ever added without its owner choosing it here.
+ */
+async function waitingFor(raw: any, choice: Choice, found: Found[]): Promise<string[] | undefined> {
+  const current: string[] | null = Array.isArray(raw?.guard) ? raw.guard : null;
+  if (!choice.on.claude || flags.has("yes") || !process.stdin.isTTY || !process.stdout.isTTY) return current ?? undefined;
+  const guard = await chooseWaiting(current, choice.on);
+  if (guard.length) note(dim(WAIT_WORDS.phone));
+  const open = guard.length ? openSessionsNote(found.find((f) => f.agent === "claude")?.version ?? null) : null;
+  if (open) note(dim(open));
+  return guard;
+}
+/** The policy with its list as chosen; none chosen (never asked) leaves the file without one. */
+function withWaiting(policy: any, guard: string[] | undefined) {
+  const out = { ...policy };
+  if (guard) out.guard = guard; else delete out.guard;
+  return out;
+}
+
+/** Opt-in linked-document reading: `--documents=off|project|all`, or asked at a terminal (off by default). */
+async function documentAccess(existing: unknown): Promise<DocumentAccess> {
+  if (flags.has("documents")) {
+    const v = flags.get("documents")!;
+    if (!DOCUMENT_MODES.includes(v as DocumentAccess)) throw new Error(`"${v}" isn't valid for --documents (use ${DOCUMENT_MODES.join(", ")}).`);
+    return v as DocumentAccess;
+  }
+  if (existing !== undefined && existing !== false && DOCUMENT_MODES.includes(existing as DocumentAccess)) return existing as DocumentAccess;
+  if (flags.has("yes") || !process.stdin.isTTY || !process.stdout.isTTY) return "off";
+  if (!await confirm("Let 10 & 2 read prose documents your agents link (plans, design docs)?", false)) return "off";
+  return await confirm("Include coding apps' own plan folders outside your projects (e.g. ~/.claude/plans, T3 artifacts)?", true) ? "all" : "project";
+}
 /** A branch fetched from origin by default: a checkout left on older work would otherwise start every new thread stale. */
 async function worktreeBase() {
   const wanted = flags.get("worktree-base") ?? (flags.has("yes") ? "main"
@@ -339,6 +389,9 @@ function canDo(policy: any, choice: Choice, found: Found[]) {
   for (const line of summary(choice, found)) say(`  ${line}`);
   if (policy.projects !== "*") say(`  It sees ${seesText(policy)}.`);
   if (choice.on.t3 && choice.caps.start_work) say(`  New T3 Code worktrees start from ${baseText(policy.worktreeBase ?? "HEAD")}.`);
+  if (policy.documents && policy.documents !== "off") {
+    say(`  Linked documents: ${policy.documents === "all" ? "project and coding-app plan folders" : "project folders only"}.`);
+  }
   if (choice.caps.steer && AGENTS.some((a) => choice.on[a] && a !== "t3")) say(`  ${dim("Messages reach a session open in a terminal between its steps, or as its next turn.")}`);
   say(`  ${dim(`${cmd("10and2 agents")} changes this.`)}`);
 }
@@ -351,8 +404,12 @@ async function agentsCommand() {
   const raw = readPolicyFile();
   if (!raw) throw new Error(`This computer isn't set up yet: ${cmd("10and2 setup")} connects it.`);
   const { found, choice } = await chooseAgents("10and2 agents", raw);
-  const next: any = applyChoice(raw, choice);
+  const next: any = withWaiting(applyChoice(raw, choice), await waitingFor(raw, choice, found));
   if (choice.on.t3 && next.worktreeBase === undefined) next.worktreeBase = await worktreeBase();
+  if (flags.has("documents") || next.documents === undefined) {
+    const docs = await documentAccess(next.documents);
+    if (docs !== "off" || flags.has("documents") || next.documents !== undefined) next.documents = docs;
+  }
   parsePolicy(JSON.stringify(next));
   writePrivate(defaultPolicyPath(), JSON.stringify(next, null, 2) + "\n");
   ok(`Saved ${dim(`· ${defaultPolicyPath()}`)}`);
@@ -372,10 +429,17 @@ async function agentsCommand() {
 async function offerHelpers(choice: Choice) {
   const wants = (a: Agent) => choice.on[a] && choice.caps.follow_up && !(choice.off[a] ?? []).includes("follow_up");
   const helpers: { name: string; add: () => Promise<void>; undo: string }[] = [];
-  if (wants("claude") && !(await hooksStatus(claudeDir()).catch(() => null))?.installed) {
-    const unavailable = hooksUnavailable(claudeDir());
+  // A list that can't be read is taken as one, so the hook that holds it stays (it fails closed).
+  const hooked = await hooksStatus(claudeDir()).catch(() => null), gate = (readGuard() ?? ["?"]).length > 0;
+  // Where Claude Code can't run them (no Git Bash on Windows), they're never added, and setup says why.
+  const unavailable = hooksUnavailable(claudeDir());
+  if (wants("claude") && !hooked?.installed) {
     if (unavailable) note(dim(unavailable));
-    else helpers.push({ name: "Claude Code hooks", undo: "10and2 hooks uninstall", add: () => installHooks(claudeDir(), hookCommand()) });
+    else helpers.push({ name: "Claude Code hooks", undo: "10and2 hooks uninstall", add: () => installHooks(claudeDir(), hookCommand(), gate) });
+  } else if (hooked?.installed && hooked.gate !== gate && !unavailable) {
+    // Commands that wait: the hook that holds one, only while the list has something on it.
+    await installHooks(claudeDir(), hookCommand(), gate);
+    ok(gate ? "Claude Code's commands on your list now wait for you" : "Claude Code's commands no longer wait");
   }
   if (wants("pi") && piExtensionStatus(piAgentDir()).state !== "installed") {
     helpers.push({ name: "Pi extension", undo: "10and2 pi uninstall", add: async () => { installPiExtension(piAgentDir()); } });
@@ -483,6 +547,12 @@ function seesText(p: any) {
   return `${what} in ${where}`;
 }
 
+/** One send or start held for later, as `status` lists it: "03:00 tell API “carry on”", on this computer's clock. */
+function heldText(h: { at: string | null; said: string }): string {
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return h.at && Number.isFinite(Date.parse(h.at)) ? `${shownClock(Date.parse(h.at), zone, Date.now())} ${h.said}` : h.said;
+}
+
 /**
  * What the login service runs, and this PATH (service.ts launchFor). Windows' startup entry names neither (it runs
  * `10and2` from the PATH): there they start its supervisor this once, and the PATH is kept for it.
@@ -510,13 +580,19 @@ async function runConnector() {
   // Windows' supervisor asks it to stop over IPC, where SIGTERM never arrives: shutdown() below runs for both.
   stopLikeSigterm();
   const fatalExit = Number(flags.get("fatal-exit") ?? 78);
-  let state = { pid: process.pid, version: VERSION, startedAt: new Date().toISOString(), brain: "", linked: false, since: null as string | null, error: null as string | null, fatal: false, threads: undefined as number | undefined, projects: undefined as number | undefined, privacy: [] as string[] };
+  let state = { pid: process.pid, version: VERSION, startedAt: new Date().toISOString(), brain: "", linked: false, since: null as string | null, error: null as string | null, fatal: false, threads: undefined as number | undefined, projects: undefined as number | undefined, privacy: [] as string[],
+    schedules: [] as { at: string | null; said: string }[],
+    // Commands that wait: what's held now, by work system, and how many were stopped at once (a session nobody shows).
+    holds: {} as Record<string, HeldSummary[]>, unheld: 0, unheldAt: null as string | null,
+    /** T3 Code stopped on its own (its session refused), while the rest stays connected. */
+    t3Error: null as string | null };
   const record = (s: Partial<typeof state>) => { state = { ...state, ...s }; try { writePrivate(statusFile(), JSON.stringify(state) + "\n"); } catch { /* status is a convenience */ } };
   let policy;
   try { policy = loadPolicy(); }
   catch (e) { log(`connector: ${describe(e)} (policy: ${defaultPolicyPath()}; run \`10and2 setup\`)`); process.exitCode = fatalExit; return; }
   const origin = originOf(policy.brain);
   record({ brain: origin });
+  for (const p of policy.unresolved ?? []) log(`connector: project folder "${p}" can't be found or read; leaving it out (${defaultPolicyPath()})`);
   let token = process.env.TENANDTWO_TOKEN;
   // The login service's way: a start before the keyring opens (boot, with lingering) waits for it instead of giving up.
   // Windows has no keyring: DPAPI reads the key from sign-in or never (made for another account), so it stops as unpaired.
@@ -550,19 +626,30 @@ async function runConnector() {
     ? new T3Adapter({
       // Without T3_URL, where T3 says it is, at each connect (it moves off 3773 when that's taken).
       ...(process.env.T3_URL ? { baseUrl: process.env.T3_URL } : {}), cli: [process.env.T3_CLI ?? "t3"], label: "10and2-connector", log,
-      visible: (root) => visible(policy, root), worktreeBase: policy.worktreeBase, onRevoked: () => { record({ error: "T3 revoked the connector's session" }); stop(fatalExit); },
+      visible: (root) => visible(policy, root), worktreeBase: policy.worktreeBase, policy,
+      // T3 Code alone stops: the other agents stay connected (status says T3's, and how to bring it back).
+      onRevoked: () => record({ t3Error: "T3 Code refused 10 & 2's session (revoked there?)" }),
+      onHolds: (held) => record({ holds: { ...state.holds, t3: held } }),
     })
     : null;
   // Claude Code has no command ids, so a lost outcome is never sent again (the ledger reports it unknown).
   const claude = policy.claude
     ? new ClaudeAdapter({ policy, configDir: claudeDir(), db: join(stateDirectory(), "claude.db"), stateDir: join(stateDirectory(), "claude"),
       // On Windows the adapter makes a new pipe at each start and names it where hookSocket() reads it.
-      hookSocketPath: process.platform === "win32" ? undefined : hookSocket()?.path, log })
+      hookSocketPath: process.platform === "win32" ? undefined : hookSocket()?.path, log,
+      // Commands that wait: a T3 Code thread run by Claude holds its own; one nobody shows is counted for status.
+      // T3 decides for its own threads, and stops one at once where it may not answer (never the Claude adapter's then).
+      claimGate: t3 ? (session, socket, command, matched) => t3.claimGate(session, socket, command, matched) : undefined,
+      onUnheld: () => record({ unheld: state.unheld + 1, unheldAt: new Date().toISOString() }),
+      onHolds: (held) => record({ holds: { ...state.holds, claude: held } }) })
     : null;
   // A copy of 10and2's Pi extension from an older 10and2 is brought up to this one's: Pi loads it in each Pi started after.
   if (policy.pi) { try { if (piExtensionStatus(piAgentDir()).state === "outdated") { installPiExtension(piAgentDir()); log("pi: updated 10and2's Pi extension"); } } catch (e) { log(`pi: ${describe(e)}`); } }
   if (policy.copilot) { try { if (updateCopilotExtension(copilotDir())) log("copilot: updated 10and2's Copilot extension"); } catch (e) { log(`copilot: ${describe(e)}`); } }
   if (policy.opencode) { try { const s = await openCodePluginStatus(); if (s.installed && !s.current) { await installOpenCodePlugin(); log("opencode: updated 10and2's OpenCode plugin"); } } catch (e) { log(`opencode: ${describe(e)}`); } }
+  // Commands that wait's entries, where installed, name this connector's own settings and socket (setup may have run
+  // with another XDG_RUNTIME_DIR, XDG_STATE_HOME or HOME than the service has), as this 10and2 writes them.
+  if (policy.claude) { try { if (await refreshGate(claudeDir())) log("claude: the hook that holds commands on your list now names this connector's socket and settings"); } catch (e) { log(`claude: ${describe(e)}`); } }
   // Codex doesn't dedupe a message it's sent twice, so a lost outcome is never sent again.
   const codex = policy.codex ? new CodexAdapter({ policy, codexHome: defaultCodexHome(), db: join(stateDirectory(), "codex.db"), stateDir: join(stateDirectory(), "codex"), log }) : null;
   const opencode = policy.opencode ? new OpenCodeAdapter({ policy, db: join(stateDirectory(), "opencode.db"), stateDir: join(stateDirectory(), "opencode"), log }) : null;
@@ -581,10 +668,16 @@ async function runConnector() {
     ...(gemini ? [{ prefix: "gemini", adapter: gemini }] : []),
     ...(copilot ? [{ prefix: "copilot", adapter: copilot }] : []),
     ...(cursor ? [{ prefix: "cursor", adapter: cursor }] : []),
-  ], policy);
+  ], policy, () => ledger.sends(), (key, found) => { try { ledger.claim(key, found); } catch (e) { log(`ledger: couldn't keep a send's message (${describe(e)})`); } });
   let privacyAsking = false;
+  // Sends and starts set up for later, held here and run at their time while the link says nothing was stopped since.
+  const schedules = new Schedules({ ledger, local: adapter, policy, device: deviceOf(token, parseCredential(token)?.deviceId), gate: () => link?.fireable() ?? false, log });
+  const held = () => record({ schedules: schedules.summary() });
+  schedules.watch(held);
+  held();
   link = new Link({
-    url: policy.brain, token, adapter, ledger, log,
+    url: policy.brain, token, adapter, ledger, log, schedules,
+    onRevoked: () => { try { schedules.revoke(); } catch (e) { log(`schedules: ${describe(e)}`); } },
     onFatal: () => { record({ error: "this computer was disconnected (revoked on the website, or set up again elsewhere)", fatal: true }); stop(fatalExit); },
     onView: (n) => {
       if (n.threads !== state.threads || n.projects !== state.projects) record(n);
@@ -601,12 +694,14 @@ async function runConnector() {
     onState: (s) => record({ linked: s.linked, ...(s.linked !== state.linked ? { since: new Date().toISOString() } : {}), ...(s.linked ? { error: null } : s.error ? { error: s.error } : {}) }),
   });
   link.start();
+  schedules.start();
   log(`connector ${VERSION}: linking to ${origin}`);
   const proxy = proxyAdvice();
   if (proxy) log(`connector: ${proxy}`);
   // Running on, it leaves a first run that hasn't answered yet to finish (agents.ts onPath).
   void detect(process.env, undefined, true, (a) => !!policy[a]).then((found) => { for (const f of found) { const w = policy[f.agent] && f.installed ? versionWarning(f.agent, f.name, f.version) : null; if (w) log(`${f.agent}: ${w}`); } }, () => {});
-  void t3?.start().catch((e) => { log(`t3: ${describe(e)}; not restarting`); record({ error: `T3 Code: ${describe(e)}` }); stop(fatalExit); });
+  // T3 Code that can't be reached stops only itself; every other agent stays connected.
+  void t3?.start().catch((e) => { log(`t3: ${describe(e)}; not restarting`); record({ t3Error: `T3 Code: ${describe(e)}` }); });
   void claude?.start().then(() => log("claude: reading sessions"), (e) => log(`claude: ${describe(e)}`));
   void codex?.start().then(() => log("codex: reading sessions"), (e) => log(`codex: ${describe(e)}`));
   void opencode?.start().then(() => log("opencode: reading sessions"), (e) => log(`opencode: ${describe(e)}`));
@@ -618,6 +713,7 @@ async function runConnector() {
     if (stopping) return;
     stopping = true;
     link?.close();
+    schedules.stop();
     await adapter.close();
     await ledger.close();
     record({ linked: false });
@@ -645,11 +741,20 @@ async function status() {
   // A brain of your own has no website to approve this computer on, so plain setup can't connect it again.
   if (!cred && !token) bad(`Not connected to ${account(origin, key)}: ${cmd(paired(origin) ? "10and2 setup" : `10and2 setup --brain=${origin} --token`)} connects it.`);
   // A log that isn't there yet: it has never run (set up from a terminal run as administrator, on Windows).
-  else if (!alive) bad(`Not running. ${!s.installed ? `${cmd("10and2 autostart on")} keeps it running.` : isAbsolute(s.logs) && !existsSync(s.logs) ? "It starts at your next sign-in." : `It should start at login; see ${s.logs}`}`);
+  // Stopped for good (exit 78): its key was refused. Forgetting it is what connects it again.
+  else if (!alive && st?.fatal) {
+    bad(`Disconnected from ${account(origin, key)}${st.error ? `: ${st.error}` : ""}`);
+    say(`  To connect it again: ${cmd("10and2 revoke")}, then ${cmd("10and2 setup")}.`);
+  }
+  else if (!alive) bad(`Not running. ${!s.installed ? `${cmd("10and2 autostart on")} keeps it running.` : isAbsolute(s.logs) && !existsSync(s.logs) ? "It starts at your next sign-in." : `It should start at login; see ${s.logs}`}${st?.error ? ` ${dim(`(last: ${st.error})`)}` : ""}`);
   else if (st.linked) ok(`Connected to ${account(origin, key)} ${dim(`· ${Date.now() - Date.parse(st.since) < 10_000 ? "just now" : `for ${ago(st.since)}`}`)}${st.threads !== undefined ? ` ${dim("·")} ${sizeText(st)}` : ""}`);
   else warn(`Connecting to ${account(origin, key)}${st.error ? `: ${st.error}` : ""}`);
   // What macOS keeps from the running connector (privacy.ts), as it last found.
   if (alive) for (const why of Array.isArray(st.privacy) ? st.privacy : []) warn(why);
+  // T3 Code stopped on its own; the other agents are still connected.
+  if (alive && typeof st.t3Error === "string") warn(`${st.t3Error}. The other agents stay connected; ${cmd(s.installed ? "10and2 autostart on" : "10and2 run")} restarts it to try T3 Code again.`);
+  // Upgraded while it runs: the running one is still the old version until it restarts.
+  if (alive && typeof st.version === "string" && st.version !== VERSION) warn(`It's running ${st.version}, and ${VERSION} is installed: ${s.installed ? `${cmd("10and2 autostart on")} restarts it with ${VERSION}` : `stop it and ${cmd("10and2 run")} again for ${VERSION}`}.`);
   // Not running is said once, above; running (here, or in another terminal), whether it also starts at login.
   if ((cred || token) && alive) {
     if (s.installed) (s.running ? ok : warn)(s.running ? "Starts at login" : `Starts at login, but isn't running: see ${s.logs}`);
@@ -657,6 +762,8 @@ async function status() {
   }
   say();
   note(`Sees   ${seesText(policy)}`);
+  for (const p of policy.unresolved ?? []) warn(`The project folder ${p} can't be found or read, so it's left out. Connect its drive, or take it out of "projects" in ${defaultPolicyPath()}.`);
+  if (Array.isArray(policy.projects)) for (const p of policy.projects) if (!existsSync(p)) warn(`The project folder ${p} isn't there (moved, or its drive isn't connected), so there's nothing to see in it.`);
   // Each agent, and what Driver may do with it after the spoken yes (choose.ts).
   const choice = choiceOf(readPolicyFile());
   for (const a of ORDER) {
@@ -669,9 +776,23 @@ async function status() {
     note(`New work runs with at most ${CEILING_LABEL[policy.maxRuntimeMode]}`);
     if (policy.t3) note(`New T3 Code worktrees start from ${baseText(policy.worktreeBase)}`);
   }
+  // What a send or start set up for later may do here, as far as the actions allow it too.
+  const rules = !policy.actions.includes("follow_up") ? "off" : rulesOf(policy) === "start" && !policy.actions.includes("start_work") ? "send" : rulesOf(policy);
+  note(`For later    ${RULES_LABEL[rules]}`);
+  const later: { at: string | null; said: string }[] = Array.isArray(st?.schedules) ? st.schedules : [];
+  if (later.length) note(`Holding ${later.length} for later: ${later.map(heldText).join("; ")}`);
   if (policy.claude) {
     const h = await hooksStatus(claudeDir()).catch(() => null);
     if (!h?.installed) note(dim(hooksUnavailable(claudeDir()) ?? `${cmd("10and2 hooks install")} lets 10 & 2 answer Claude Code's questions, and makes updates instant`));
+    // Commands that wait (Fable's 4-H1): how many kinds are on, and what waits now.
+    const guard = policy.guard ?? [];
+    if (guard.length) {
+      const holds: HeldSummary[] = alive && st?.holds && typeof st.holds === "object" ? Object.values(st.holds as Record<string, HeldSummary[]>).flat().filter((x) => x && typeof x.command === "string") : [];
+      const kinds = waitKinds(guard);
+      note(`${WAIT_WORDS.heading}: ${kinds} ${kinds === 1 ? "kind" : "kinds"} on.${holds.length ? ` ${holds.length} waiting now: ${holds.map((x) => `${x.command}${x.thread ? ` (${x.thread})` : ""}`).join(", ")}.` : ""}`);
+      if (!h?.gate) note(dim(`They don't wait yet: ${cmd("10and2 hooks install")} adds the hook that holds them.`));
+      if (alive && st?.unheld) warn(`${st.unheld} ${st.unheld === 1 ? "command on your list was" : "commands on your list were"} stopped at once since it started (last ${ago(st.unheldAt)} ago): ${st.unheld === 1 ? "its session isn't" : "their sessions aren't"} one 10 & 2 shows (a headless claude -p, another app), so ${st.unheld === 1 ? "it" : "they"} couldn't wait for you`);
+    }
     const db = join(stateDirectory(), "claude.db");
     if (existsSync(db)) {
       const conn = new DatabaseSync(databasePath(db), { readOnly: true });
@@ -709,6 +830,12 @@ async function revoke(uninstalling = false) {
     } catch { spin.warn(`Couldn't reach ${hostOf(origin)}: remove this computer on your account page too`); }
   }
   await new Service().uninstall();
+  // What it held for later goes with it. A connector still running here (by hand) holds the database, and cancels them
+  // itself when 10 & 2 tells it it's disconnected.
+  try {
+    const db = join(stateDirectory(), "connector.db");
+    if (existsSync(db)) { const conn = new DatabaseSync(db); try { cancelWaiting(conn); } finally { conn.close(); } }
+  } catch { /* held by a running connector */ }
   await creds.delete(origin);
   rmSync(statusFile(), { force: true });
   if (cred) ok(`Forgot its key, and it no longer starts at login${uninstalling ? "" : ` ${dim(`· your settings stay in ${defaultPolicyPath()}; ${cmd("10and2 uninstall")} removes everything`)}`}`);
@@ -718,25 +845,25 @@ async function revoke(uninstalling = false) {
  * What Claude Code's hooks run. This Node and this 10and2 first, as setup ran them: Claude Code started from the
  * desktop app has hardly any PATH, and in a project whose .nvmrc picks another Node, PATH's 10and2 is missing or runs
  * on a Node too old for it. Once either is gone (an upgrade), the `10and2` on PATH. Windows runs the hooks in Git Bash,
- * where that's `10and2`; a checkout's hooks run `10and2` too.
+ * where that's `10and2`; a checkout's hooks run `10and2` too. As a shell function (`hookLauncher`), so a Commands that
+ * wait entry's own arguments reach whichever runs and its `|| … exit 2` still fails closed (the engine's stage 4c).
  */
 function hookCommand(): string {
   if (process.env.TENANDTWO_COMMAND) return process.env.TENANDTWO_COMMAND;
   const l = launch();
   if (process.platform === "win32" || checkout(l) || temporary(l)) return "10and2";
-  const node = process.execPath, script = realpathOr(process.argv[1]);
-  const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
-  return `{ [ -x ${q(node)} ] && [ -f ${q(script)} ] && exec ${q(node)} ${q(script)} hook; }; 10and2`;
+  return hookLauncher(process.execPath, realpathOr(process.argv[1]));
 }
 function realpathOr(p: string) { try { return realpathSync(p); } catch { return p; } }
 
 /**
  * `10and2 uninstall`: everything 10and2 added to this computer, gone: disconnected, no longer started at login (nor a
- * brain of your own), its Claude Code hooks, Pi extension and OpenCode plugin removed, and its settings, key and files
- * deleted. Each part is tried even when one fails. The program itself is the package manager's to remove, said last.
+ * brain of your own), its Claude Code hooks, Pi extension, OpenCode plugin and Copilot extension removed, and its
+ * settings, key and files deleted. Each part is tried even when one fails. The program itself is the package manager's
+ * to remove, said last.
  */
 async function uninstall() {
-  if (!flags.has("yes") && !await confirm(`Remove 10and2 from this computer? It disconnects it, stops it starting at login, removes its Claude Code hooks, Pi extension and OpenCode plugin, and deletes its settings and files (${configDirectory()}, ${stateDirectory()})`, true)) throw new Cancelled();
+  if (!flags.has("yes") && !await confirm(`Remove 10and2 from this computer? It disconnects it, stops it starting at login, removes its Claude Code hooks, Pi extension, OpenCode plugin and Copilot extension, and deletes its settings and files (${configDirectory()}, ${stateDirectory()})`, true)) throw new Cancelled();
   flags.set("yes", "true");
   const step = async (what: string, f: () => Promise<boolean | void>) => {
     try { if (await f() !== false) ok(what); } catch (e) { warn(`Couldn't ${what.charAt(0).toLowerCase()}${what.slice(1)} (${describe(e)})`); }
@@ -756,6 +883,10 @@ async function uninstall() {
   await step("Removed its OpenCode plugin", async () => {
     if (!(await openCodePluginStatus()).installed) return false;
     await uninstallOpenCodePlugin();
+  });
+  await step("Removed its Copilot extension", async () => {
+    if (!["installed", "outdated", "off"].includes(copilotExtensionStatus(copilotDir()).state)) return false;
+    uninstallCopilotExtension(copilotDir());
   });
   await step(`Deleted its settings and files`, async () => {
     for (const dir of [configDirectory(), stateDirectory(), ...(process.env.XDG_RUNTIME_DIR ? [join(process.env.XDG_RUNTIME_DIR, "10and2")] : [])]) rmSync(dir, { recursive: true, force: true });
@@ -790,7 +921,7 @@ async function autostart() {
 async function hooks() {
   // Hooks edit the user's own Claude Code settings, so they're only ever installed or removed when asked (here, or by
   // setup's question).
-  if (sub === "install") await installHooks(claudeDir(), hookCommand());
+  if (sub === "install") await installHooks(claudeDir(), hookCommand(), (readGuard() ?? ["?"]).length > 0);
   else if (sub === "uninstall") await uninstallHooks(claudeDir());
   else if (sub !== "status") throw new Error(`${cmd("10and2 hooks")} takes install, uninstall or status.`);
   const s = await hooksStatus(claudeDir());

@@ -38,7 +38,7 @@ export const SPEECH_PRICES: Record<string, number> = { "gpt-4o-mini-tts": 0.015,
 export const SPEECH_CHARS_PER_MINUTE = 900;
 
 /** Every operation that pays the provider (cloud/src/costs.ts names the same, with how each is metered). */
-export const OPS = ["call", "backend", "speech", "voice_sample", "rewriter", "briefing_writer", "classifier", "opener", "titler", "purposer", "demo_writer"] as const;
+export const OPS = ["call", "backend", "speech", "voice_sample", "rewriter", "briefing_writer", "classifier", "opener", "titler", "purposer", "demo_writer", "rules_reader", "rules_judge"] as const;
 export type Op = (typeof OPS)[number];
 
 /**
@@ -47,7 +47,7 @@ export type Op = (typeof OPS)[number];
  * rewritten for listening, a new thread's title and a purpose asked for in a call are waited on, and go without the
  * model past the budget.
  */
-export const BACKGROUND: readonly Op[] = ["classifier", "opener", "briefing_writer", "rewriter", "titler", "purposer"];
+export const BACKGROUND: readonly Op[] = ["classifier", "opener", "briefing_writer", "rewriter", "titler", "purposer", "rules_reader", "rules_judge"];
 
 /** A model call's usage, as the provider reports it. */
 export type Spent = {

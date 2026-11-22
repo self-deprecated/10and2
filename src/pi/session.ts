@@ -5,6 +5,7 @@
 import { openSync, closeSync, readSync, fstatSync } from "node:fs";
 import type { ItemStatus, PastReply } from "../contract.ts";
 import { limited } from "../work.ts";
+import { digestOf, newest, type Write } from "../typed.ts";
 
 /** A message's text: a string, or its text blocks joined. */
 export function textOf(content: unknown): string {
@@ -44,6 +45,13 @@ export type Projection = {
   wroteAt: string | null;
   progress: string | null;
   replies: PastReply[];
+  /**
+   * What a person typed (`WorkItem.typed`, typed.ts): the user's messages on the active branch after its first, which Pi
+   * doesn't say a person typed (a session a script started looks the same), so it's never counted. Not known to be at
+   * this computer (`desk` false): an extension's `sendUserMessage` writes the same user message, so none of them ends
+   * Away (the Skeptic on 3.9 and 3.10: in doubt, not yours). An extension's notice is a custom message, not the user's.
+   */
+  writes: Write[];
 };
 
 export class PiSession {
@@ -154,11 +162,13 @@ export class PiSession {
     let status: ItemStatus = "idle", unanswered = false, updatedAt: string | null = null, lastRunAt: string | null = null, wroteAt: string | null = null;
     let progress: string | null = null;
     let prompt: { id: string; text: string } | null = null;
+    const writes: Write[] = [];
     const replies = new Map<string, PastReply>();
     for (const node of this.branch()) {
       if (node.k === "o") continue;
       updatedAt = node.at ?? updatedAt;
       if (node.k === "u") {
+        if (prompt && node.at) writes.push({ at: node.at, digest: digestOf(node.text), desk: false });
         prompt = { id: node.id, text: node.text }; wroteAt = node.at;
         status = "idle"; unanswered = true; progress = null;
       } else if (node.k === "t") unanswered = true;
@@ -175,7 +185,7 @@ export class PiSession {
         } else status = "idle";
       }
     }
-    this.cached = { status, unanswered, updatedAt, lastRunAt, wroteAt, progress, replies: [...replies.values()].sort((a, b) => b.at.localeCompare(a.at)) };
+    this.cached = { status, unanswered, updatedAt, lastRunAt, wroteAt, progress, replies: [...replies.values()].sort((a, b) => b.at.localeCompare(a.at)), writes: newest(writes) };
     return this.cached;
   }
 }

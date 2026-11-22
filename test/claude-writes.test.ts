@@ -7,7 +7,7 @@ import { createHash } from "node:crypto";
 import { ClaudeAdapter, permissionMode, resumeMode, sessionForKey } from "../src/claude/adapter.ts";
 import type { Action, LaunchProfile } from "../src/contract.ts";
 import { harness, until } from "./fixtures/claude/helpers.ts";
-import { assertPrivate, SLOW } from "./fixtures/platform.ts";
+import { assertPrivate, NODE, SLOW } from "./fixtures/platform.ts";
 
 const profile: LaunchProfile = { name: "Normal", runtimeMode: "approval-required", workspace: "root", interactionMode: "default" };
 function env(t: Parameters<typeof harness>[0], key: string, value: string) {
@@ -224,7 +224,7 @@ test("synchronous spawn failure releases its reservation and removes private log
   const { readdirSync } = await import("node:fs");
   const h = harness(t), f = h.completed(); await h.adapter.start();
   // A null byte is refused as spawn is called, on every system, after the command is found.
-  h.options.claudeCommand = [process.execPath, "invalid\0argument"];
+  h.options.claudeCommand = [NODE, "invalid\0argument"];
   const receipt = await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "x" }, "bad-spawn");
   assert.equal(receipt.ok, false); if (!receipt.ok) assert.match(receipt.error, /couldn't start/);
   const db = new DatabaseSync(h.options.db);
@@ -285,4 +285,13 @@ test("a session that doesn't say its permission mode is refused, and nothing run
   assert.match((await h.adapter.check(action))!, /can't tell what permissions/);
   assert.equal((await h.adapter.execute(action, "no-mode")).ok, false);
   assert.equal(existsSync(join(h.config, "calls.jsonl")), false);
+});
+
+// The Skeptic on 3.10: a headless run's prompt is recorded with promptSource "sdk", never a person's, so the Ledger drops
+// its record of it (`sendLeftOut`).
+test("a headless follow-up is never a person's prompt (sendLeftOut)", async (t) => {
+  const h = harness(t), f = h.completed(); await h.adapter.start();
+  const action: Action = { kind: "follow_up", itemId: f.id, message: "Yes, go ahead." };
+  assert.deepEqual(await h.adapter.execute(action, "follow"), { ok: true });
+  assert.equal(h.adapter.sendLeftOut(action, "follow"), true);
 });

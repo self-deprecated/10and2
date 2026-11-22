@@ -3,8 +3,12 @@
 // Pure: only words in, only claims out. A claim is an action said as done, by Driver: "Sent the message to …", "Kept.",
 // "I flagged that moment", "It's sent", "Done." Never a readback, a quote, a question, a promise or a negation.
 
-/** The actions Driver can say it did. "done": any of them. */
-export type Claim = "sent" | "started" | "settled" | "snoozed" | "archived" | "kept" | "flagged" | "starred" | "done";
+/**
+ * The actions Driver can say it did. "done": any of them. "scheduled": a send or a start set up for later (stage 4b);
+ * "stopped": stopped or cancelled, as a held command or a proposal called off is (stage 4; Fable's review: a made-up
+ * "Cancelled." for a send set up for later, which still goes at its time, must be corrected).
+ */
+export type Claim = "sent" | "started" | "settled" | "snoozed" | "archived" | "kept" | "flagged" | "starred" | "scheduled" | "stopped" | "done";
 
 /** What a change carried out is, as a claim of it: a reply is "sent". */
 export const CLAIM_OF: Record<string, Claim> = {
@@ -17,11 +21,17 @@ export const CLAIM_OF: Record<string, Claim> = {
  * it's starred" was corrected to "nothing was starred", and the phone showed Not sent, for a start that did both.
  */
 export function claimsOf(p: { action: string; state: string; fields: { itemId?: string } }): Claim[] {
+  // Set up for later: scheduled, never sent or started until its time.
+  if (p.state === "scheduled") return ["scheduled"];
   if ((p.state !== "executed" && p.state !== "partial") || !CLAIM_OF[p.action]) return [];
   return p.action === "start_work" && p.fields.itemId ? ["started", "starred"] : [CLAIM_OF[p.action]];
 }
 
-const VERBS = ["sent", "started", "settled", "snoozed", "archived", "kept", "flagged", "starred"];
+const VERBS = ["sent", "started", "settled", "snoozed", "archived", "kept", "flagged", "starred", "scheduled", "stopped", "cancelled", "canceled"];
+/** A verb's claim: "cancelled" is "stopped". */
+const CLAIM_BY: Record<string, Claim> = { cancelled: "stopped", canceled: "stopped" };
+/** "I've stopped watching it": a watch or a recording ended, not something stopped from going. */
+const STOPPED_DOING = /^\s+(?:watching|following|waiting|listening|recording|dictating|reading|holding|calling)\b/i;
 /** Opening words that don't change what the sentence claims: "Okay, sent." */
 const LEAD = /^(?:(?:okay|ok|right|alright|all right|great|good|so|and|yes|yep|sure|well|hmm)\b[\s,.!—-]*)*/i;
 /** What may follow a bare verb for it to be the claim, not a word for a thread's state ("Settled threads aren't …"). */
@@ -30,7 +40,7 @@ const OBJECT = /^(?:the|it|that|this|your|them|all|both|until|to|for|and|its|the
 const MINE = new RegExp(String.raw`\bI(?:'ve|’ve| have)?(?: just| now| also)? (${VERBS.join("|")})\b`, "g");
 /** It as done: "It's sent.", "The message has been sent to Alpha.", not "It's sent the build" (the thread did that). */
 const PASSIVE = new RegExp(
-  String.raw`\b(?:it|that|this|the (?:message|reply|follow-up|moment))(?:'s|’s| is| was| has been|'s been|’s been)(?: now| just| all)? (sent|snoozed|archived|kept|flagged|starred)(?=\s*(?:$|[.!,;:—]|to\b|now\b|off\b|for\b))`,
+  String.raw`\b(?:it|that|this|the (?:message|reply|follow-up|moment))(?:'s|’s| is| was| has been|'s been|’s been)(?: now| just| all)? (sent|snoozed|archived|kept|flagged|starred|scheduled|stopped|cancelled|canceled)(?=\s*(?:$|[.!,;:—]|to\b|now\b|off\b|for\b))`,
   "gi",
 );
 const DONE = /^(?:(?:all|that's|that’s|that is|it's|it’s)\s+)?done\W*$/i;
@@ -61,8 +71,8 @@ export function claimIn(sentence: string): Said[] {
   if (!s || /\?\s*$/.test(s) || NEGATED.test(s) || NOT_YET.test(s)) return [];
   const out: Said[] = [];
   const add = (verb: string, first: boolean) => {
-    const claim = verb.toLowerCase() as Claim;
-    const own = first || claim === "kept" || claim === "flagged" || claim === "starred" || claim === "done";
+    const claim = CLAIM_BY[verb.toLowerCase()] ?? verb.toLowerCase() as Claim;
+    const own = first || claim === "kept" || claim === "flagged" || claim === "starred" || claim === "scheduled" || claim === "done";
     if (!out.some((o) => o.claim === claim)) out.push({ claim, own });
   };
   const bare = s.replace(/^[\s'"‘’“”(]+/, "").replace(LEAD, "");
@@ -73,7 +83,7 @@ export function claimIn(sentence: string): Said[] {
     // Before a name ("Settled Fix login."), an object ("Kept your reply"), or nothing ("Kept.").
     if (!rest || /^[.!,;:—-]/.test(rest) || OBJECT.test(rest) || /^[\d“"‘']/.test(rest) || /^[A-Z]/.test(rest)) add(head[1], false);
   }
-  for (const m of s.matchAll(MINE)) add(m[1], true);
+  for (const m of s.matchAll(MINE)) if (!/^stopped$/i.test(m[1]) || !STOPPED_DOING.test(s.slice(m.index! + m[0].length))) add(m[1], true);
   for (const m of s.matchAll(PASSIVE)) add(m[1], false);
   return out;
 }
@@ -101,4 +111,22 @@ export function claimsIn(text: string, complete = false): { sentence: string; sa
   const parts = unquoted(text).split(/(?<=[.!?])\s*/);
   const over = complete || /[.!?]\s*$/.test(text) ? parts : parts.slice(0, -1);
   return over.filter((s) => s.trim()).map((sentence) => ({ sentence: sentence.trim(), said: claimIn(sentence) }));
+}
+
+/** A sentence's words as compared with a line the app wrote: lower case, letters and digits only, quotes' words kept. */
+const wordsOf = (text: string) => text.toLowerCase().replace(/[’']/g, "").split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+
+/**
+ * Whether `sentence` (as `claimsIn` gives it: quotes taken out) is the app's own words, said as written: its words, three
+ * or more, run on in one of `lines` (a told-after line the brain queued for the call, "Sent to API at 2 this afternoon:
+ * "carry on"."), so its claim is the brain's record, not the voice's (Fable's review of stage 4). A made-up "Sent." isn't.
+ */
+export function inLine(sentence: string, lines: readonly string[]): boolean {
+  const words = wordsOf(sentence);
+  if (words.length < 3) return false;
+  return lines.some((line) => {
+    const all = wordsOf(line);
+    for (let i = 0; i + words.length <= all.length; i++) if (words.every((w, k) => all[i + k] === w)) return true;
+    return false;
+  });
 }

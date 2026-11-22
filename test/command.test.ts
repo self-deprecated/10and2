@@ -1,9 +1,10 @@
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { envVar, execFileCommand, resolveCommand, shimTarget, which } from "../src/command.ts";
+import { envVar, execFileCommand, hookLauncher, resolveCommand, shimTarget, which } from "../src/command.ts";
 
 // Windows' rules, on whatever system runs the tests: real files, found through a PATH split on ";".
 const made: string[] = [];
@@ -248,4 +249,31 @@ set ELECTRON_RUN_AS_NODE=1\r
 test("execFileCommand gives every failure to its callback, starting it included", async () => {
   const err = await new Promise<any>((resolve) => execFileCommand("10and2-no-such-command", [], { env: { PATH: dir() } }, (e) => resolve(e)));
   assert.equal(err.code, "ENOENT");
+});
+
+test("Claude Code's hook, run by setup's own Node while it's there, else the 10and2 on PATH: either gets every argument after it, and a gate's entry fails closed for both", { skip: process.platform === "win32" && "Windows' hooks run 10and2 in Git Bash" }, () => {
+  const d = dir();
+  // A stand-in for setup's Node, and for the 10and2 on PATH: each writes what it was given, and exits as told.
+  const fake = (name: string) => {
+    const f = join(d, name);
+    writeFileSync(f, `#!/bin/sh\necho "${name} $*" >> "${join(d, "ran")}"\nexit "\${EXIT:-0}"\n`);
+    chmodSync(f, 0o755);
+    return f;
+  };
+  const node = fake("node it's"), script = join(d, "10and2.js");
+  writeFileSync(script, "");
+  mkdirSync(join(d, "bin"));
+  writeFileSync(join(d, "bin", "10and2"), `#!/bin/sh\necho "path $*" >> "${join(d, "ran")}"\nexit "\${EXIT:-0}"\n`);
+  chmodSync(join(d, "bin", "10and2"), 0o755);
+  const gate = `${hookLauncher(node, script)} hook --policy '/p q' --socket '/s' || { echo "Not run" >&2; exit 2; }`;
+  const run = (exit = "0") => {
+    writeFileSync(join(d, "ran"), "");
+    const r = spawnSync("/bin/sh", ["-c", gate], { env: { PATH: `${join(d, "bin")}:/usr/bin:/bin`, EXIT: exit }, encoding: "utf8" });
+    return { status: r.status, stderr: r.stderr, ran: readFileSync(join(d, "ran"), "utf8").trim() };
+  };
+  assert.deepEqual(run(), { status: 0, stderr: "", ran: `node it's ${script} hook --policy /p q --socket /s` });
+  assert.deepEqual(run("1"), { status: 2, stderr: "Not run\n", ran: `node it's ${script} hook --policy /p q --socket /s` }, "fails closed");
+  rmSync(script);
+  assert.deepEqual(run(), { status: 0, stderr: "", ran: "path hook --policy /p q --socket /s" }, "setup's 10and2 gone: the one on PATH, with the same arguments");
+  assert.deepEqual(run("1").status, 2);
 });

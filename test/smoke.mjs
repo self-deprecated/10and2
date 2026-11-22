@@ -1,5 +1,5 @@
 // The published file runs on its own: no TypeScript, no node_modules, on whichever Node runs this script.
-// `npm run check` runs it after the build; run it under Node 22 too (`nix shell nixpkgs#nodejs_22 -c node test/smoke.mjs`).
+// `bun run check` and `npm run check:node` run it after the build; run it under Node 22 too (`nix shell nixpkgs#nodejs_22 -c node test/smoke.mjs`).
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";

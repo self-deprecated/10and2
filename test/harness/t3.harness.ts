@@ -12,7 +12,8 @@ import { T3Adapter } from "../../src/t3/adapter.ts";
 import { issueSession, revokeSession, CONNECTOR_SCOPES } from "../../src/t3/auth.ts";
 import { RpcClient } from "../../src/t3/rpc.ts";
 import type { Action, LaunchProfile } from "../../src/contract.ts";
-import { has, inContainer, mockModel, project, sleep, until } from "./lib.ts";
+import { ANSWERED } from "../../src/util.ts";
+import { checksByStart, has, inContainer, local, mockModel, project, scheduled, sleep, typedOf, until } from "./lib.ts";
 
 const skip = !inContainer || !has("t3") || !has("codex") ? "runs in the harness container (test/harness/run.sh)" : false;
 const PORT = 3773;
@@ -56,6 +57,9 @@ test("T3 Code: start work, list, read, follow up idle and busy, answer a questio
 
   const adapter = new T3Adapter({ baseUrl, cli: ["t3"], label: "10and2-harness", log: (m) => t.diagnostic(m), worktreeBase: "HEAD" });
   t.after(async () => { await adapter.close(); });
+  // What the brain is told of who wrote (the engine's stage 3.9): every send below is 10 & 2's, recorded as it goes.
+  const typed = typedOf(adapter);
+  const starts: string[] = [];
 
   // Each feature is its own subtest, so an older T3 Code can pass some and fail others (src/versions.ts).
   let id = "", place = "";
@@ -70,6 +74,9 @@ test("T3 Code: start work, list, read, follow up idle and busy, answer a questio
     const late = new Promise<never>((_, reject) => { minute = setTimeout(() => reject(new Error("T3 didn't connect within a minute")), 60_000); });
     try { await Promise.race([adapter.start(), late]); } finally { clearTimeout(minute); }
     await until("the project to be a place", () => adapter.places().some((p) => p.name === "lap-timer"), 30_000);
+    // Only this test's: another of that name in T3's data (a harness run before, in the same container) would take the
+    // work into its folder, where the checks' test files aren't (stage 4's final review: the "checks" subtest's flake).
+    assert.equal(adapter.places().filter((p) => p.name === "lap-timer").length, 1, JSON.stringify(adapter.places()));
     place = adapter.places().find((p) => p.name === "lap-timer")!.id;
     // A new project has no default model; T3's own clients set one. The test does it with a session of its own.
     const s = await issueSession({ cli: ["t3"], label: "10and2-harness-setup", ttl: "10m", scopes: CONNECTOR_SCOPES });
@@ -84,6 +91,7 @@ test("T3 Code: start work, list, read, follow up idle and busy, answer a questio
     const started = await adapter.execute({ kind: "start_work", placeId: place, title: "Harness start", message: "Start words STARTONE", profile }, "start");
     assert.equal(started.ok, true, JSON.stringify(started));
     id = (started as { itemId: string }).itemId;
+    starts.push(id);
     await until("the model to get the new work", () => mock.saw("Start words STARTONE"), 90_000);
     await until("it to be listed, done", async () => (await item())?.status === "completed", 90_000);
     assert.equal((await item())!.title, "Harness start");
@@ -111,6 +119,7 @@ test("T3 Code: start work, list, read, follow up idle and busy, answer a questio
     const started = await adapter.execute({ kind: "start_work", placeId: place, title: "Harness question", message: "Please ASKQ now", profile }, "ask");
     assert.equal(started.ok, true, JSON.stringify(started));
     const askId = (started as { itemId: string }).itemId;
+    starts.push(askId);
     await until("the question to be read", async () => /Which one\? Options: Alpha \/ Beta/.test((await adapter.report(askId)).question ?? ""), 90_000);
     assert.deepEqual(await adapter.execute({ kind: "follow_up", itemId: askId, message: "Beta, please" } as Action, "answer"), { ok: true });
     // The fake model echoes the tool's result as its reply.
@@ -118,13 +127,66 @@ test("T3 Code: start work, list, read, follow up idle and busy, answer a questio
     await until("the question to be gone", async () => (await adapter.report(askId)).question === null, 30_000);
   });
 
+  await t.test("tap: a thread's question is input, its own options its choices; a stale questionId sends nothing, and an option's label answers it", async () => {
+    const profile: LaunchProfile = { name: "Plan", runtimeMode: "full-access", workspace: "root", interactionMode: "plan" };
+    const started = await adapter.execute({ kind: "start_work", placeId: place, title: "Harness tap", message: "Please ASKQ by tap", profile }, "ask-tap");
+    assert.equal(started.ok, true, JSON.stringify(started));
+    const tapId = (started as { itemId: string }).itemId;
+    starts.push(tapId);
+    await until("the question to be read", async () => (await adapter.report(tapId)).choices?.length === 2, 90_000);
+    assert.deepEqual((await adapter.report(tapId)).choices, ["Alpha", "Beta"]);
+    const asked = (await adapter.list()).find((i) => i.id === tapId)!;
+    assert.equal(asked.questionKind, "input");
+    const tap = (questionId: string): Action => ({ kind: "follow_up", itemId: tapId, message: "Alpha", questionId });
+    assert.deepEqual(await local(adapter).execute(tap("an-earlier-question"), "tap-stale"), { ok: false, error: ANSWERED });
+    assert.deepEqual(await local(adapter).execute(tap(asked.questionId!), "tap"), { ok: true });
+    await until("the tapped option to come back from the model", async () => /^ACK RESULT .*Alpha/.test((await adapter.report(tapId)).text ?? ""), 60_000);
+    await until("the question to be gone", async () => (await adapter.report(tapId)).question === null, 30_000);
+  });
+
   await t.test("start in a worktree: new work in a fresh worktree", async () => {
     const profile: LaunchProfile = { name: "Build", runtimeMode: "full-access", workspace: "worktree", interactionMode: "default" };
     const started = await adapter.execute({ kind: "start_work", placeId: place, message: "Worktree words WTONE", profile }, "start-wt");
     assert.equal(started.ok, true, JSON.stringify(started));
     const wtId = (started as { itemId: string }).itemId;
+    starts.push(wtId);
     await until("the model to get the worktree's work", () => mock.saw("Worktree words WTONE"), 90_000);
     await until("its reply to be read", async () => (await adapter.report(wtId)).text === "ACK Worktree words WTONE", 90_000);
+  });
+
+  await t.test("typed: a message from T3's web app is yours at a computer, from its phone app yours away from one; 10 & 2's follow-ups and new work aren't", async () => {
+    await until("the last run to end", async () => (await item())?.status === "completed", 60_000);
+    // T3's own clients, as the user would type in them: a session of the test's own.
+    const s = await issueSession({ cli: ["t3"], label: "10and2-harness-typed", ttl: "10m", scopes: CONNECTOR_SCOPES });
+    const rpc = await RpcClient.connect(baseUrl, s.token);
+    const send = (text: string, creationSource: "web" | "mobile") => rpc.request("orchestration.dispatchCommand", {
+      type: "message.dispatch", commandId: `harness-${creationSource}-${Date.now()}`, threadId: id, messageId: `harness-${creationSource}-${Date.now()}`, text, attachments: [],
+      createdBy: "user", creationSource, dispatchMode: { type: "queue_after_active" } });
+    try {
+      // So far only 10 & 2 has written in it: its launch (from 10 & 2, "mobile") and its follow-ups.
+      assert.equal((await typed(id))?.desk, null, "10 & 2's own sends aren't a person's at a computer");
+      const from = Date.now();
+      await send("Web words WEBONE", "web");
+      await until("the model to get the web message", () => mock.saw("Web words WEBONE"), 60_000);
+      await until("it to be typed at a computer", async () => !!(await typed(id))?.desk, 30_000);
+      const web = (await typed(id))!;
+      assert.ok(Date.parse(web.desk!) >= from - 2000 && Date.parse(web.desk!) <= Date.now(), JSON.stringify(web));
+      assert.equal(web.at, web.desk);
+      await until("the web message's run to end", async () => (await item())?.status === "completed", 60_000);
+      await send("Phone words PHONEONE", "mobile");
+      await until("the model to get the phone message", () => mock.saw("Phone words PHONEONE"), 60_000);
+      await until("it to be yours, not at a computer", async () => (await typed(id))?.at !== web.at, 30_000);
+      const phone = (await typed(id))!;
+      assert.equal(phone.desk, web.desk, "the phone's isn't at a computer");
+      assert.deepEqual(await follow("after-typed", "Follow words FOLLOWTWO"), { ok: true });
+      await until("the model to get it", () => mock.saw("Follow words FOLLOWTWO"), 60_000);
+      await until("its run to end", async () => (await item())?.status === "completed", 60_000);
+      await sleep(1500);
+      assert.deepEqual(await typed(id), phone, "10 & 2's follow-up isn't yours");
+      for (const s of starts.slice(1)) assert.equal((await typed(s))?.desk, null, "new work 10 & 2 started isn't yours at a computer");
+    } finally {
+      rpc.close(); await revokeSession(["t3"], s.sessionId);
+    }
   });
 
   await t.test("start on a chosen model: the project offers T3's models, and new work starts on the one named", async () => {
@@ -144,6 +206,19 @@ test("T3 Code: start work, list, read, follow up idle and busy, answer a questio
     assert.ok(mock.requests().some((r) => r.texts.some((x) => x.includes("MODELONE")) && r.model === slug), `asked of ${slug}: ${JSON.stringify(mock.requests().filter((r) => r.texts.some((x) => x.includes("MODELONE"))).map((r) => r.model))}`);
     assert.deepEqual(await adapter.execute({ kind: "start_work", placeId: place, message: "Not this", profile, model: "codex:not-a-model" }, "start-no-model"),
       { ok: false, error: "T3 Code doesn't offer that model for this project now." });
+  });
+
+  await t.test("checks: a test run's pass and failure, from its command's exit, are the run's (mid-run) and the reply's checks", async () => {
+    const profile: LaunchProfile = { name: "Full", runtimeMode: "full-access", workspace: "root", interactionMode: "default" };
+    await checksByStart(adapter, place, profile, cwd);
+  });
+
+  await t.test("schedule: a message set up for later goes at its time and not before, held and sent by the connector (the engine's stage 4a)", async () => {
+    await until("it to be idle", async () => { const i = (await adapter.list()).find((x) => x.id === id); return !!i && i.status !== "running"; }, 60_000);
+    const held = await scheduled(adapter, id, "Later words LATERONE");
+    assert.equal(held.state, "sent", JSON.stringify(held));
+    await until("the model to get it", () => mock.saw("Later words LATERONE"), 60_000);
+    await until("its reply to be read", async () => (await adapter.report(id)).text === "ACK Later words LATERONE", 60_000);
   });
 
   await t.test("tidy: a thread is settled and snoozed", async () => {

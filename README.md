@@ -11,6 +11,8 @@ npm install -g 10and2
 
 Setup finds the coding agents on this computer and lets you switch off any you don't want 10 & 2 to reach, and choose what 10 & 2 may do: follow up, steer a session that's open, answer an agent's questions, start new work, and settle, snooze or archive. Each applies to every agent, and you can narrow it for one. Then setup opens your browser so you can approve this computer while signed in to your 10 & 2 account. It stays connected from then on. The connector dials out and nothing dials in, so your code stays on your computer.
 
+Keep this computer awake while you drive: closing a laptop's lid sleeps it, and takes it offline.
+
 ```sh
 10and2 status    # whether it's connected, and what 10 & 2 can see and do
 10and2 agents    # choose again which agents to connect, and what 10 & 2 may do

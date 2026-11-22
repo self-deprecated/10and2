@@ -192,6 +192,17 @@ export function execFileCommand(command: string, args: string[], options: ExecFi
   }
 }
 
+/**
+ * Claude Code's hooks' command when setup's own Node and 10and2 run them (main.ts `hookCommand`): `node` running
+ * `script` while both are there, else the `10and2` on PATH. A shell function, so what's written after it (`hook`, and a
+ * Commands that wait entry's `--policy`, `--socket` and `--settings`) reaches whichever runs, and its status is theirs:
+ * the entry's `|| { …; exit 2; }` fails closed for both (the engine's stage 4c, with main's "setup's Node first").
+ */
+export function hookLauncher(node: string, script: string): string {
+  const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  return `run10and2() { if [ -x ${q(node)} ] && [ -f ${q(script)} ]; then ${q(node)} ${q(script)} "$@"; else 10and2 "$@"; fi; }; run10and2`;
+}
+
 /** Whether a command is installed (it answers `--version`), for finding the coding agents. */
 export const installed = (command: string) => new Promise<boolean>((resolve) => {
   execFileCommand(command, ["--version"], { timeout: 5000 }, (err) => resolve(!err));

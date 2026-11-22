@@ -14,6 +14,7 @@ import type { Policy, RuntimeMode } from "../policy.ts";
 import { Store } from "../claude/store.ts";
 import { pidState, procStart, sessionId } from "../claude/registry.ts";
 import { spawnCommand } from "../command.ts";
+import type { ThreadDocContext } from "../documents.ts";
 import { addWorktree, firstAsk, folderOf, gitRoot, group } from "../work.ts";
 import { CursorChat } from "./chat.ts";
 import { bucketOf, cursorConfigDir, cursorDataDir } from "./paths.ts";
@@ -234,6 +235,11 @@ export class CursorAdapter implements Adapter {
     const row = this.rows.get(id);
     if (!row || !visible(this.opts.policy, row.cwd)) throw new Error("That chat isn't visible to 10 & 2.");
     return row;
+  }
+  docContext(id: string): ThreadDocContext | null {
+    const row = this.rows.get(id);
+    if (!row || !visible(this.opts.policy, row.cwd)) return null;
+    return { agent: "cursor", cwd: row.cwd, projectRoot: gitRoot(row.cwd) ?? row.cwd };
   }
   async report(id: string): Promise<Report> {
     this.fresh();

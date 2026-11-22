@@ -1,12 +1,19 @@
 // The timeline (`GET /api/timeline`, contracts §3): what happened, newest first, in one stream. Replies arriving, calls
 // with Driver and what changed in them, and what the user changed with a tap on the phone. Built only from what the
 // brain keeps already: each thread's card (its latest reply), the conversations, their carried-out changes, and the
-// taps (`TAP`). A thread's page is the same stream narrowed to it, with every one of its replies.
+// taps (`TAP`). A thread's page is the same stream narrowed to it, with every one of its replies. From the engine's
+// stage 3.9, Away's lines too: when it was turned on, until when, and how it ended (away.ts).
 import { aged, ASKS, isNew, staleAfterDays } from "./briefing.ts";
+import { awayLines, awayLog } from "./away.ts";
+import { laterTimeline } from "./later.ts";
+import { VIA_SAID } from "./later-lines.ts";
+import { timelineRun, timelineStopped, timelineTimeout } from "./held-lines.ts";
+import { privacyOf } from "./privacy.ts";
+import { phoneZoneIn } from "./ring.ts";
 import { tappedWords } from "./drafts.ts";
 import { pastReplies } from "./reading.ts";
 import type { ReadDeps } from "./reads.ts";
-import { TAP, type Proposal } from "./store.ts";
+import { TAP, type Approved, type Proposal } from "./store.ts";
 import type { AgendaItem, CallRecord } from "./voice/callview.ts";
 
 /** What the phone and the desk page show of changes: the ones carried out or tried. */
@@ -20,7 +27,22 @@ const CALLS = 1000;
 type Thread = { id: string; name: string; project: string };
 /** A tap's thread: `id` is null only for a new thread started with a tap that isn't known (it failed, or its outcome was lost). */
 type TapThread = Omit<Thread, "id"> & { id: string | null };
-type Change = { text: string; result: string | null; state: string; at: number; threads: string[] };
+/** `approved`: how a send was agreed to in the call ("spoken yes", "tap", "Face ID"); none for any other change. */
+type Change = { text: string; result: string | null; state: string; at: number; threads: string[]; approved?: string };
+
+/** How a send was agreed to, as the Timeline says it (Fable's 4-F and 4-K): "(spoken yes)", "(tap)", "(Face ID)", "(lock screen)". */
+export const APPROVED_SAID: Record<Approved, string> = { ...VIA_SAID, lock_screen: "lock screen" };
+
+/** How a send (a reply or a new thread) was agreed to, in the Timeline's words; nothing for any other change, or one from before. */
+const approvedOf = (p: Proposal) => ((p.action === "follow_up" || p.action === "start_work") && p.fields.approved ? { approved: APPROVED_SAID[p.fields.approved] } : {});
+
+/**
+ * A reply sent from a notification (Fable's 4-K: an answer's button, a quick reply, Reply…, Send now), as the Timeline
+ * says it, the thread always named: "Sent to API: Carry on (lock screen)", "(Face ID)" where the phone asked for it.
+ */
+export function sentFromNote(thread: string, words: string, approved: Approved): string {
+  return `Sent to ${thread}: ${words} (${APPROVED_SAID[approved]})`;
+}
 export type TimelineItem =
   | { kind: "reply"; id: string; at: number; thread: Thread; messageId: string; ask: string | null; summary: string | null; unread: boolean }
   | {
@@ -29,7 +51,17 @@ export type TimelineItem =
     usedSeconds: number | null;
     title: string; changes: Change[]; agenda: AgendaItem[] | null;
   }
-  | { kind: "action"; id: string; at: number; action: string; thread: TapThread; until: string | null; state: string; result: string | null; text?: string };
+  /**
+   * `approved`: how a send was agreed to ("tap", "Face ID", "lock screen", "spoken yes"); `line`: one sent from a
+   * notification, in the brain's words ("Sent to API: Carry on (lock screen)"), which the phone shows as it is.
+   */
+  | { kind: "action"; id: string; at: number; action: string; thread: TapThread; until: string | null; state: string; result: string | null; text?: string; approved?: string; line?: string }
+  /** Away (the engine's stage 3.9): "Away on until Monday 08:00", "Away ended: you wrote in Migration on Lattice". */
+  | { kind: "away"; id: string; at: number; text: string }
+  /** Sends and starts set up for later (stage 4b; Fable's 4-F): "Scheduled for API, 03:00 tomorrow: carry on (spoken yes)". */
+  | { kind: "later"; id: string; at: number; text: string }
+  /** Commands that wait (Fable's 4-H2): "Let terraform apply run in API (Face ID)", "Stopped terraform apply in API". */
+  | { kind: "held"; id: string; at: number; text: string; thread: Thread };
 export type TimelineQuery = { before: string | null; limit: number; project: string | null; kind: (typeof KINDS)[number] | null; thread: string | null };
 
 /** The query from the URL, or what's wrong with it. */
@@ -118,7 +150,7 @@ export async function timeline(deps: ReadDeps, q: TimelineQuery): Promise<{ item
       out.push({
         kind: "call", id: `call:${c.id}`, at: endedAt, conversationId: c.id, startedAt: c.startedAt, endedAt, usedSeconds: used.get(c.id) ?? null, title: c.title, agenda: null,
         changes: kept.map(({ p, threads }) => {
-          const change = { text: p.readback, result: p.result, state: p.state, at: p.createdAt, threads: threads.map((t) => t.id) };
+          const change = { text: p.readback, result: p.result, state: p.state, at: p.createdAt, threads: threads.map((t) => t.id), ...approvedOf(p) };
           proposalOf.set(change, p);
           return change;
         }),
@@ -137,7 +169,28 @@ export async function timeline(deps: ReadDeps, q: TimelineQuery): Promise<{ item
       // A reply sent with a tap is listed as "reply", and a start as "start", each with its first words.
       const what = started ? { action: "start", text: firstWords(p.fields.message ?? "") }
         : p.action === "follow_up" ? { action: "reply", text: firstWords(tappedWords(p.fields.message ?? "")) } : { action: p.action };
-      out.push({ kind: "action", id: `action:${p.id}`, at: p.createdAt, ...what, thread, until: p.fields.until ?? null, state: p.state, result: p.result });
+      // Sent from a notification: its own line, how it was agreed to in it.
+      const noted = p.action === "follow_up" && p.fields.noted && p.fields.approved && p.state === "executed" ? { line: sentFromNote(thread.name, tappedWords(p.fields.message ?? ""), p.fields.approved) } : {};
+      out.push({ kind: "action", id: `action:${p.id}`, at: p.createdAt, ...what, thread, until: p.fields.until ?? null, state: p.state, result: p.result, ...approvedOf(p), ...noted });
+    }
+    // Away's lines (Fable, 3.9-G): only in the whole stream, not a thread's or a project's. Thread names follow Privacy's
+    // switch, computers' only when the account has more than one; times on the phone's clock.
+    if (q.thread === null && q.project === null) {
+      const computers = deps.adapter.connectionStatus?.().length || new Set(briefing.allItems().map((i) => i.machine ?? "")).size;
+      const words = { names: privacyOf(store).names, computers, zone: phoneZoneIn(store) ?? "UTC" };
+      for (const e of awayLog(store)) for (const l of awayLines(e, words)) out.push({ kind: "away", id: `away:${e.id}:${l.key}`, at: l.at, text: l.text });
+      for (const l of laterTimeline(store, computers || 1)) out.push({ kind: "later", id: `later:${l.key}`, at: l.at, text: l.text });
+    }
+    // Commands that wait (Fable's 4-H2): how each held command ended, by the phone or with no answer; a thread's page too.
+    for (const r of store.reachOuts()) {
+      if (r.kind !== "held" || !r.news.held) continue;
+      const thread = threadOf(r.news.itemId, { handle: r.news.handle });
+      if (!wanted(thread)) continue;
+      const end = r.ended?.end ?? (r.answer ? (r.answer.run ? "run" : "stop") : null);
+      const text = end === "run" ? timelineRun(r.news.held.matched, thread.name, r.answer?.how ?? "faceid")
+        : end === "stop" ? timelineStopped(r.news.held.matched, thread.name)
+        : end === "timeout" ? timelineTimeout(r.news.held.matched, thread.name) : null;
+      if (text) out.push({ kind: "held", id: `held:${r.key}`, at: r.answer?.at ?? r.ended?.at ?? r.at, text, thread });
     }
   }
 

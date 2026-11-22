@@ -141,7 +141,15 @@ export function saysHead(spoken: string[], head: string[], next: string | string
       // leaves the machine out). The name alone already identifies the thread, so each clause of the place is optional.
       let k = j;
       let clause = -1;
-      for (const w of where) {
+      // Speech-to-text may glue the place's first clause into one word: "Remove Noctalia Bottom Bar, innix." for "in
+      // nix" (19 November, eval: the yes was refused twice and nothing was settled).
+      const cut = where.findIndex(mark);
+      const first = cut < 0 ? where : where.slice(0, cut);
+      let g = j;
+      while (mark(spoken[g])) g++;
+      const glued = first.length > 1 && spoken[g] === first.join("");
+      if (glued) k = g + 1;
+      for (const w of glued ? where.slice(first.length) : where) {
         if (mark(w)) {
           clause = k;
           continue;

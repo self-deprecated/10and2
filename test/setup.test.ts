@@ -11,7 +11,7 @@ import { Credentials, parseCredential, powershellArgs, type Runner } from "../sr
 import { Expired, linkUrl, originOf, pair } from "../src/pair.ts";
 import { carried, launchAgent, launchFor, NO_SYSTEMD, Service, systemdUnit, temporary } from "../src/service.ts";
 import { opener } from "../src/browser.ts";
-import { assertPrivate, removeDir, WINDOWS } from "./fixtures/platform.ts";
+import { assertPrivate, NODE, removeDir, WINDOWS } from "./fixtures/platform.ts";
 
 const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 const credential = `dc1.${Buffer.from("user_abc123").toString("base64url")}.${"d".repeat(22)}.${"s".repeat(43)}`;
@@ -342,7 +342,7 @@ test("a login service whose program is gone is stale (systemd and launchd), and 
 function cli(args: string[], env: NodeJS.ProcessEnv, before?: string): Promise<{ status: number | null; out: string }> {
   return new Promise((resolve) => {
     const preload = before ? ["--import", `data:text/javascript,${encodeURIComponent(before)}`] : [];
-    const child = spawn(process.execPath, [...preload, main, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(NODE, [...preload, main, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     child.stdout.on("data", (d) => { out += d; });
     child.stderr.on("data", (d) => { out += d; });
@@ -571,7 +571,7 @@ test("status says once that the login service isn't running", { skip: process.pl
   writeFileSync(join(config, "10and2", "connector.json"), JSON.stringify({ brain: "ws://127.0.0.1:9/connector", projects: "*" }));
   writeFileSync(join(config, "10and2", "credentials.json"), JSON.stringify({ "http://127.0.0.1:9": "a-token" }), { mode: 0o600 });
   // Installed, and not running: there's no systemctl to say it is.
-  writeFileSync(join(config, "systemd", "user", "10and2.service"), systemdUnit({ program: [process.execPath, main], path: "/usr/bin" }));
+  writeFileSync(join(config, "systemd", "user", "10and2.service"), systemdUnit({ program: [NODE, main], path: "/usr/bin" }));
   const env = testEnv(dir, { PATH: join(dir, "nonexistent"), XDG_CONFIG_HOME: config, XDG_STATE_HOME: join(dir, "state"), TENANDTWO_CREDENTIAL_STORE: "file" });
   const status = await cli(["status"], env);
   assert.equal(status.status, 0, status.out);

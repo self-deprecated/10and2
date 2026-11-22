@@ -12,14 +12,17 @@ import { accessSync, closeSync, existsSync, openSync, readdirSync, readFileSync,
 import { homedir } from "node:os";
 import { basename, isAbsolute, join, resolve } from "node:path";
 import { Duplex } from "node:stream";
-import type { Action, ActionKind, Adapter, FirstAsk, ItemStatus, CodingModel, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import type { Action, ActionKind, Adapter, Checks, FirstAsk, ItemStatus, CodingModel, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
+import { checksIn, receipts, stepsOf, Tested, type OwnChecks, type Step } from "../checks.ts";
 import { allows, answers, ceilingFor, RUNTIME_MODES, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy, RuntimeMode } from "../policy.ts";
 import { Store } from "../claude/store.ts";
 import { t3Cwd } from "../claude/transcript.ts";
-import { goAhead } from "../claude/adapter.ts";
 import { titleFrom } from "../t3/adapter.ts";
+import type { ThreadDocContext } from "../documents.ts";
 import { addWorktree, firstAsk, folderOf, gitRoot, group } from "../work.ts";
+import { ANSWERED, choicesOf, goAhead } from "../util.ts";
+import { digestOf, newest, type Write } from "../typed.ts";
 import { VERSION } from "../protocol.ts";
 import { execFileCommand, spawnCommand } from "../command.ts";
 import { CodexRpc, ConnectionError, RpcError } from "./rpc.ts";
@@ -68,9 +71,51 @@ type Thread = {
 };
 type Item = { type: string; id: string; text?: string; phase?: string | null; clientId?: string | null; content?: { type: string; text?: string }[]; startedAtMs?: number | null };
 type Turn = { id: string; status: "completed" | "interrupted" | "failed" | "inProgress"; items: Item[]; startedAt: number | null; completedAt: number | null };
+/**
+ * A message whose turn starts this soon after the turn before it ended was queued while that ran (Tab in Codex's
+ * terminal), not typed after its reply: Codex dates the turn's end in whole seconds and the message as it's taken
+ * (0.167.0: the busy turn's end 21:55:55.2, the queued message's 55.2), so a second for the rounding and two for the rest.
+ */
+const QUEUED_MS = 3000;
+
+/**
+ * Tests passed or failed (docs/launch/engine.md §11 stage 3.10): what a turn ran of its checks, from its items in full
+ * (the summary view `readTurns` keeps has only its messages): each `commandExecution` that's a check (`checksIn`), with
+ * its `exitCode` and the folder it ran in (`cwd`), and each `fileChange` applied (`turnSteps`). Only the kind, the
+ * result and the table's label are kept; a report folds them through the thread's runs before it (`Tested`).
+ */
+export function turnChecks(items: any[], own: OwnChecks = {}): Checks | undefined {
+  return receipts(turnSteps(items, own));
+}
+function turnSteps(items: any[], own: OwnChecks = {}): Step[] {
+  const steps: Step[] = [];
+  for (const i of items) {
+    if (i?.type === "fileChange" && i.status === "completed") steps.push("edit");
+    if (i?.type !== "commandExecution" || typeof i.command !== "string") continue;
+    const ok = typeof i.exitCode === "number" && (i.status === "completed" || i.status === "failed") ? i.exitCode === 0 : null;
+    steps.push(...stepsOf(checksIn(i.command, own), ok, typeof i.aggregatedOutput === "string" ? i.aggregatedOutput : "", typeof i.cwd === "string" ? i.cwd : null));
+  }
+  return steps;
+}
 /** A request Codex sent this connection about a thread: a question or an approval. Its id only means something here. */
 type Held = { rpc: CodexRpc; id: number | string; method: string; params: any };
-type Row = { thread: Thread; item: WorkItem; turns: Turn[] };
+type Row = { thread: Thread; item: WorkItem; turns: Turn[]; subagents: Thread[] };
+
+/** The parent thread id of a Codex subagent thread, when Codex links it either directly or via `source.subAgent.thread_spawn`. */
+export function parentOf(t: Pick<Thread, "parentThreadId" | "source">): string | null {
+  if (typeof t.parentThreadId === "string" && t.parentThreadId) return t.parentThreadId;
+  const src = t.source as Record<string, unknown> | null | undefined;
+  const sub = src && typeof src === "object" ? (src.subAgent ?? src.subagent) as Record<string, unknown> | undefined : undefined;
+  const spawn = sub && typeof sub === "object" ? (sub.thread_spawn ?? sub.threadSpawn) as Record<string, unknown> | undefined : undefined;
+  const id = spawn?.parent_thread_id ?? spawn?.parentThreadId;
+  return typeof id === "string" && id ? id : null;
+}
+
+function subagentProgress(subs: Thread[]): string {
+  const labels = subs.map((s) => s.name?.trim() || (s.preview?.trim() ? titleFrom(s.preview) : "")).filter(Boolean);
+  if (subs.length === 1) return labels[0] ? `Waiting on subagent: ${labels[0]}.` : "Waiting on a subagent.";
+  return labels.length ? `Waiting on ${subs.length} subagents: ${labels.slice(0, 3).join("; ")}.` : `Waiting on ${subs.length} subagents.`;
+}
 
 const QUESTION = "item/tool/requestUserInput";
 const APPROVALS = new Set(["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval",
@@ -88,6 +133,8 @@ const REFUSED = "Codex didn't take that. Nothing was sent.";
 const NO_SANDBOX = "Codex can't edit on its own here until its Windows sandbox is set up. Set it up in Codex, then try again.";
 
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+/** A held question's or approval's id, as its item's `questionId` says it. */
+const heldId = (h: Held) => hash(`${h.method}:${h.params?.itemId ?? ""}:${h.params?.approvalId ?? ""}`).slice(0, 24);
 /** A UUID made from the operation key, as the message's `clientUserMessageId`: how its turn is found again. */
 export function messageIdFor(key: string): string {
   const b = createHash("sha256").update("driver:codex:message:v1\0" + key).digest().subarray(0, 16);
@@ -140,7 +187,8 @@ export function answersFor(questions: Question[], words: string): { answers: Rec
   const said = plain(words);
   for (const q of questions) {
     const options = q.options ?? [];
-    const exact = options.find((o) => plain(o.label) === said);
+    // An option's own label first (a tap sends one), so "Deploy (later)" isn't taken for "Deploy".
+    const exact = options.find((o) => o.label === words.trim()) ?? options.find((o) => plain(o.label) === said);
     const named = options.filter((o) => plain(o.label).trim() && said.includes(plain(o.label)));
     const pick = exact ?? (named.length === 1 ? named[0] : undefined);
     if (pick) out[q.id] = { answers: [pick.label] };
@@ -196,6 +244,8 @@ export function windowsSandbox(configToml: string): boolean {
 
 export class CodexAdapter implements Adapter {
   readonly name = "codex";
+  /** It reads its threads' test runs (`Report.checks`, docs/launch/engine.md §11 stage 3.10). */
+  readonly readsChecks = true;
   readonly actions = ["follow_up", "settle", "snooze", "archive", "start_work", "unsnooze", "unsettle"] as const;
   readonly codexHome: string;
   readonly socketPath: string;
@@ -225,17 +275,29 @@ export class CodexAdapter implements Adapter {
   private readonly questions = new Map<string, string | null>();
   private readonly listeners = new Set<(ids: string[], urgent: boolean) => void>();
   private readonly writes = new Set<Promise<unknown>>();
+  /** The message ids of 10 & 2's own sends (`messageIdFor` each operation's key): never you writing (`writesOf`). */
+  private readonly own = new Set<string>();
   private readonly stale = new Set<string>();
   private turnsTimer: NodeJS.Timeout | null = null;
+  /**
+   * Stage 3.10: a finished turn's checks once read in full, by turn id (a finished turn doesn't change), so a report
+   * reads turns in full only for a turn still going or one not read yet (the review's finding on 3.10: every report read
+   * the newest three in full, every command's output with them).
+   */
+  private readonly receipted = new Map<string, Checks | null>();
   /** What a new thread can start on (`model/list`, less hidden ones), as Codex last said. */
   private models: CodingModel[] = [];
   private modelsTimer: NodeJS.Timeout | null = null;
+  /** Each thread's test runs across its turns (`Tested`), in this adapter's store. */
+  private readonly tested: Tested;
 
   constructor(opts: Options) {
     this.opts = opts; this.now = opts.now ?? Date.now; this.platform = opts.platform ?? process.platform;
     this.codexHome = resolve(opts.codexHome ?? process.env.CODEX_HOME ?? join(homedir(), ".codex"));
     this.socketPath = join(this.codexHome, "app-server-control", "app-server-control.sock");
     this.store = new Store(opts.db);
+    this.tested = new Tested(this.store.db);
+    for (const key of this.store.operationKeys()) this.own.add(messageIdFor(key));
   }
 
   /** Connects (starting Codex's daemon if it isn't running and that's allowed) and reads the threads once; then keeps both current. */
@@ -432,7 +494,7 @@ export class CodexAdapter implements Adapter {
     for (const id of loaded) {
       if (seen.has(id)) continue;
       const known = this.threads.get(id);
-      if (known && known.ephemeral) continue;
+      if (known && known.ephemeral && !parentOf(known)) continue;
       try { const r: any = await rpc.request("thread/read", { threadId: id }); if (r?.thread) seen.set(id, r.thread); }
       catch (e) { if (e instanceof ConnectionError) throw e; }
     }
@@ -493,10 +555,26 @@ export class CodexAdapter implements Adapter {
   private recompute() {
     if (this.closed) return;
     const cutoff = (this.now() - (this.opts.days ?? 14) * 86_400_000) / 1000;
+    // Active subagents keep their ancestor thread running even when the parent's own turn is idle.
+    const activeSubagents = new Map<string, Thread[]>();
+    for (const t of this.threads.values()) {
+      if (t.status.type !== "active") continue;
+      let cur = parentOf(t);
+      const visited = new Set<string>([t.id]);
+      while (cur && !visited.has(cur)) {
+        visited.add(cur);
+        const list = activeSubagents.get(cur) ?? [];
+        list.push(t);
+        activeSubagents.set(cur, list);
+        const p = this.threads.get(cur);
+        cur = p ? parentOf(p) : null;
+      }
+    }
     const next = new Map<string, Row>();
     for (const t of this.threads.values()) {
       if (!this.listed(t)) continue;
-      if (t.status.type === "notLoaded" && t.updatedAt < cutoff) continue;
+      const subagents = activeSubagents.get(t.id) ?? [];
+      if (t.status.type === "notLoaded" && !subagents.length && t.updatedAt < cutoff) continue;
       const overlay = this.store.overlay(t.id);
       if (overlay.archived) continue;
       const turns = this.turns.get(t.id)?.turns ?? [];
@@ -504,9 +582,9 @@ export class CodexAdapter implements Adapter {
       const lastRunAt = iso(finished?.completedAt ?? null);
       const flag = this.waitingFlag(t), held = this.held.get(t.id);
       const pending = !!flag || !!held;
-      const status: ItemStatus = pending ? "waiting" : t.status.type === "active" ? "running" : t.status.type === "systemError" ? "failed"
+      const status: ItemStatus = pending ? "waiting" : t.status.type === "active" || subagents.length > 0 ? "running" : t.status.type === "systemError" ? "failed"
         : turns[0]?.status === "completed" ? "completed" : turns[0]?.status === "failed" ? "failed" : turns[0]?.status === "interrupted" ? "cancelled" : "idle";
-      const questionId = held ? hash(`${held.method}:${held.params?.itemId ?? ""}:${held.params?.approvalId ?? ""}`).slice(0, 24)
+      const questionId = held ? heldId(held)
         : flag ? hash(`${t.id}:${turns.find((x) => x.status === "inProgress")?.id ?? t.updatedAt}:${flag}`).slice(0, 24) : null;
       const newer = (at: string | null) => !!at && !!lastRunAt && lastRunAt > at;
       const wrote = turns.flatMap((x) => x.items.filter((i) => i.type === "userMessage").map((i) => i.startedAtMs ?? 0)).sort((a, b) => b - a)[0];
@@ -516,8 +594,10 @@ export class CodexAdapter implements Adapter {
         settled: !!overlay.settledAt && !newer(overlay.settledAt),
         snoozedUntil: overlay.snoozedUntil && Date.parse(overlay.snoozedUntil) > this.now() && !pending && !newer(overlay.snoozedAt) ? overlay.snoozedUntil : null,
         parentId: null, pendingQuestion: pending, questionId, lastRunAt, wroteAt: wrote ? new Date(wrote).toISOString() : null, createdAt: iso(t.createdAt),
+        // An approval is never given from 10 & 2 (`onRequest`): it waits for the user at Codex.
+        ...(held ? { questionKind: held.method === QUESTION ? "input" as const : "approval" as const } : flag ? { questionKind: flag === "question" ? "input" as const : "approval" as const } : {}),
       };
-      next.set(t.id, { thread: t, item, turns });
+      next.set(t.id, { thread: t, item, turns, subagents });
     }
     this.rows = next;
     this.refreshPlaces();
@@ -593,25 +673,89 @@ export class CodexAdapter implements Adapter {
   }
 
   async list(): Promise<WorkItem[]> { return [...this.rows.values()].map((r) => ({ ...r.item })); }
+  /**
+   * What a person typed in a thread (`WorkItem.typed`, typed.ts), from its newest turns: its user messages, at this
+   * computer (Codex's terminal or app; a listed thread is an interactive one), but not 10 & 2's own (`own`). Each when
+   * Codex says it started (`startedAtMs`); a Codex that doesn't say (0.157.0 doesn't) dates the message that started a
+   * turn by the turn's start, and one sent into a running turn not at all. Nor one whose turn started within `QUEUED_MS`
+   * of the turn before it ending: queued with Tab while that ran, and dated when Codex took it (0.167.0, measured), so
+   * when it was typed isn't known (Fable on 3.9 and 3.10: a last instruction queued as you leave, taken 30 minutes in,
+   * would end Away; in doubt, not yours).
+   */
+  personWrites(id: string): Write[] {
+    const turns = this.rows.get(id)?.turns ?? [];
+    const writes = turns.flatMap((t, k) => t.items.flatMap((i, n) => {
+      if (i.type !== "userMessage" || (i.clientId && this.own.has(i.clientId))) return [];
+      const at = i.startedAtMs ?? (n === 0 && t.startedAt ? t.startedAt * 1000 : null);
+      // Newest first: the turn before this one is the next.
+      const before = turns[k + 1]?.completedAt;
+      if (n === 0 && at && before && at - before * 1000 < QUEUED_MS) return [];
+      return at ? [{ at, digest: digestOf((i.content ?? []).filter((c) => c.type === "text").map((c) => c.text ?? "").join("\n")) }] : [];
+    }));
+    return newest(writes.sort((a, b) => a.at - b.at).map((w) => ({ at: new Date(w.at).toISOString(), digest: w.digest, desk: true })));
+  }
+  /**
+   * Whether a send of 10 & 2's is never taken for a person's message here (the Ledger then drops its row, so it can't
+   * claim your same words later): every follow-up and new work carries its own message id (`messageIdFor`), which
+   * `personWrites` leaves out, and an answer to Codex's question is no message at all.
+   */
+  sendLeftOut(action: Action): boolean { return action.kind === "follow_up" || action.kind === "start_work"; }
   private row(id: string): Row {
     const row = this.rows.get(id);
     if (!row || !visible(this.opts.policy, row.thread.cwd)) throw new Error("That session isn't visible to 10 & 2.");
     return row;
+  }
+  docContext(id: string): ThreadDocContext | null {
+    const row = this.rows.get(id);
+    if (!row || !visible(this.opts.policy, row.thread.cwd)) return null;
+    return { agent: "codex", cwd: row.thread.cwd, projectRoot: gitRoot(row.thread.cwd) ?? row.thread.cwd };
   }
   async report(id: string): Promise<Report> {
     this.row(id);
     try { await this.readTurns(id); this.recompute(); } catch { /* the last read stands */ }
     const row = this.row(id), last = this.lastReply(row.turns), held = this.held.get(id);
     const running = row.turns[0]?.status === "inProgress" ? row.turns[0] : null;
-    const progress = row.item.status === "running" || row.item.status === "waiting"
+    const ownProgress = row.item.status === "running" || row.item.status === "waiting"
       ? running?.items.filter((i) => i.type === "agentMessage" && i.text?.trim()).at(-1)?.text ?? null : null;
-    let question: string | null = null;
+    const progress = ownProgress ?? (row.item.status === "running" && row.subagents.length ? subagentProgress(row.subagents) : null);
+    let question: string | null = null, choices: string[] | null = null;
     if (held?.method === QUESTION) {
-      question = ((held.params?.questions ?? []) as any[]).map((q) => `${q.question}${q.options?.length ? ` Options: ${q.options.map((o: any) => o.label).join(" / ")}.` : ""}`).join(" ");
+      const questions = (held.params?.questions ?? []) as any[];
+      question = questions.map((q) => `${q.question}${q.options?.length ? ` Options: ${q.options.map((o: any) => o.label).join(" / ")}.` : ""}`).join(" ");
+      // Only a question the connector holds: one Codex shows only in its terminal (the flag alone) isn't answered here.
+      choices = choicesOf(questions.map((q) => ({ options: ((q.options ?? []) as any[]).map((o) => String(o.label)) })));
     } else if (held) question = `Codex ${wants(held)}.${held.params?.reason ? ` ${String(held.params.reason).slice(0, 300)}` : ""}`;
     else if (row.item.pendingQuestion) question = "Codex needs your input in its terminal.";
-    return { text: last?.item.text ?? "", progress, question,
-      reply: last ? { runId: last.turn.id, messageId: last.item.id, at: iso(last.turn.completedAt ?? last.turn.startedAt) ?? row.item.updatedAt } : null };
+    // Stage 3.10: the reply's turn's checks (kept once read: a finished turn doesn't change), and the turn still going's so
+    // far, from one read of the newest turns in full, made only when one of them needs it.
+    const kept = last && this.receipted.has(last.turn.id);
+    const read = running || (last && !kept) ? await this.fullTurns(id) : [];
+    const full = read ?? [];
+    const done = last && !kept ? full.find((x) => x.id === last.turn.id) : undefined;
+    const checks = !last ? undefined : kept ? this.receipted.get(last.turn.id) ?? undefined : this.tested.receipts(id, last.turn.id, turnSteps(done?.items ?? [], this.opts.policy.checks));
+    if (done && done.status !== "inProgress") {
+      this.receipted.set(done.id, checks ?? null);
+      if (this.receipted.size > 500) this.receipted.delete(this.receipted.keys().next().value!);
+    }
+    // The turn going, from the user's latest words in it (a follow-up steered into it starts there, as a typed message
+    // does in Claude Code): what it has run since, and when that was (`runningSince`). What it ran before them is where
+    // that starts (the review of 45ec9eccdf6f, F1): a failure in api before the steer stands after it, read again from the turn's
+    // items at each report, so after a restart too.
+    const going = running ? full.find((x) => x.id === running.id) : undefined;
+    const said = going ? going.items.findLastIndex((i) => i.type === "userMessage") : -1;
+    const soFar = going ? this.tested.receipts(id, going.id, turnSteps(going.items, this.opts.policy.checks), turnSteps(going.items.slice(0, said + 1), this.opts.policy.checks).length) : undefined;
+    const wrote = said >= 0 && typeof going!.items[said].startedAtMs === "number" ? new Date(going!.items[said].startedAtMs!).toISOString() : iso(running?.startedAt);
+    return { text: last?.item.text ?? "", progress, question, choices,
+      reply: last ? { runId: last.turn.id, messageId: last.item.id, at: iso(last.turn.completedAt ?? last.turn.startedAt) ?? row.item.updatedAt } : null,
+      ...(checks ? { checks } : last && !kept && !read ? { checksUnread: true as const } : {}), ...(soFar ? { running: soFar, runningId: going!.id, ...(wrote ? { runningSince: wrote } : {}) } : {}) };
+  }
+  /**
+   * Stage 3.10: the newest turns read in full (the summary view has only their messages); null when they can't be read,
+   * which the report says (`checksUnread`), never taken for "no check ran".
+   */
+  private async fullTurns(id: string): Promise<Turn[] | null> {
+    const r: any = await this.rpc?.request("thread/turns/list", { threadId: id, limit: 3, sortDirection: "desc", itemsView: "full" }).catch(() => null);
+    return Array.isArray(r?.data) ? r.data as Turn[] : null;
   }
   async replies(id: string): Promise<PastReply[]> {
     this.row(id);
@@ -662,12 +806,20 @@ export class CodexAdapter implements Adapter {
     const id: string | undefined = p?.threadId ?? p?.thread?.id;
     switch (method) {
       case "thread/started":
-        if (p?.thread?.id) { this.threads.set(p.thread.id, p.thread); if (!p.thread.ephemeral) this.touch(p.thread.id); }
+        if (p?.thread?.id) {
+          this.threads.set(p.thread.id, p.thread);
+          if (!p.thread.ephemeral) this.touch(p.thread.id);
+          if (parentOf(p.thread) && p.thread.status?.type === "active") this.recompute();
+        }
         return;
       case "thread/status/changed": {
         const t = id ? this.threads.get(id) : undefined;
         if (!t || !p.status) { if (id && p.status?.type !== "notLoaded") void this.refresh(); return; }
-        if (t.ephemeral) { this.threads.set(id!, { ...t, status: p.status }); return; }
+        if (t.ephemeral) {
+          this.threads.set(id!, { ...t, status: p.status });
+          if (parentOf(t)) this.recompute();
+          return;
+        }
         const was = this.waitingFlag(t);
         this.threads.set(id!, { ...t, status: p.status, updatedAt: p.status.type === "active" ? Math.max(t.updatedAt, Math.floor(this.now() / 1000)) : t.updatedAt });
         const now = this.waitingFlag(this.threads.get(id!)!);
@@ -687,7 +839,7 @@ export class CodexAdapter implements Adapter {
         if (id && this.threads.has(id)) { this.threads.set(id, { ...this.threads.get(id)!, name: p.threadName ?? null }); this.recompute(); }
         return;
       case "thread/archived":
-        if (id) { this.threads.delete(id); this.held.delete(id); this.recompute(); }
+        if (id) { this.threads.delete(id); this.held.delete(id); this.tested.forget(id); this.recompute(); }
         return;
       case "thread/unarchived":
         void this.refresh();
@@ -825,6 +977,7 @@ export class CodexAdapter implements Adapter {
       }
     }
     if (!this.store.begin(key, digest)) return this.earlier(key, digest) ?? UNKNOWN;
+    this.own.add(messageIdFor(key));
     const run = (async (): Promise<Receipt> => {
       try {
         return this.store.finish(key, action.kind === "start_work" ? await this.startWork(action, key) : await this.followUp(action, key));
@@ -846,7 +999,8 @@ export class CodexAdapter implements Adapter {
   private async followUp(action: Extract<Action, { kind: "follow_up" }>, key: string): Promise<Receipt> {
     const id = action.itemId, rpc = this.rpc!;
     const t = this.rows.get(id)!.thread;
-    if (this.held.get(id)?.method === QUESTION || this.waitingFlag(t) === "question") return this.answer(id, action.message);
+    // A tap is only ever an answer, to the question it was for (`answer` looks last thing), never a message in its place.
+    if (action.questionId !== undefined || this.held.get(id)?.method === QUESTION || this.waitingFlag(t) === "question") return this.answer(id, action.message, action.questionId);
     const timeout = this.opts.acceptanceTimeoutMs ?? 20_000;
     const clientUserMessageId = messageIdFor(key);
     if (t.status.type === "active") {
@@ -930,9 +1084,10 @@ export class CodexAdapter implements Adapter {
   }
   /**
    * The answer to the question a thread is waiting on, through this connection (Codex replays it to whoever
-   * subscribes). Sent once Codex says the question is resolved after this answer.
+   * subscribes). Sent once Codex says the question is resolved after this answer. With `questionId` (a tap), only to
+   * that question: another asked since, or none, sends nothing.
    */
-  private async answer(id: string, words: string): Promise<Receipt> {
+  private async answer(id: string, words: string, questionId?: string): Promise<Receipt> {
     const timeout = this.opts.acceptanceTimeoutMs ?? 20_000;
     if (!this.held.has(id)) {
       await this.subscribe(id, "question");
@@ -940,6 +1095,7 @@ export class CodexAdapter implements Adapter {
       while (!this.held.has(id) && Date.now() < end) await new Promise((r) => setTimeout(r, 25));
     }
     const held = this.held.get(id);
+    if (questionId !== undefined && (!held || heldId(held) !== questionId)) return { ok: false, error: ANSWERED };
     if (!held || held.method !== QUESTION) return { ok: false, error: held ? `Codex is waiting for your OK: it ${wants(held)}. 10 & 2 can't approve that, so answer it in Codex.` : "Codex's question was already answered. Nothing was sent." };
     if (held.rpc !== this.rpc) return { ok: false, error: "Codex's question was already answered. Nothing was sent." };
     const a = answersFor(held.params?.questions ?? [], words);

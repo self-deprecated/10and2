@@ -114,3 +114,12 @@ test("a start on a model its place doesn't list now is refused before it reaches
   assert.equal(await providers.check(start("p-proj", "claudeAgent:claude-opus-5-5")), null);
   assert.equal(await providers.check(start("p-proj", "claude-proxy:claude-sonnet-5-5")), "T3 Code doesn't offer that model for this project now.");
 });
+
+// The engine's stage 3.10: each item says whether its test runs are read, so a brain can tell a work system that isn't
+// covered (Pi: false) from an older connector that says nothing either way (no `testRuns`).
+test("each item says whether its work system's test runs are read: true where the adapter reads them, false where it doesn't", async () => {
+  const reads = Object.assign(new FakeAdapter([item("a")]), { readsChecks: true });
+  const not = new FakeAdapter([item("b")]);
+  const adapter = new Local([{ prefix: "", adapter: reads }, { prefix: "pi", adapter: not }], policy);
+  assert.deepEqual((await adapter.list()).map((i) => [i.id, i.testRuns]), [["a", true], ["pi:b", false]]);
+});

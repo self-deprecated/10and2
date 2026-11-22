@@ -4,11 +4,12 @@
 // ten times overnight costs one summary, not ten (cost-tracking.md, 14 November). Until then its card says it has a
 // newer reply (`newer`), never passes the old summary off as current.
 import { createHash } from "node:crypto";
-import type { Adapter, ReplyRef, Report, WorkItem } from "./adapter.ts";
+import type { Adapter, Checks, DocSummary, ReplyRef, Report, WorkItem } from "./adapter.ts";
 import { spokenTitle, uniqueHandles } from "./handles.ts";
 import type { Briefed, Card, CardReply, Store } from "./store.ts";
 import type { Purposes } from "./purposes.ts";
-import { mapLimit, describe } from "./util.ts";
+import { mapLimit, describe, redactWhole } from "./util.ts";
+import { offlineSince } from "./offline.ts";
 
 export type ClassifyInput = {
   id: string;
@@ -22,6 +23,14 @@ export type ClassifyInput = {
   /** What the thread was started to get done (purposes.ts), which its card is judged against; null until one is written. */
   purpose: string | null;
 };
+/** What the classifier is given, with any credential the thread quotes masked (`redactWhole`). */
+export const masked = <T extends ClassifyInput>(i: T): T => ({
+  ...i,
+  title: redactWhole(i.title),
+  report: redactWhole(i.report),
+  question: i.question === null ? null : redactWhole(i.question),
+  purpose: i.purpose === null ? null : redactWhole(i.purpose),
+});
 export type ClassifyOutput = Pick<Card, "state" | "summary" | "ask" | "suggested" | "answers"> & { id: string };
 
 /**
@@ -51,9 +60,26 @@ export type OpenerWriter = (view: BriefingView, now: Date) => Promise<string>;
  * `unread` while its reply is new to the user (`isNew`), and `unheard`, how many of its replies are then (1 when the
  * work system doesn't say what came before); `heard` once they've heard this card's news (`summaryHeard`);
  * `newer`, a reply the thread gave after the one its summary was made from, not summarized yet: the card's state,
- * summary and question are of the earlier reply.
+ * summary and question are of the earlier reply. `offline`: its computer is offline past the grace (`offlineOf`), so the
+ * card is how the thread stood then (docs/launch/engine.md §11, 3.7).
  */
-export type BriefCard = Card & { handle: string; title: string; group: string; status: string; updatedAt: string; starred: boolean; unread: boolean; unheard: number; heard: boolean; newer: CardReply | null };
+export type BriefCard = Card & { handle: string; title: string; group: string; status: string; updatedAt: string; starred: boolean; unread: boolean; unheard: number; heard: boolean; newer: CardReply | null; offline?: CardOffline };
+
+/** A thread's computer offline past the grace (offline.ts): its name as it's said, and since when it's silent. */
+export type CardOffline = { machine: string; since: number };
+
+/**
+ * The computer holding `itemId` is offline past the grace (stage 3.7; Fable, topic 12): which, and since when. Null while
+ * it reports, within the grace (a Wi-Fi blip or a reconnect is never mentioned), or where the adapter can't tell.
+ */
+export function offlineOf(adapter: Pick<Adapter, "link">, itemId: string, now: number): CardOffline | null {
+  let link = null;
+  try {
+    link = adapter.link?.(itemId) ?? null;
+  } catch {}
+  const since = offlineSince(link, now);
+  return link && since !== null ? { machine: link.machine, since } : null;
+}
 export type ClutterGroup = { parentId: string; parent: string; group: string; count: number; ids: string[]; parentIds?: Record<string, string> };
 export type BriefingView = {
   cards: BriefCard[];
@@ -169,6 +195,19 @@ export function contentKey(item: WorkItem, report: string, question: string | nu
 }
 
 /**
+ * The key of a card whose question went with no model call (its thread at work again): one no read gives, since
+ * `contentKey` is hex, so the card stays behind its thread until it's summarized, whatever is read meanwhile.
+ */
+const clearedKey = (key: string) => `cleared:${key}`;
+
+/**
+ * The summary of a card whose question went with no model call, until it's summarized again: the classifier's summary
+ * of what happened may tell the question ("It stopped to ask whether to commit"), which neither the opening nor the
+ * briefing may tell once it's gone.
+ */
+export const BACK_TO_WORK = "It went back to work.";
+
+/**
  * A reply is new until the user has heard it read out in full in Driver (`readAt`: when the latest reply they heard
  * that way finished), or opened its thread in the system after it came (`visitedAt`). Summaries don't count.
  */
@@ -246,7 +285,7 @@ export class Briefing {
   private updatedAt: string | null = null;
   private localUpdatedAt: string | null = null;
   /** Each briefed thread's last report as read in the last refresh (head and tail), for the voice backend's prompt. */
-  private readonly reports = new Map<string, { text: string; question: string | null }>();
+  private readonly reports = new Map<string, { text: string; question: string | null; checks?: Checks; docs?: DocSummary[] }>();
   private readonly refreshed = new Set<() => void>();
   /** Each briefed thread's content as last read, which its card may be behind (`newer`) until it's summarized. */
   private readonly latest = new Map<string, { key: string; reply: CardReply | null; earlier: string[] }>();
@@ -266,6 +305,8 @@ export class Briefing {
     onDemand?: boolean;
     /** Writes threads' purposes, in a pass whenever changes are summarized; without it (demo worlds, tests), none are. */
     purposes?: Purposes;
+    /** The time the view's cards are aged at (`aged`, `offlineOf`); the wall clock without it, a fake one in tests. */
+    now?: () => number;
   };
 
   constructor(deps: Briefing["deps"]) {
@@ -287,12 +328,28 @@ export class Briefing {
   }
 
   private flush() {
+    void this.refresh(this.takePending()).catch((e) => this.deps.log(`briefing: refresh failed: ${describe(e)}`));
+  }
+
+  /** The threads changed since the last refresh, no longer waiting for it. */
+  private takePending(): string[] {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     this.firstPendingAt = 0;
     const ids = [...this.pendingIds];
     this.pendingIds.clear();
-    void this.refresh(ids).catch((e) => this.deps.log(`briefing: refresh failed: ${describe(e)}`));
+    return ids;
+  }
+
+  /**
+   * The briefing brought up to date before a call's opening is built (the stage 3 staging run: a call opened with a
+   * question that had gone 13 s before, its thread's change still waiting out `QUIET_MS`): the threads changed since the
+   * last refresh are read now, with no model call. A thread at work again asks nothing (`doRefresh`), one that replied
+   * since says so (`newer`), and the call's own look (`watching`) summarizes them. Nothing changed: at once.
+   */
+  catchUp(): Promise<void> {
+    if (!this.pendingIds.size) return Promise.resolve();
+    return this.refresh(this.takePending(), "read");
   }
 
   /**
@@ -390,6 +447,21 @@ export class Briefing {
     return !this.deps.onDemand || this.calls > 0 || now - this.lookedAt < LOOKING_MS;
   }
 
+  /**
+   * Whether a thread's turn left it waiting on you (stage 3.5, "needs my input"'s judged half; docs/launch/engine.md
+   * §7, Cost): its card, made now if it's behind (one classifier call for that thread alone, background spend inside
+   * the account's limit; never the other cards behind, nor the opener), blocked or needing a decision, with the card's
+   * ask as why. Null when its card can't be brought up to date (the budget out, the read failed): unchecked.
+   */
+  async needsYou(id: string): Promise<{ yes: boolean; reason: string | null } | null> {
+    // After any refresh under way, as the one refresh then: what's asked for meanwhile waits for it, as always.
+    while (this.running) await this.running.catch(() => {});
+    await this.run(this.doRefresh([id], true, true));
+    const card = this.deps.store.cards().find((c) => c.itemId === id);
+    if (!card || !this.latest.has(id) || this.behind(id, card)) return null;
+    return { yes: ASKS.has(card.state), reason: card.ask };
+  }
+
   /** Briefable items with no card yet, or whose card is behind what was last read of them. */
   private due(): string[] {
     const cards = new Map(this.deps.store.cards().map((c) => [c.itemId, c]));
@@ -403,17 +475,23 @@ export class Briefing {
 
   /**
    * Re-reads the items (no ids means all) and re-classifies those whose last report changed, when `summarize` (by
-   * default, while that's wanted: `summarizing`); otherwise their cards wait, marked as behind.
+   * default, while that's wanted: `summarizing`); otherwise their cards wait, marked as behind. `"read"`: never now,
+   * whoever looks (`catchUp`).
    */
-  async refresh(ids?: string[], summarize = false): Promise<void> {
+  async refresh(ids?: string[], summarize: boolean | "read" = false): Promise<void> {
     if (this.running) {
       if (!ids || this.again === "all") this.again = "all";
       else this.again = new Set([...(this.again ?? []), ...ids]);
-      this.againSummarize ||= summarize;
+      this.againSummarize ||= summarize === true;
       // Resolves once the refresh that covers these ids is done: the one queued after the one running.
       return this.running.then(() => this.running ?? undefined);
     }
-    this.running = this.doRefresh(ids, summarize).finally(() => {
+    return this.run(this.doRefresh(ids, summarize));
+  }
+
+  /** `refreshing` as the one refresh under way; what was asked for meanwhile runs after it. */
+  private run(refreshing: Promise<void>): Promise<void> {
+    this.running = refreshing.finally(() => {
       this.running = null;
       const next = this.again;
       const again = this.againSummarize;
@@ -424,7 +502,8 @@ export class Briefing {
     return this.running;
   }
 
-  private async doRefresh(ids: string[] | undefined, force: boolean) {
+  /** `only`: the ids alone are read, and summarized if behind (a judged check's card): no other card, no opener. */
+  private async doRefresh(ids: string[] | undefined, force: boolean | "read", only = false) {
     const { adapter, store, classify, log } = this.deps;
     const now = new Date();
     this.items = this.listed(await adapter.list());
@@ -443,10 +522,11 @@ export class Briefing {
     // Why each thread was started (purposes.ts) goes a week after it leaves the list (store.ts `forgetPurposes`): any
     // thread listed, briefed or not, keeps its own, and so does one Driver started that the list may not have yet.
     store.forgetPurposes(new Set(this.items.map((i) => i.id)), now.getTime() - PROVISIONAL_MS, now.getTime());
-    const summarize = force || this.summarizing();
+    const read = force === "read";
+    const summarize = !read && (force || this.summarizing());
     const wanted = new Set(ids ?? visible.map((i) => i.id));
     // Also read: an item never read, and, when summarizing, every card behind what was read of its item.
-    const toCheck = visible.filter((i) => wanted.has(i.id) || !this.latest.has(i.id) || (summarize && (!cards.has(i.id) || this.behind(i.id, cards.get(i.id)!))));
+    const toCheck = visible.filter((i) => wanted.has(i.id) || (!only && (!this.latest.has(i.id) || (summarize && (!cards.has(i.id) || this.behind(i.id, cards.get(i.id)!))))));
     for (const id of this.failedReads) if (!visibleIds.has(id)) this.failedReads.delete(id);
     const inputs: (ClassifyInput & { key: string; reply: Card["reply"] })[] = [];
     // What each thread was started for: a card is judged against it, so one written or set later makes it due again.
@@ -457,7 +537,8 @@ export class Briefing {
         // Even an unchanged cached report counts as a successful read after a failure.
         this.failedReads.delete(item.id);
         const report = await reportOf(adapter, item.id, rep);
-        this.reports.set(item.id, { text: report, question: rep.question });
+        // The reply's run's checks, from the computer (stage 3.10), told with it (session.ts `preload`).
+        this.reports.set(item.id, { text: report, question: rep.question, ...(rep.checks ? { checks: rep.checks } : {}), ...(rep.docs?.length ? { docs: rep.docs } : {}) });
         const purpose = purposes.get(item.id) ?? null;
         const key = contentKey(item, report, rep.question, purpose);
         // Which reply this is, and the thread's state when it was read: what marking it read sends.
@@ -469,11 +550,20 @@ export class Briefing {
           return;
         }
         // A thread started again on the reply its card was made from: it's running, and nothing else changed, so no
-        // model is needed (every run used to cost one).
+        // model is needed (every run used to cost one). A question it asked goes, and so does a summary that may tell it.
         if (card && item.status === "running" && !item.pendingQuestion && !rep.question && card.reply && reply && card.reply.messageId === reply.messageId) {
-          store.putCard({ ...card, state: "running", ask: null, answers: [], suggested: "none", contentKey: key, reply });
+          store.putCard({ ...card, state: "running", ask: null, answers: [], suggested: "none", contentKey: key, reply, ...(card.ask ? { summary: BACK_TO_WORK } : {}) });
           changed = true;
           return;
+        }
+        // A card that asks, whose thread is at work again with nothing asked, asks nothing from now, before any model
+        // call (the stage 3 staging run), and its summary, which may tell the question, goes too. Its key is one no read
+        // gives (`clearedKey`), so it's behind until the next summary reads what changed, even of the same question
+        // asked again (T3's permission prompts all read alike: the old key would have matched, and the card kept asking
+        // nothing).
+        if (card?.ask && item.status === "running" && !item.pendingQuestion && !rep.question) {
+          store.putCard({ ...card, state: "running", ask: null, answers: [], suggested: "none", summary: BACK_TO_WORK, contentKey: clearedKey(card.contentKey) });
+          changed = true;
         }
         inputs.push({ id: item.id, title: item.title, group: item.group, status: item.status, updatedAt: item.updatedAt, report, question: rep.question, purpose, key, reply });
       } catch (e) {
@@ -482,23 +572,29 @@ export class Briefing {
       }
     });
     // Someone may have started looking while the items were read (a call while a refresh is under way).
-    const summarizeNow = summarize || this.summarizing();
+    const summarizeNow = !read && (summarize || this.summarizing());
     let summarized = 0;
     if (summarizeNow && inputs.length) {
       const batches: (typeof inputs)[] = [];
       for (let i = 0; i < inputs.length; i += CLASSIFY_BATCH) batches.push(inputs.slice(i, i + CLASSIFY_BATCH));
       await mapLimit(batches, CLASSIFY_AT_ONCE, async (batch) => {
         // A batch that fails leaves its cards behind, marked so, for the next look.
-        const out = await classify(batch, now).catch((e) => {
+        // A report can quote a credential (a token pasted into a thread): the classifier, a model, never sees one.
+        const out = await classify(batch.map(masked), now).catch((e) => {
           log(`briefing: couldn't summarize ${batch.length} items: ${describe(e)}`);
           return [];
         });
         for (const o of out) {
           const input = batch.find((b) => b.id === o.id);
           if (!input) continue;
+          // A running thread with no pending question is never done, even if it posted a new reply while subagents or
+          // background work continue. Keep the classifier's fresh summary, but enforce running state.
+          const stillRunning = input.status === "running" && !input.question;
+          const state = stillRunning ? "running" : o.state;
           // Only what waits on the user asks: an offer of anything else is told in the summary, never as a question.
-          const ask = ASKS.has(o.state) ? o.ask : null;
-          store.putCard({ ...o, ask, answers: tapAnswers(ask, o.answers), itemId: o.id, contentKey: input.key, classifiedAt: now.toISOString(), reply: input.reply });
+          const ask = !stillRunning && ASKS.has(state) ? o.ask : null;
+          const suggested = stillRunning ? "none" : o.suggested;
+          store.putCard({ ...o, state, ask, answers: tapAnswers(ask, o.answers), suggested, itemId: o.id, contentKey: input.key, classifiedAt: now.toISOString(), reply: input.reply });
           changed = true;
           summarized++;
         }
@@ -506,7 +602,7 @@ export class Briefing {
     }
     // The opener is only heard when a call starts: written while someone looks, from the cards as they are then.
     this.openerStale ||= changed;
-    if (summarizeNow && (this.openerStale || !this.opener)) {
+    if (summarizeNow && !only && (this.openerStale || !this.opener)) {
       this.openerStale = false;
       this.opener = await this.deps.writeOpener(this.view(), now).catch((e) => {
         log(`briefing: opener failed: ${describe(e)}`);
@@ -514,16 +610,17 @@ export class Briefing {
       });
       store.set("opener", this.opener);
     }
-    if (!this.localReadFailed() && adapter.connected()) {
+    // One thread read says nothing of how fresh the rest is.
+    if (!only && !this.localReadFailed() && adapter.connected()) {
       this.localUpdatedAt = now.toISOString();
       store.set("briefedLocalAt", this.localUpdatedAt);
     }
-    if (this.failedReads.size === 0 && adapter.connected()) {
+    if (!only && this.failedReads.size === 0 && adapter.connected()) {
       this.updatedAt = now.toISOString();
       store.set("briefedAt", this.updatedAt);
     }
     log(`briefing: ${visible.length} items, ${toCheck.length} read, ${inputs.length} changed, ${summarized} summarized${inputs.length > summarized && !summarizeNow ? " (the rest once someone looks)" : ""}`);
-    if (summarizeNow) this.purpose();
+    if (summarizeNow && !only) this.purpose();
     for (const listener of this.refreshed) {
       try {
         listener();
@@ -540,7 +637,7 @@ export class Briefing {
   }
 
   /** A briefed thread's last report as of the last refresh that read it, or undefined if none has yet. */
-  report(id: string): { text: string; question: string | null } | undefined {
+  report(id: string): { text: string; question: string | null; checks?: Checks; docs?: DocSummary[] } | undefined {
     return this.reports.get(id);
   }
 
@@ -578,7 +675,7 @@ export class Briefing {
     const briefed = this.deps.store.briefedAll();
     const raw = this.deps.store.cards().filter((c) => items.has(c.itemId) && briefable(items.get(c.itemId)!));
     const handles = this.names();
-    const now = Date.now();
+    const now = this.deps.now?.() ?? Date.now();
     // The account's setting, read each time: a change shows at once.
     const staleAfter = staleAfterDays(this.deps.store);
     const cards = raw
@@ -587,10 +684,18 @@ export class Briefing {
         const read = this.latest.get(stored.itemId);
         const latest = read?.reply ?? null;
         const newer = latest && latest.messageId !== stored.reply?.messageId ? latest : null;
-        const c = aged(stored, i, newer, now, staleAfter);
+        const base = aged(stored, i, newer, now, staleAfter);
+        // Live running status always wins over a cached finished state (e.g. onDemand before re-summarization, or a
+        // thread that resumed or is still working in a subagent).
+        const c = i.status === "running" && !i.pendingQuestion
+          ? { ...base, state: "running" as const, ask: null, answers: [], suggested: "none" as const }
+          : base;
         const unread = isNew(c.reply, reads.get(c.itemId), visited.get(c.itemId));
+        // Asked of the adapter now, never kept: a computer goes and comes back without any thread changing.
+        const offline = offlineOf(this.deps.adapter, c.itemId, now);
         return {
           ...c, handle: handles.get(c.itemId)!, title: i.title, group: i.group, status: i.status, updatedAt: i.updatedAt, starred: stars.has(c.itemId),
+          ...(offline ? { offline } : {}),
           unread, unheard: unread ? unheardCount(latest ?? c.reply!, read?.earlier ?? [], reads.get(c.itemId), visited.get(c.itemId)) : 0,
           heard: summaryHeard(c, briefed.get(c.itemId), reads.get(c.itemId)),
           newer,
@@ -601,7 +706,9 @@ export class Briefing {
     const snoozed = this.items
       .filter((i) => i.parentId === null && !i.settled && i.snoozedUntil)
       .map((i) => ({ id: i.id, title: i.title, group: i.group, until: i.snoozedUntil!, starred: stars.has(i.id) }));
-    return { cards, clutter, clutterTotal: clutter.reduce((s, g) => s + g.count, 0), snoozed, opener: this.opener, updatedAt: this.updatedAt, readFailures: this.failedReads.size };
+    // An opener written before the cards last changed without a model (a thread at work again, one gone) may say what
+    // they no longer do: none until the next summary writes it again.
+    return { cards, clutter, clutterTotal: clutter.reduce((s, g) => s + g.count, 0), snoozed, opener: this.openerStale ? "" : this.opener, updatedAt: this.updatedAt, readFailures: this.failedReads.size };
   }
 
   /** Every live item, as of the last refresh. */
@@ -643,7 +750,7 @@ For every item give a state:
 - needs_decision: it did its part, but what it was for isn't met until the user decides, tries, approves or acts where only they can (tries a prototype, chooses defaults, deploys to their own machines, acts in App Store Connect). An offer counts only when taking it up is the thread's own unfinished purpose ("Want me to deploy the fix?" in a thread started to fix the server).
 - ready_to_apply: it did what it was for, but the result is held: not committed, pushed or merged. This wins over a closing offer to commit, push or merge it ("Should I commit?"). When deploying or shipping it is what the thread was for (a fix to a live server isn't done until it's deployed), it isn't done yet: needs_decision.
 - done_unreviewed: it did what it was for, or answered what was asked, and nothing waits on the user. Offers of anything extra, choices that are safe to leave as they are, a scheduled report's list of things to do, and questions or lists meant for someone else or for elsewhere (questions to take to a bank's advisor) are not asks.
-- running: status is running.
+- running: status is running (even if it posted a new reply while subagents or background work continue — summarize the reply, never call it done).
 - stale: untouched for more than two days with nothing pending.
 When the work system itself holds a question open (status waiting, with a question), the thread can't go on until the user answers: blocked or needs_decision.
 summary: what happened. For a thread that isn't blocked or needs_decision, tell an optional offer last, as an offer, never as a question to the user ("It offers to add feedback to the button.").

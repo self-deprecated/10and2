@@ -21,12 +21,15 @@ in
       root = ./.;
       fileset = lib.fileset.unions [./src ./extensions ./build.mjs ./package.json ./package-lock.json];
     };
+    # The connector's own imports of the brain's code (`../../brain/src/receipts.ts`) are written for Driver's
+    # repository, where the brain is beside connector/, so it's linked there too.
     postUnpack = ''
       cp -r ${brain} $sourceRoot/brain
       chmod -R u+w $sourceRoot/brain
+      ln -s $sourceRoot/brain brain
     '';
     nodejs = nodejs_24;
-    npmDepsHash = "sha256-W1i5Q2YCEEcdsnlDPcQZI9YZHx+5C/AezLSKdjuFiA4=";
+    npmDepsHash = "sha256-p5+zYskyQQhrIpjVEJ/tDz0qedWU5vm36WjxmI+RM6U=";
     # The same bundled files npm publishes (`npm run build`): no TypeScript or node_modules at runtime.
     installPhase = ''
       runHook preInstall

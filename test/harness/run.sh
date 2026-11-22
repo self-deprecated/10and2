@@ -3,11 +3,13 @@
 # container with no network, against a deterministic fake model (test/fixtures/mock-model.mjs). Each test drives the
 # CLI's terminal UI in tmux and the connector's adapter for it: list, read, follow up idle, steer busy, continue a closed
 # session, start work, answer a question where the CLI asks one.
-#   test/harness/run.sh                 every harness (npm run test:harness)
+#   test/harness/run.sh                 every harness (bun run test:harness)
 #   test/harness/run.sh codex           one: test/harness/codex.harness.ts (also claude, opencode, pi, t3, gemini, copilot)
 #   CODEX=0.160.0 test/harness/run.sh codex
 #                                       another version of a CLI (CLAUDE_CODE, CODEX, OPENCODE, PI, T3, GEMINI, COPILOT), for finding the
 #                                       oldest each feature works with (src/versions.ts); each subtest is one feature
+#   HARNESS_CONCURRENCY=1 test/harness/run.sh
+#                                       one test file at a time (two by default)
 # Needs podman (or docker). The image is built once per Containerfile (pinned CLI versions) and reused; another
 # version is a layer over it, also reused.
 set -euo pipefail
@@ -58,11 +60,14 @@ if [[ ${#steps[@]} -gt 0 ]]; then
     build "$tag" "$containerfile"; rm -f "$containerfile"
   fi
 fi
-[[ -d $repo/connector/node_modules ]] || (cd "$repo/connector" && npm ci --silent)
+# The tests run on the container's Node; the packages only have to be there. Bun's install where there's Bun, npm's elsewhere.
+[[ -d $repo/connector/node_modules ]] || (cd "$repo/connector" && if command -v bun >/dev/null; then bun ci --silent; else npm ci --silent --no-audit --no-fund; fi)
 files=()
 if [[ $# -gt 0 ]]; then for h in "$@"; do files+=("test/harness/$h.harness.ts"); done
 else for f in "$here"/*.harness.ts; do files+=("test/harness/$(basename "$f")"); done; fi
 # Read-only sources; everything a test writes goes to the container's own /tmp. No network: nothing can reach a real model.
+# Two files at a time, which halves the time: each has its own tmux server, fake model (on a free port), homes and
+# state, and only T3's uses its fixed port and ~/.t3. Three at once made Codex's plan-mode test time out once.
 exec "$engine" run --rm --network=none --init \
   -v "$repo/connector:/work/connector:ro" -v "$repo/brain/src:/work/brain/src:ro" \
-  "$tag" node --test --test-concurrency=1 "${files[@]}"
+  "$tag" node --test --test-concurrency="${HARNESS_CONCURRENCY:-2}" "${files[@]}"

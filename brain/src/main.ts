@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { loadConfig } from "./config.ts";
-import { Store } from "./store.ts";
+import { READINGS_KEPT_MS, Store } from "./store.ts";
 import { RemoteAdapter } from "./connectors.ts";
 import { Machines } from "./machines.ts";
 import { makeLlm, type Llm, type Used } from "./llm.ts";
@@ -15,9 +15,12 @@ import { modelClassifier, modelOpener } from "./briefing.ts";
 import { modelBriefingWriter } from "./briefing-reading.ts";
 import { modelTitler } from "./titles.ts";
 import { modelPurposer } from "./purposes.ts";
+import { modelJudge, modelReader, rulesAI } from "./reader.ts";
 import { startServer, type DemoWorlds, type ServerDeps } from "./server.ts";
-import { wire } from "./world.ts";
+import { wake, wire } from "./world.ts";
 import { Ringer } from "./ring.ts";
+import { Engine, questionReader } from "./engine.ts";
+import { privacyOf } from "./privacy.ts";
 import { demoWorld, demoWriter } from "./demo/world.ts";
 import { hangup } from "./voice/live.ts";
 import { nodeSocket } from "./voice/socket-node.ts";
@@ -104,12 +107,23 @@ if (cfg.demo === "only") {
 } else {
   const connectors = cfg.connectors.map((c) => ({ ...c, adapter: new RemoteAdapter(c.name) }));
   const adapter = new Machines(connectors.map((c) => ({ ...c, said: c.local ? spokenHost() : undefined })), log);
-  const { briefing, conversations, proposals, waits } = wire({
+  const { briefing, conversations, proposals, waits, later } = wire({
     adapter, store, classify: modelClassifier(spending("classifier"), cfg.classifyModel), writeOpener: modelOpener(spending("opener"), cfg.openerModel),
     title: modelTitler(spending("titler"), cfg.openerModel), purpose: modelPurposer(spending("purposer"), cfg.classifyModel), profiles: cfg.launchProfiles, log,
     track: analytics.track, onDemand: true,
   });
-  adapter.watch((ids, urgent) => briefing.onChange(ids, urgent));
+  // A phone can register to be rung, but this brain has no push key, so nothing rings (docs/launch/ring.md); nor does it
+  // send notifications yet. The engine (engine.ts) is always on here: following, and its reach-outs, kept for a call. Its
+  // one timer, at `engine.due()`, keeps the rules' time: the waits' too, which no longer poll.
+  const ringer = new Ringer({ waits, store, log, track: analytics.track, names: () => privacyOf(store).names });
+  // Stage 3.5: "needs my input"'s judged half by the thread's card, only once Jordan says (reader.ts `NEEDS_YOU_SHIPS`);
+  // your own words read, and their clauses judged, only while the reader's eval says so (`READER_SHIPS`).
+  const engine = new Engine({
+    adapter, store, waits, ringer, later, name: (i) => briefing.names().get(i.id) ?? i.title, read: questionReader(briefing, adapter, store), log, track: analytics.track,
+    ...rulesAI({ needsYou: (id) => briefing.needsYou(id), reader: () => modelReader(spending("rules_reader"), cfg.classifyModel), judge: () => modelJudge(spending("rules_judge"), cfg.classifyModel) }),
+  });
+  // A machine's report wakes the briefing, the waits and the engine, as the cloud's does (docs/launch/engine.md §7).
+  wake(adapter, briefing, waits, engine);
   void briefing.refresh().catch((e) => {
     log(`briefing: first refresh failed: ${describe(e)}`);
     analytics.exception("briefing", e);
@@ -123,10 +137,8 @@ if (cfg.demo === "only") {
     });
     void syncVisits({ adapter, briefing, store, log });
   }, 3600_000).unref();
-  store.forgetReadings(Date.now() - 30 * 86_400_000);
-  // A phone can register to be rung, but this brain has no push key, so nothing rings (docs/launch/ring.md).
-  const ringer = new Ringer({ waits, store, log, track: analytics.track });
-  deps = { ...common, connectors, adapter, briefing, proposals, store, conversations, waits, hangups, flags: flagsIn("flags", store), refresh: () => briefing.refresh(), ringer };
+  store.forgetReadings(Date.now() - READINGS_KEPT_MS);
+  deps = { ...common, connectors, adapter, briefing, proposals, store, conversations, waits, hangups, flags: flagsIn("flags", store), refresh: () => briefing.refresh(), ringer, engine };
   closeWork = () => adapter.close();
 }
 const server = startServer(cfg, deps, demo);

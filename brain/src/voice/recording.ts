@@ -168,6 +168,13 @@ export class Recording {
   private pendingBytes = 0;
   /** The entry being cleaned, part way through. */
   private current: { pass: Generator<void, unknown>; entry: Record<string, unknown>; tally: Tally; size: number } | null = null;
+  /**
+   * What a slice has cleaned, written in one go as it ends. Node's file stream joins whatever waits into one write
+   * anyway; Bun's finishes one write a turn of the event loop, so written a line at a time, 33 lines of 57 KB queued
+   * past the 1 MB a disk may fall behind, on a quick disk, in 14 of 15 runs of the oversized-event test (22 November).
+   */
+  private batch: string[] = [];
+  private batchBytes = 0;
   private scheduled = false;
   private closing = false;
   /** Settles once the file is finished (or failed). */
@@ -200,7 +207,7 @@ export class Recording {
     this.maxPending = opts.maxPending ?? MAX_PENDING;
     this.started = this.now();
     this.out = (opts.open ?? ((f: string): WriteStream => createWriteStream(f, { flags: "a", mode: 0o600 })))(file);
-    this.out.on("error", (e) => this.stop(`couldn't write it (${describe(e)})`));
+    this.out.on("error", (e) => this.stop(`couldn't write it (${describe(e)})`, false));
     const out = this.out;
     this.done = new Promise((resolve) => {
       out.once("finish", resolve);
@@ -243,6 +250,11 @@ export class Recording {
         this.close();
       },
     };
+  }
+
+  /** Stops keeping the microphone's audio (call audio switched off mid-call); the recording itself goes on. */
+  stopAudio(): Promise<void> {
+    return this.audio?.stop() ?? Promise.resolve();
   }
 
   /** Ends the recording once what's pending is written; settles when the file is finished, or after `ms` at most. */
@@ -292,7 +304,10 @@ export class Recording {
     const until = performance.now() + SLICE_MS;
     try {
       while (!this.stopped) {
-        if (performance.now() >= until) return this.schedule();
+        if (performance.now() >= until) {
+          this.send();
+          return this.schedule();
+        }
         if (!this.current) {
           const next = this.pending.shift();
           if (!next) break;
@@ -313,6 +328,7 @@ export class Recording {
         this.current = null;
         this.writeLine(JSON.stringify(done) + "\n");
       }
+      this.send();
     } catch (e) {
       return this.stop(`couldn't write it (${describe(e)})`);
     }
@@ -328,27 +344,49 @@ export class Recording {
       // Never wait for the disk: what it hasn't taken yet is held in memory, so past a limit the recording stops. The
       // header, however many threads it lists, is queued before the file has even opened: it's allowed on top.
       if (!this.bytes) this.headerBytes = size;
-      else if (this.out.writableLength + size > this.maxQueued + this.headerBytes) return this.stop("the disk isn't keeping up");
+      else if (this.out.writableLength + this.batchBytes + size > this.maxQueued + this.headerBytes) {
+        // The slice's lines go to the file first, so only what it hasn't taken counts, as when each line was written on
+        // its own: a stream that takes a write at once (cloud's bucket) has nothing queued.
+        this.send();
+        if (this.out.writableLength + size > this.maxQueued + this.headerBytes) return this.stop("the disk isn't keeping up");
+      }
       if (this.bytes + size > this.maxBytes) {
-        this.out.write(recordLine({ t: this.elapsed(), brain: { type: "truncated", bytes: this.bytes } }) + "\n");
+        this.batch.push(recordLine({ t: this.elapsed(), brain: { type: "truncated", bytes: this.bytes } }) + "\n");
         return this.stop(`it reached ${Math.round(this.maxBytes / (1 << 20))} MB`);
       }
       this.bytes += size;
-      this.out.write(line);
+      this.batch.push(line);
+      this.batchBytes += size;
     } catch (e) {
       this.stop(`couldn't write it (${describe(e)})`);
     }
   }
 
-  /** Stops recording this session, once, and says why; the session carries on. */
-  private stop(why: string) {
+  /** Hands the slice's lines to the file, in one write. */
+  private send() {
+    if (!this.batch.length) return;
+    const text = this.batch.join("");
+    this.batch = [];
+    this.batchBytes = 0;
+    this.out.write(text);
+  }
+
+  /**
+   * Stops recording this session, once, and says why; the session carries on. `flush`: what was taken before it stopped
+   * is written, as it would have been a line at a time; not to a stream that has failed.
+   */
+  private stop(why: string, flush = true) {
     if (this.stopped) return;
     this.stopped = true;
     this.pending = [];
     this.current = null;
     this.pendingBytes = 0;
     this.log(`recording: stopped recording ${this.file}: ${why}; the session carries on`);
-    this.out.end();
+    // Neither may throw (a stream already ended or broken): recording never breaks the session, and the file is still
+    // ended so `done` settles.
+    if (flush) { try { this.send(); } catch { /* ended below all the same */ } }
+    else { this.batch = []; this.batchBytes = 0; }
+    try { this.out.end(); } catch { /* already over */ }
   }
 }
 
@@ -400,6 +438,11 @@ export class Recordings {
     this.open.add(recording);
     void recording.done.then(() => this.open.delete(recording));
     return recording;
+  }
+
+  /** Every open recording stops keeping its call's audio (the tester switched it off): settles once none is written. */
+  async stopAudio() {
+    await Promise.all([...this.open].map((r) => r.stopAudio()));
   }
 
   /** Finishes every recording still open (the brain is shutting down), waiting `ms` at most for each. */

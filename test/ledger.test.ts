@@ -5,9 +5,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { spawn } from "node:child_process";
-import { Ledger, actionHash, ledgerHeld } from "../src/ledger.ts";
+import { Ledger, NOT_CLAIMED, actionHash, ledgerHeld } from "../src/ledger.ts";
 import { databasePath } from "../src/paths.ts";
-import { assertPrivate, removeDir } from "./fixtures/platform.ts";
+import { assertPrivate, NODE, removeDir } from "./fixtures/platform.ts";
 import type { Action, Receipt } from "../src/contract.ts";
 
 const action: Action = { kind: "settle", itemId: "a" };
@@ -128,7 +128,7 @@ test("a held ledger says a connector is running, and a look at it (as status tak
   await ledger.close();
   assert.equal(ledgerHeld(dir), false);
   // Another process reading the ledger while a connector opens it: the connector waits for it.
-  const reader = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", "-e", `
+  const reader = spawn(NODE, ["--disable-warning=ExperimentalWarning", "-e", `
     const db = new (require("node:sqlite").DatabaseSync)(${JSON.stringify(join(dir, "connector.db"))}, { readOnly: true });
     db.exec("BEGIN"); db.prepare("SELECT 1 FROM sqlite_master").get(); console.log("reading");
     setTimeout(() => { db.exec("COMMIT"); db.close(); }, 300);`], { stdio: ["ignore", "pipe", "inherit"] });
@@ -149,4 +149,56 @@ test("on Windows a database path too long for SQLite there is given as \\\\?\\, 
   assert.equal(databasePath(":memory:", "win32"), ":memory:");
   const posix = `/home/me/${"x".repeat(300)}/connector.db`;
   assert.equal(databasePath(posix, "linux"), posix);
+});
+
+// The skeptic on 7717d10f3219: the `sent` table's two new columns were added in one go, guarded by the second alone, so a
+// crash between them left `found_item` there, and every later start failed ("duplicate column name: found_item").
+test("a store from before a send kept its message gains each new column by itself, whichever a crash left", async (t) => {
+  for (const had of [[], ["found_item"], ["found_item", "found_at"]]) {
+    const dir = mkdtempSync(join(tmpdir(), "ledger-"));
+    t.after(() => removeDir(dir));
+    const db = new DatabaseSync(join(dir, "connector.db"));
+    db.exec(`CREATE TABLE sent (key TEXT PRIMARY KEY, item TEXT, digest TEXT NOT NULL, at INTEGER NOT NULL${had.map((c) => `, ${c} TEXT`).join("")});
+      INSERT INTO sent (key, item, digest, at) VALUES ('op-1', 'a', 'd', ${Date.now()});`);
+    db.close();
+    const ledger = new Ledger(dir);
+    ledger.claim("op-1", { item: "a", at: "2026-11-20T09:00:00.000Z" });
+    assert.deepEqual(ledger.sends(), [{ key: "op-1", item: "a", digest: "d", at: ledger.sends()[0]!.at, found: { item: "a", at: "2026-11-20T09:00:00.000Z" } }], had.join(", "));
+    await ledger.close();
+  }
+});
+
+test("the schedules table is on the ledger's own handle, under its exclusive lock: no second connection can read it", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ledger-"));
+  t.after(() => removeDir(dir));
+  const ledger = new Ledger(dir);
+  ledger.handle.prepare("INSERT INTO schedules (id, v, device, hash, body, state, set_at) VALUES ('s', 1, 'd', 'h', '{}', 'waiting', 1)").run();
+  const other = new DatabaseSync(join(dir, "connector.db"));
+  assert.throws(() => other.prepare("SELECT * FROM schedules").all(), /locked/);
+  other.close();
+  await ledger.close();
+  const after = new DatabaseSync(join(dir, "connector.db"));
+  assert.equal((after.prepare("SELECT state FROM schedules WHERE id = 's'").get() as { state: string }).state, "waiting", "kept on disk for the next start");
+  after.close();
+});
+
+test("a claim that says no, once the checks passed, sends nothing and records nothing against the key", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "ledger-"));
+  const ledger = new Ledger(dir);
+  // Its store closed first: Windows won't remove a folder with a file open in it.
+  t.after(async () => { await ledger.close(); removeDir(dir); });
+  let calls = 0, claims = 0;
+  const execute = async (): Promise<Receipt> => { calls++; return { ok: true }; };
+  const no = await ledger.execute(action, "R-1:a", { retrySafe: false, refuse: async () => null, claim: () => { claims++; return false; }, execute });
+  assert.deepEqual(no, NOT_CLAIMED);
+  assert.equal(calls, 0);
+  assert.equal(ledger.handle.prepare("SELECT COUNT(*) AS n FROM actions").get()!.n, 0);
+  // Refused first: the claim isn't asked.
+  await ledger.execute(action, "R-1:a", { retrySafe: false, refuse: async () => ({ ok: false, error: "busy" }), claim: () => { claims++; return true; }, execute });
+  assert.equal(claims, 1);
+  // Yes: claimed in the dispatch's own transaction, then sent once.
+  let inTransaction = false;
+  assert.deepEqual(await ledger.execute(action, "R-1:a", { retrySafe: false, claim: () => { inTransaction = ledger.handle.isTransaction; return true; }, execute }), { ok: true });
+  assert.equal(inTransaction, true);
+  assert.equal(calls, 1);
 });

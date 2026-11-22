@@ -6,14 +6,18 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { AddressInfo } from "node:net";
+import type { TestContext } from "node:test";
 import { WebSocketServer, type WebSocket } from "ws";
-import { answersFor, folderOf, instanceOn, mapStatus, newThreadModel, offeredModels, providerLabel, snoozedUntil, t3Home, t3Origin, T3Adapter, titleFrom, toCommand, toLaunch, type ShellThread, type T3Config, type T3Provider, type T3Settings } from "../src/t3/adapter.ts";
+import { answersFor, folderOf, HISTORY_PAGES, instanceOn, mapStatus, newThreadModel, offeredModels, outputVerdict, runItems, providerLabel, snoozedUntil, t3Home, t3Origin, T3Adapter, titleFrom, toCommand, toLaunch, toWorkItem, type ShellThread, type T3Config, type T3Provider, type T3Settings } from "../src/t3/adapter.ts";
 import { CONNECTOR_SCOPES, issueSession, revokeSession } from "../src/t3/auth.ts";
 import { resolveCommand } from "../src/command.ts";
+import { Local } from "../src/local.ts";
+import { parsePolicy } from "../src/policy.ts";
+import { ANSWERED } from "../src/util.ts";
 import { worktreeStart } from "../src/work.ts";
 import type { LaunchProfile } from "../src/contract.ts";
 import { ConnectionError, RpcClient, RpcError } from "../src/t3/rpc.ts";
-import { nodeCommand, removeDir } from "./fixtures/platform.ts";
+import { NODE, nodeCommand, removeDir } from "./fixtures/platform.ts";
 
 const thread = (id: string, over: Partial<ShellThread> = {}): ShellThread => ({
   id, projectId: "p1", title: `Thread ${id}`, status: "completed", updatedAt: "2026-10-16T08:00:00Z", ...over,
@@ -35,6 +39,14 @@ test("status, settled and snooze follow T3's own rules", () => {
 test("T3 waiting is an active run unless it has a question for the user", () => {
   assert.equal(mapStatus(thread("a", { status: "waiting" })), "running");
   assert.equal(mapStatus(thread("a", { status: "waiting", pendingRuntimeRequest: { id: "r", kind: "user_input" } })), "waiting");
+});
+
+test("T3 pending background tasks and thread waits keep a thread running", () => {
+  assert.equal(mapStatus(thread("a", { status: "completed", pendingBackgroundTasks: [{ taskId: "t1", kind: "subagent", description: "Phase 3 build" }] })), "running");
+  assert.equal(mapStatus(thread("a", { status: "completed", pendingBackgroundTasks: [{ taskId: "t2", kind: "command", awaited: true, description: "Running tests", command: "npm test" }] })), "running");
+  assert.equal(mapStatus(thread("a", { status: "completed", pendingBackgroundTasks: [{ taskId: "t3", kind: "command", awaited: false, description: "Dev server", command: "npm run dev" }] })), "completed");
+  assert.equal(mapStatus(thread("a", { status: "completed", blockedOnThreadWait: true })), "running");
+  assert.equal(mapStatus(thread("a", { status: "completed", pendingBackgroundTasks: [{ taskId: "t1", kind: "subagent" }], pendingRuntimeRequest: { id: "r", kind: "user_input" } })), "waiting");
 });
 
 test("actions map to exactly the four allowed thread commands", () => {
@@ -62,15 +74,21 @@ test("a follow-up answers a question with the option it names, or else in its ow
 
 /**
  * A fake T3: ticket endpoint plus a socket that speaks the captured Effect RPC frames. `threads` answers the HTTP API's
- * whole-thread snapshot (`/api/orchestration/threads/<id>`) with a projection, or a status to fail with.
+ * whole-thread snapshot (`/api/orchestration/threads/<id>`) with a projection, or a status to fail with; `onHttp` answers
+ * any other GET it returns something for (a thread's bounded window or a page of its history).
  */
-async function fakeT3(handlers: { onRequest: (frame: any, ws: WebSocket) => void; tokens?: Set<string>; threads?: (id: string) => object | number }) {
+async function fakeT3(handlers: { onRequest: (frame: any, ws: WebSocket) => void; tokens?: Set<string>; threads?: (id: string) => object | number; onHttp?: (url: URL, headers: Record<string, unknown>) => object | null }) {
   const tokens = handlers.tokens ?? new Set(["good"]);
   const frames: any[] = [];
   const sockets: WebSocket[] = [];
   const threadReads: string[] = [];
   const http = createServer((req, res) => {
     const authorized = tokens.has(String(req.headers.authorization).replace("Bearer ", ""));
+    const got = req.method === "GET" && handlers.onHttp ? handlers.onHttp(new URL(req.url!, "http://x"), req.headers) : null;
+    if (got) {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify(got));
+    }
     if (req.url === "/api/auth/websocket-ticket" && req.method === "POST") {
       res.writeHead(authorized ? 200 : 401, { "content-type": "application/json" });
       return res.end(JSON.stringify(authorized ? { ticket: "tk" } : { error: "no" }));
@@ -192,6 +210,8 @@ test("T3Adapter: lists from the shell, ignores thread-less snapshots, reports ch
         exit(ws, f.id, { sequence: 7 });
       }
     },
+    // T3's bounded history, as T3 answers it: nothing older (a report reads it back for a run its window doesn't hold).
+    onHttp: () => ({ snapshotSequence: 1, projection: { turnItems: [] }, hasMoreHistory: false }),
   });
   const revoked: string[] = [];
   const adapter = new T3Adapter({
@@ -218,7 +238,7 @@ test("T3Adapter: lists from the shell, ignores thread-less snapshots, reports ch
     assert.equal(rep.question, "Which host? Options: Prism / Quartz.");
     assert.equal(rep.progress, null);
     assert.equal(rep.reply, null, "a message without an id or a time can't be told apart, so it isn't a reply to track");
-    const kid = { text: "Done: it builds.", progress: "Next I'll run the tests.", question: null, reply: { runId: "r1", messageId: "m1", at: "2026-10-16T07:30:00Z" }, earlier: ["2026-10-16T07:10:00Z"] };
+    const kid = { text: "Done: it builds.", progress: "Next I'll run the tests.", question: null, choices: null, reply: { runId: "r1", messageId: "m1", at: "2026-10-16T07:30:00Z" }, earlier: ["2026-10-16T07:10:00Z"] };
     assert.deepEqual(await adapter.report("kid"), kid, "the reply is r1's, finished when r1 did: r3 failed without one; r0's before it");
     runStatus = "waiting";
     assert.deepEqual(await adapter.report("kid"), kid, "waiting notes are still progress, not a finished reply");
@@ -342,8 +362,10 @@ test("T3Adapter: a run longer than the projection's window still has the replies
   });
   try {
     await adapter.start();
+    // This fake T3 serves no turn-item pages, so the reply's run can't be read for its checks: the report says so.
     assert.deepEqual(await adapter.report("ads"), {
-      text: "Four drafts are made.", progress: "Landing on main now.", question: null, reply: { runId: "r2", messageId: "a2", at: r2.completedAt }, earlier: [r1.completedAt],
+      text: "Four drafts are made.", progress: "Landing on main now.", question: null, choices: null, reply: { runId: "r2", messageId: "a2", at: r2.completedAt }, earlier: [r1.completedAt],
+      checksUnread: true,
     }, "the last finished run's reply and the one before it (not the rolled-back one), with the run going as progress");
     // The run works on: the shell's updatedAt moves with every row, which doesn't make the thread worth reading again.
     push({ kind: "thread.updated", location: "active", thread: running({ updatedAt: "2026-11-18T19:47:40Z" }) });
@@ -366,7 +388,7 @@ test("T3Adapter: a run longer than the projection's window still has the replies
     assert.deepEqual(t3.threadReads, ["ads", "ads"]);
 
     // A first run still going has no reply before it, and a window that holds every row is the whole thread.
-    assert.deepEqual(await adapter.report("fresh"), { text: "", progress: "Still reading.", question: null, reply: null, earlier: [] });
+    assert.deepEqual(await adapter.report("fresh"), { text: "", progress: "Still reading.", question: null, choices: null, reply: null, earlier: [] });
     assert.deepEqual((await adapter.replies("short")).map((r) => r.text), ["The latest only."]);
     assert.deepEqual(t3.threadReads, ["ads", "ads"], "neither is read whole");
 
@@ -836,6 +858,89 @@ test("local project visibility filters threads, places and changes, and guards e
   } finally { await adapter.close(); t3.close(); }
 });
 
+test("a question for the user is input; any other request T3 is waiting on is an approval, which 10 & 2 never gives", () => {
+  const kind = (t: ShellThread) => toWorkItem(t, new Map(), 0).questionKind;
+  assert.equal(kind(thread("a", { status: "running", pendingRuntimeRequest: { id: "r", kind: "user_input" } })), "input");
+  assert.equal(kind(thread("a", { status: "running", pendingRuntimeRequest: { id: "r", kind: "command_execution_approval" } })), "approval");
+  assert.equal("questionKind" in toWorkItem(thread("a"), new Map(), 0), false, "asks nothing");
+});
+
+/** A T3 with four threads: one asking which way with two options, one waiting for an OK, one running, one done. */
+async function asking(t: TestContext, policy: string | null) {
+  const commands: any[] = [], launches: any[] = [];
+  let push: (v: unknown) => void = () => {};
+  const t3 = await fakeT3({ onRequest: (f, ws) => {
+    if (f.tag === "orchestration.subscribeShell") {
+      push = (v) => ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [v] }));
+      push({ kind: "snapshot", snapshot: { projects: [{ id: "p1", title: "api", workspaceRoot: "/work/api", defaultModelSelection: { model: "m" } }], threads: [
+        thread("ask", { status: "running", pendingRuntimeRequest: { id: "r1", kind: "user_input" } }),
+        thread("ok", { status: "running", pendingRuntimeRequest: { id: "r2", kind: "command_execution_approval" } }),
+        thread("busy", { status: "running" }),
+        thread("done"),
+      ] } });
+    } else if (f.tag === "orchestration.getThreadProjection") {
+      exit(ws, f.id, { messages: [], turnItems: f.payload.threadId !== "ask" ? [] : [{ type: "user_input_request", requestId: "r1",
+        questions: [{ id: "q1", question: "Rebase onto main, or merge?", options: [{ label: "Rebase", value: "rebase" }, { label: "Rebase (later)", value: "later" }, { label: "Merge", value: "merge" }] }] }] });
+    } else if (f.tag === "orchestration.dispatchCommand") { commands.push(f.payload); exit(ws, f.id, {}); }
+    else if (f.tag === "orchestration.launchThread") { launches.push(f.payload); exit(ws, f.id, { threadId: "t-new" }); }
+  } });
+  const parsed = policy === null ? undefined : parsePolicy(policy);
+  const adapter = new T3Adapter({ baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {}, ...(parsed ? { policy: parsed } : {}),
+    auth: { issue: async () => ({ token: "good", sessionId: "s", expiresAt: new Date(Date.now() + 86400000).toISOString() }), revoke: async () => {} } });
+  t.after(async () => { await adapter.close(); t3.close(); });
+  await adapter.start();
+  return { adapter, commands, launches, policy: parsed, push };
+}
+
+test("T3's question has its own options as choices, and a tap answers that request with the option's own label; a stale one sends nothing", async (t) => {
+  const { adapter, commands } = await asking(t, null);
+  assert.deepEqual((await adapter.report("ask")).choices, ["Rebase", "Rebase (later)", "Merge"]);
+  assert.equal((await adapter.report("ok")).choices, null, "a permission has no options to tap");
+  assert.equal((await adapter.report("done")).choices, null);
+  assert.deepEqual(Object.fromEntries((await adapter.list()).map((i) => [i.id, i.questionKind])), { ask: "input", ok: "approval", busy: undefined, done: undefined });
+  const tap = (questionId: string, message = "Rebase (later)") => ({ kind: "follow_up" as const, itemId: "ask", message, questionId });
+  assert.deepEqual(await adapter.execute(tap("r0"), "T-1:ask"), { ok: false, error: ANSWERED }, "T3 holds another request now");
+  assert.deepEqual(commands, []);
+  assert.deepEqual(await adapter.execute(tap("r1"), "T-2:ask"), { ok: true });
+  assert.deepEqual(commands, [{ type: "runtime-request.respond", commandId: "T-2:ask", threadId: "ask", requestId: "r1", answers: { q1: "later" } }]);
+});
+
+test("T3 Code keeps to its own narrowing in the policy (agents.t3): answering, steering a running thread, its actions and its ceiling", async (t) => {
+  const brain = "ws://127.0.0.1:8790/connector";
+  const all = ["follow_up", "settle", "snooze", "archive", "start_work"];
+  const profile = { name: "Build", workspace: "root", runtimeMode: "full-access", interactionMode: "default" } as const;
+  const follow = (itemId: string) => ({ kind: "follow_up" as const, itemId, message: "Rebase" });
+
+  // The machine allows everything; T3 alone may not answer, steer, archive or start above auto.
+  const narrowed = JSON.stringify({ brain, projects: "*", actions: all, maxRuntimeMode: "full-access",
+    agents: { t3: { answer: false, steer: false, actions: ["follow_up", "settle", "snooze", "start_work"], maxRuntimeMode: "auto" } } });
+  const n = await asking(t, narrowed);
+  const local = new Local([{ prefix: "", adapter: n.adapter, retrySafe: true }], n.policy!);
+  assert.match((await local.check(follow("ask")))!, /doesn't let 10 & 2 answer them/);
+  assert.match((await local.execute(follow("ask"), "P-1:ask") as { error: string }).error, /doesn't let 10 & 2 answer them/);
+  assert.match((await local.check(follow("busy")))!, /doesn't let 10 & 2 send to a running thread/);
+  assert.equal(await local.check(follow("done")), null, "a thread that isn't running is followed up as before");
+  assert.match((await local.check({ kind: "archive", itemId: "done" }))!, /doesn't allow that action/);
+  assert.match((await local.check({ kind: "start_work", placeId: "p1", message: "Go", profile }))!, /permission ceiling/);
+  assert.equal(await local.check({ kind: "start_work", placeId: "p1", message: "Go", profile: { ...profile, runtimeMode: "auto" } }), null);
+  assert.deepEqual(local.refusals(), { ask: { follow_up: n.adapter.refusals().ask!.follow_up }, busy: { follow_up: n.adapter.refusals().busy!.follow_up } }, "said before a proposal is read back");
+  assert.deepEqual([n.commands, n.launches], [[], []], "nothing reached T3");
+  assert.match((await local.execute(follow("ok"), "P-2:ok") as { error: string }).error, /answer it in T3 Code/, "a permission is refused when it's sent, as before");
+
+  // T3 may not start work at all: it offers no places.
+  const noStart = await asking(t, JSON.stringify({ brain, projects: "*", actions: all, maxRuntimeMode: "full-access", agents: { t3: { actions: ["follow_up"] } } }));
+  assert.deepEqual(noStart.adapter.places(), []);
+
+  // Narrowed for another agent only, T3 answers, steers and starts as before.
+  const other = await asking(t, JSON.stringify({ brain, projects: "*", actions: all, maxRuntimeMode: "full-access", agents: { t3: true, claude: { answer: false, steer: false } } }));
+  assert.equal(await other.adapter.check(follow("ask")), null);
+  assert.equal(await other.adapter.check(follow("busy")), null);
+  assert.deepEqual(other.adapter.refusals(), {});
+  assert.deepEqual(other.adapter.places().map((p) => p.id), ["p1"]);
+  assert.deepEqual(await other.adapter.execute(follow("ask"), "P-3:ask"), { ok: true });
+  assert.deepEqual(other.commands.map((c) => [c.type, c.answers]), [["runtime-request.respond", { q1: "rebase" }]]);
+});
+
 test("folderOf: the end of a checkout's path, never all of it", () => {
   assert.equal(folderOf("/home/jmo/Development/mono/nix/"), "mono/nix");
   assert.equal(folderOf("/srv"), "srv");
@@ -859,7 +964,7 @@ test("without T3_URL, T3 is found where it says it is (another port when 3773 is
   assert.equal(t3Origin(home), "http://127.0.0.1:3773", "no file: T3's default");
   runtime({ version: 1, pid: process.pid, host: "127.0.0.1", port: 3774, origin: "http://127.0.0.1:3774", startedAt: "2026-11-20T10:00:00.000Z" });
   assert.equal(t3Origin(home), "http://127.0.0.1:3774");
-  const ended = spawnSync(process.execPath, ["-e", ""]).pid;
+  const ended = spawnSync(NODE, ["-e", ""]).pid;
   runtime({ version: 1, pid: ended, port: 3775, origin: "http://127.0.0.1:3775" });
   assert.equal(t3Origin(home), "http://127.0.0.1:3773", "a server that has stopped left it");
   runtime({ version: 1, pid: process.pid, port: 3774, origin: "file:///etc/passwd" });
@@ -890,6 +995,50 @@ test("without T3_URL, T3 is found where it says it is (another port when 3773 is
   assert.deepEqual(subscribed, ["first", "second"]);
   for (let n = 0; n < 50 && !adapter.connected(); n++) await new Promise((r) => setTimeout(r, 20));
   assert.deepEqual((await adapter.list()).map((i) => i.id), ["second"]);
+});
+
+// main.ts passes T3's address only when T3_URL is set; without it, a run's pages are read where T3 says it is (t3Origin),
+// as every other call to T3 is.
+test("receipts: without T3_URL, a long run's history pages are read where T3 says it is", async (t) => {
+  const at = "2026-11-16T09:00:00Z";
+  const item = (ordinal: number, runId: string, over: object) => ({ id: `i${ordinal}`, threadId: "t1", runId, ordinal, status: "completed", updatedAt: at, ...over });
+  const all = [
+    item(1, "r1", { type: "assistant_message", text: "Earlier.", streaming: false }),
+    item(2, "r2", { type: "command_execution", input: "pnpm test", status: "failed", exitCode: 1 }),
+    ...Array.from({ length: 100 }, (_, n) => item(3 + n, "r2", { type: "reasoning", text: "thinking" })),
+    item(103, "r2", { type: "assistant_message", text: "All done!", streaming: false }),
+  ];
+  const newest = (n: number, before = all.length) => all.slice(Math.max(0, before - n), before);
+  const projection = {
+    runs: [{ id: "r1", status: "completed", completedAt: "2026-11-16T08:00:00Z" }, { id: "r2", status: "completed", completedAt: at }],
+    messages: [{ id: "i1", role: "assistant", runId: "r1", text: "Earlier.", streaming: false }, { id: "i103", role: "assistant", runId: "r2", text: "All done!", streaming: false }],
+    turnItems: newest(77),
+  };
+  const asked: string[] = [];
+  const t3 = await fakeT3({
+    onRequest: (f, ws) => {
+      if (f.tag === "orchestration.subscribeShell") ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [{ kind: "snapshot", snapshot: { projects: [{ id: "p1", title: "api", workspaceRoot: "/work/api" }], threads: [thread("t1")] } }] }));
+      if (f.tag === "orchestration.getThreadProjection") exit(ws, f.id, projection);
+    },
+    onHttp: (url) => {
+      asked.push(url.pathname.endsWith("/bounded") ? "bounded" : `history ${url.searchParams.get("cursor")}`);
+      if (url.pathname === "/api/orchestration/threads/t1/bounded") return { snapshotSequence: 9, projection: { ...projection, turnItems: newest(75) }, historyCursor: "75", hasMoreHistory: true };
+      if (url.pathname !== "/api/orchestration/threads/t1/history") return null;
+      const skip = Number(url.searchParams.get("cursor"));
+      return { snapshotSequence: 9, items: newest(75, all.length - skip).map((i, position) => ({ position, visibility: "local", sourceThreadId: "t1", sourceItemId: i.id, item: i })), nextCursor: String(skip + 75), hasMoreHistory: all.length - skip - 75 > 0 };
+    },
+  });
+  t.after(() => t3.close());
+  const home = mkdtempSync(join(tmpdir(), "t3-home-"));
+  t.after(() => removeDir(home));
+  mkdirSync(join(home, "userdata"));
+  writeFileSync(join(home, "userdata", "server-runtime.json"), JSON.stringify({ version: 1, pid: process.pid, port: Number(new URL(t3.base).port), origin: t3.base }));
+  const adapter = new T3Adapter({ t3Home: home, cli: ["t3"], label: "test", log: () => {}, auth: { issue: async () => ({ token: "good", sessionId: "s", expiresAt: new Date(Date.now() + 86400000).toISOString() }), revoke: async () => {} } });
+  t.after(() => adapter.close());
+  await adapter.start();
+  const report = await adapter.report("t1");
+  assert.deepEqual(asked, ["bounded", "history 75"]);
+  assert.deepEqual(report.checks, { tests: { ok: false, runs: 1, failed: 1, label: "pnpm test" } });
 });
 
 test("T3's CLI mints and revokes the session with plain words only, which even the desktop app's t3.cmd on Windows takes", async (t) => {
@@ -1171,6 +1320,499 @@ test("T3Adapter: a launch on a chosen model sends it as T3's picker would, check
     assert.deepEqual(launches.at(-1).modelSelection, { instanceId: "codex", model: "astra-6" }, "without T3's settings, the newest thread's model, as before");
     // The last good read still stands for the places.
     assert.ok(adapter.places()[0]!.models!.length > 0);
+  } finally {
+    await adapter.close();
+    t3.close();
+  }
+});
+
+test("what a person typed (the engine's stage 3.9): a thread is read only as T3's last user write moves, one recent at first sight; its own resumes and 10 & 2's sends aren't a person's, the phone's isn't at a computer", async () => {
+  const at = (minAgo: number) => new Date(Date.now() - minAgo * 60_000).toISOString();
+  let push: (v: any) => void = () => {};
+  const reads: string[] = [];
+  const resumed = at(20);
+  const messages: Record<string, any[]> = {
+    a: [
+      { id: "m1", role: "user", text: "Run the migration.", createdBy: "user", creationSource: "web", createdAt: at(30) },
+      // T3's usage-limit resume, written as the user's: latestUserAuthoredMessageAt moves to it.
+      { id: "limit-resume:x:legacy", role: "user", text: "Continue where you left off.", createdBy: "user", creationSource: "server", createdAt: resumed },
+    ],
+    old: [{ id: "m0", role: "user", text: "Long ago.", createdBy: "user", creationSource: "web", createdAt: at(80 * 60) }],
+  };
+  const t3 = await fakeT3({ onRequest: (f, ws) => {
+    if (f.tag === "orchestration.subscribeShell") {
+      push = (v) => ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [v] }));
+      push({ kind: "snapshot", snapshot: { projects: [{ id: "p1", title: "nix" }], threads: [
+        thread("a", { latestUserAuthoredMessageAt: resumed }),
+        thread("old", { latestUserAuthoredMessageAt: at(80 * 60) }),
+        thread("none"),
+      ] } });
+    } else if (f.tag === "orchestration.getThreadProjection") {
+      reads.push(f.payload.threadId);
+      exit(ws, f.id, { messages: messages[f.payload.threadId] ?? [] });
+    }
+  } });
+  const auth = { issue: async () => ({ token: "good", sessionId: "s", expiresAt: new Date(Date.now() + 86_400_000).toISOString() }), revoke: async () => {} };
+  const adapter = new T3Adapter({ baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {}, auth });
+  const until = async (test: () => boolean) => { for (let i = 0; i < 200 && !test(); i++) await new Promise((r) => setTimeout(r, 10)); assert.ok(test()); };
+  try {
+    const changed: string[][] = [];
+    adapter.watch((ids) => changed.push(ids));
+    await adapter.start();
+    await until(() => adapter.personWrites("a").length === 1);
+    assert.deepEqual(adapter.personWrites("a").map((w) => [w.at, w.desk]), [[messages.a![0].createdAt, true]], "the resume isn't a person's");
+    assert.deepEqual(adapter.personWrites("old"), [], "a write from before Away could have begun isn't read");
+    assert.deepEqual(reads, ["a"]);
+    assert.ok(changed.some((ids) => ids.includes("a")), "reported again once read");
+    // The same write again (another change to the thread): not read again.
+    push({ kind: "thread.updated", thread: thread("a", { latestUserAuthoredMessageAt: resumed, status: "running" }) });
+    await new Promise((r) => setTimeout(r, 30));
+    assert.deepEqual(reads, ["a"]);
+    // 10 & 2's follow-up, then the user from T3's phone app.
+    messages.a!.push({ id: "driver:op-1", role: "user", text: "Carry on.", createdBy: "user", creationSource: "mobile", createdAt: at(5) });
+    messages.a!.push({ id: "m2", role: "user", text: "From the phone.", createdBy: "user", creationSource: "mobile", createdAt: at(1) });
+    push({ kind: "thread.updated", thread: thread("a", { latestUserAuthoredMessageAt: at(1) }) });
+    await until(() => adapter.personWrites("a").length === 2);
+    assert.deepEqual(adapter.personWrites("a").map((w) => w.desk), [true, false], "the phone's isn't at a computer; 10 & 2's isn't a person's");
+    const local = new Local([{ prefix: "", adapter }], parsePolicy(JSON.stringify({ brain: "ws://127.0.0.1:1/connector", projects: "*", actions: ["follow_up"] })));
+    assert.deepEqual((await local.list()).find((i) => i.id === "a")!.typed, { at: messages.a![3].createdAt, desk: messages.a![0].createdAt });
+    assert.deepEqual((await local.list()).find((i) => i.id === "none")!.typed, { at: null, desk: null });
+  } finally { await adapter.close(); t3.close(); }
+});
+
+// Receipts (docs/launch/spikes/run-receipts.md): the reply's run's checks, from its projection's turn items as T3's server
+// sends them (WireProjection.ts): no command output, only `outputIndicatesFailure` (a non-zero exit code, or output
+// saying "Exit code 1") and an exit code for some agents. A check piped on has its output read with getTurnItem.
+test("receipts: a report carries its run's checks, from command_execution exits and file_change items, and nothing of the commands", async () => {
+  const item = (ordinal: number, over: object) => ({ id: `i${ordinal}`, threadId: "t1", runId: "r2", ordinal, status: "completed", updatedAt: "2026-11-16T09:00:00Z", ...over });
+  const cmd = (ordinal: number, input: string, status: string, over: object = {}) => item(ordinal, { type: "command_execution", input, status, outputOmitted: true, ...over });
+  const projection = {
+    runs: [{ id: "r1", status: "completed", completedAt: "2026-11-16T08:00:00Z" }, { id: "r2", status: "completed", completedAt: "2026-11-16T09:00:00Z" }],
+    messages: [{ id: "m1", role: "assistant", runId: "r1", text: "Earlier.", streaming: false }, { id: "m2", role: "assistant", runId: "r2", text: "All done!", streaming: false }],
+    turnItems: [
+      // Another run's failing test isn't this reply's.
+      { ...cmd(1, "pnpm test", "failed", { exitCode: 1 }), runId: "r1" },
+      // A filtered run isn't a whole run: its pass isn't counted (checks.ts `FULL`).
+      cmd(2, "cd SECRET_DIR && pnpm test --filter SECRET_PKG", "completed", { exitCode: 0 }),
+      item(3, { type: "file_change", fileName: "SECRET_FILE.ts" }),
+      // Claude's, through T3: no exit code; failed with a non-zero exit, or refused by a hook.
+      cmd(4, "pnpm test", "failed", { outputIndicatesFailure: true }),
+      cmd(5, "pnpm test", "failed"),
+      // Piped on: its exit is tail's, so its output's summary, read with getTurnItem, says how the tests went.
+      cmd(6, "pnpm test 2>&1 | tail -20", "completed"),
+      cmd(7, "npm run build", "failed", { outputIndicatesFailure: true }),
+      cmd(8, "pnpm lint", "completed"),
+    ],
+  };
+  const fetched: string[] = [];
+  const t3 = await fakeT3({ onRequest: (f, ws) => {
+    if (f.tag === "orchestration.subscribeShell") ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [{ kind: "snapshot", snapshot: { projects: [{ id: "p1", title: "api", workspaceRoot: "/work/api" }], threads: [thread("t1")] } }] }));
+    if (f.tag === "orchestration.getThreadProjection") exit(ws, f.id, projection);
+    if (f.tag === "orchestration.getTurnItem") {
+      fetched.push(f.payload.itemId);
+      exit(ws, f.id, { item: { ...projection.turnItems.find((i: any) => i.id === f.payload.itemId), outputOmitted: undefined, output: "SECRET_OUTPUT\nℹ tests 12\nℹ pass 11\nℹ fail 1\n" } });
+    }
+  } });
+  const adapter = new T3Adapter({ baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {}, auth: { issue: async () => ({ token: "good", sessionId: "s", expiresAt: new Date(Date.now() + 86400000).toISOString() }), revoke: async () => {} } });
+  try {
+    await adapter.start();
+    const report = await adapter.report("t1");
+    assert.equal(report.text, "All done!");
+    const edited = { edited: true as const };
+    assert.deepEqual(report.checks, { tests: { ok: false, runs: 2, failed: 2, label: "pnpm test", ...edited }, build: { ok: false, runs: 1, failed: 1, label: "npm build", ...edited }, lint: { ok: true, runs: 1, failed: 0, label: "pnpm lint", ...edited } });
+    assert.deepEqual(fetched, ["i6", "i8"], "only the piped check's output is read, and the lint's, whose clean exit only its status tells");
+    assert.doesNotMatch(JSON.stringify(report), /SECRET_|--filter|Exit code|tail/);
+    await adapter.report("t1");
+    assert.deepEqual(fetched, ["i6", "i8"], "and only once: its verdict is kept, not its output");
+  } finally { await adapter.close(); t3.close(); }
+});
+
+// The skeptic (16 November): T3 sends a thread's newest 77 turn items only (THREAD_HISTORY_SNAPSHOT_ROW_LIMIT), so a long
+// run's failing test can be older than the projection. Its older items come from T3's HTTP history, a page at a time,
+// back to the run's start; a finished run's receipts are then kept.
+test("receipts: a long run's failing test older than T3's 77-item window is read back from its history pages, and kept", async () => {
+  const at = "2026-11-16T09:00:00Z";
+  const item = (ordinal: number, runId: string, over: object) => ({ id: `i${ordinal}`, threadId: "t1", runId, ordinal, status: "completed", updatedAt: at, ...over });
+  // r1: an earlier run. r2: a failing test, a passing build, then 200 items of other work and its reply. No test after.
+  const all = [
+    item(1, "r1", { type: "assistant_message", text: "Earlier.", streaming: false }),
+    item(2, "r2", { type: "user_message", text: "Refactor it" }),
+    item(3, "r2", { type: "command_execution", input: "pnpm test", status: "failed", exitCode: 1 }),
+    item(4, "r2", { type: "command_execution", input: "pnpm build", status: "completed", exitCode: 0 }),
+    ...Array.from({ length: 200 }, (_, n) => item(5 + n, "r2", { type: "reasoning", text: "thinking" })),
+    item(205, "r2", { type: "assistant_message", text: "All done!", streaming: false }),
+  ];
+  const newest = (n: number, before = all.length) => all.slice(Math.max(0, before - n), before);
+  const projection = {
+    runs: [{ id: "r1", status: "completed", completedAt: "2026-11-16T08:00:00Z" }, { id: "r2", status: "completed", completedAt: at }],
+    messages: [{ id: "i1", role: "assistant", runId: "r1", text: "Earlier.", streaming: false }, { id: "i205", role: "assistant", runId: "r2", text: "All done!", streaming: false }],
+    turnItems: newest(77),
+  };
+  const asked: string[] = [];
+  const t3 = await fakeT3({
+    onRequest: (f, ws) => {
+      if (f.tag === "orchestration.subscribeShell") ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [{ kind: "snapshot", snapshot: { projects: [{ id: "p1", title: "api", workspaceRoot: "/work/api" }], threads: [thread("t1")] } }] }));
+      if (f.tag === "orchestration.getThreadProjection") exit(ws, f.id, projection);
+    },
+    // T3's bounded window (75, with a cursor to what's older) and its history pages, 75 at a time, oldest last.
+    onHttp: (url, headers) => {
+      if (headers.authorization !== "Bearer good" || headers["x-t3-orchestration-protocol"] !== "2") return null;
+      asked.push(url.pathname.endsWith("/bounded") ? "bounded" : `history ${url.searchParams.get("cursor")}`);
+      if (url.pathname === "/api/orchestration/threads/t1/bounded") return { snapshotSequence: 9, projection: { ...projection, turnItems: newest(75) }, historyCursor: "75", hasMoreHistory: true };
+      if (url.pathname !== "/api/orchestration/threads/t1/history") return null;
+      const skip = Number(url.searchParams.get("cursor"));
+      const items = newest(75, all.length - skip);
+      return { snapshotSequence: 9, items: items.map((i, position) => ({ position, visibility: "local", sourceThreadId: "t1", sourceItemId: i.id, item: i })), nextCursor: String(skip + 75), hasMoreHistory: all.length - skip - 75 > 0 };
+    },
+  });
+  const adapter = new T3Adapter({ baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {}, auth: { issue: async () => ({ token: "good", sessionId: "s", expiresAt: new Date(Date.now() + 86400000).toISOString() }), revoke: async () => {} } });
+  try {
+    await adapter.start();
+    const report = await adapter.report("t1");
+    assert.equal(report.text, "All done!");
+    assert.deepEqual(report.checks, { tests: { ok: false, runs: 1, failed: 1, label: "pnpm test" }, build: { ok: true, runs: 1, failed: 0, label: "pnpm build" } });
+    // The window, then pages back until an older item that isn't r2's (r1's) shows where r2 began; no further.
+    assert.deepEqual(asked, ["bounded", "history 75", "history 150"]);
+    await adapter.report("t1");
+    assert.deepEqual(asked, ["bounded", "history 75", "history 150"], "a finished run's receipts are kept, not read back again");
+    assert.doesNotMatch(JSON.stringify(report), /Refactor it|thinking/);
+  } finally { await adapter.close(); t3.close(); }
+});
+
+// "Call me when the tests pass" mid-run (the skeptic, 16 November): a report on a thread still running carries that run's
+// checks so far, from its newest items (no reading back: a check that just exited is among them).
+test("receipts: a running run's checks so far come with the report as running, beside the finished reply's", async () => {
+  const item = (ordinal: number, runId: string, over: object) => ({ id: `i${ordinal}`, threadId: "t1", runId, ordinal, status: "completed", updatedAt: "2026-11-16T09:00:00Z", ...over });
+  const projection = {
+    runs: [{ id: "r1", status: "completed", completedAt: "2026-11-16T08:00:00Z" }, { id: "r2", status: "running" }],
+    messages: [{ id: "i2", role: "assistant", runId: "r1", text: "Tests fail; fixing.", streaming: false }, { id: "i6", role: "assistant", runId: "r2", text: "Fixing the flaky test.", streaming: false }],
+    turnItems: [
+      item(1, "r1", { type: "command_execution", input: "pnpm test", status: "failed", exitCode: 1 }),
+      item(2, "r1", { type: "assistant_message", text: "Tests fail; fixing.", streaming: false }),
+      item(3, "r2", { type: "file_change" }),
+      item(4, "r2", { type: "command_execution", input: "pnpm test", status: "failed", exitCode: 1 }),
+      item(5, "r2", { type: "command_execution", input: "pnpm test", status: "completed", exitCode: 0 }),
+      item(6, "r2", { type: "assistant_message", text: "Fixing the flaky test.", streaming: false }),
+      item(7, "r2", { type: "command_execution", input: "pnpm lint", status: "running" }),
+    ],
+  };
+  const t3 = await fakeT3({ onRequest: (f, ws) => {
+    if (f.tag === "orchestration.subscribeShell") ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [{ kind: "snapshot", snapshot: { projects: [{ id: "p1", title: "api", workspaceRoot: "/work/api" }], threads: [thread("t1", { status: "running" })] } }] }));
+    if (f.tag === "orchestration.getThreadProjection") exit(ws, f.id, projection);
+  } });
+  const adapter = new T3Adapter({ baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {}, auth: { issue: async () => ({ token: "good", sessionId: "s", expiresAt: new Date(Date.now() + 86400000).toISOString() }), revoke: async () => {} } });
+  try {
+    await adapter.start();
+    const report = await adapter.report("t1");
+    assert.equal(report.text, "Tests fail; fixing.");
+    assert.deepEqual(report.checks, { tests: { ok: false, runs: 1, failed: 1, label: "pnpm test" } });
+    assert.deepEqual(report.running, { tests: { ok: true, runs: 2, failed: 1, label: "pnpm test", edited: true } }, "the lint still running isn't counted");
+  } finally { await adapter.close(); t3.close(); }
+});
+
+// The skeptic on 5828b30370cf: a check whose clean exit only its status tells, with output saying no test ran (go's
+// `[no tests to run]` everywhere, as printed on this machine), isn't a pass; with its tests run, it is.
+test("receipts: a status-only check whose output says no test ran is unknown, not a pass", () => {
+  const i = { input: "go test -run TestNothing ./...", status: "completed" };
+  assert.equal(outputVerdict(i, {}, "ok  \texample.com/x\t0.001s [no tests to run]\nok  \texample.com/x/pkg/b\t0.001s [no tests to run]\n"), null);
+  assert.equal(outputVerdict({ ...i, input: "go test ./..." }, {}, "ok  \texample.com/x\t(cached)\n"), true);
+});
+
+// The skeptic, 16 November: Claude's commands through T3 have no exit code, and one it ran in the background is
+// `completed` the moment it launches, so a test run left running counted as a pass at launch.
+test("receipts: a check whose clean exit only its status tells counts once its output shows it wasn't left in the background", async () => {
+  const item = (ordinal: number, runId: string, over: object) => ({ id: `i${ordinal}`, threadId: "t1", runId, ordinal, status: "completed", updatedAt: "2026-11-16T09:00:00Z", ...over });
+  const cmd = (ordinal: number, runId: string, input: string, status: string, over: object = {}) => item(ordinal, runId, { type: "command_execution", input, status, outputOmitted: true, ...over });
+  const outputs: Record<string, string> = {
+    i3: "Command running in background with ID: SECRET_ID. Output is being written to: /SECRET_PATH",
+    i6: "Command did not complete within its 120s timeout and was moved to the background (ID: SECRET_ID). Output is being written to: /SECRET_PATH",
+    i7: "Command running in background with ID: SECRET_ID. Output is being written to: /SECRET_PATH",
+    i8: "SECRET_OUTPUT\nℹ tests 12\nℹ pass 12\nℹ fail 0\n",
+    i9: "SECRET_OUTPUT\nℹ tests 12\nℹ pass 11\nℹ fail 1\n",
+  };
+  const projection = {
+    runs: [{ id: "r1", status: "completed", completedAt: "2026-11-16T08:00:00Z" }, { id: "r2", status: "running" }],
+    messages: [{ id: "m1", role: "assistant", runId: "r1", text: "All done!", streaming: false }],
+    turnItems: [
+      // The reply's run: its test run failed, it changed a file, then left the test run going in the background.
+      cmd(1, "r1", "pnpm test", "failed", { outputIndicatesFailure: true }),
+      item(2, "r1", { type: "file_change" }),
+      cmd(3, "r1", "cd app && pnpm test", "completed"),
+      item(4, "r1", { type: "assistant_message", text: "All done!", streaming: false }),
+      // The run going: a change, then a test run moved to the background at its timeout, and one chained on.
+      item(5, "r2", { type: "file_change" }),
+      cmd(6, "r2", "pnpm test", "completed"),
+      cmd(7, "r2", "pnpm test && git commit -m x", "completed"),
+    ] as any[],
+  };
+  const fetched: string[] = [];
+  const t3 = await fakeT3({ onRequest: (f, ws) => {
+    if (f.tag === "orchestration.subscribeShell") ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [{ kind: "snapshot", snapshot: { projects: [{ id: "p1", title: "api", workspaceRoot: "/work/api" }], threads: [thread("t1", { status: "running" })] } }] }));
+    if (f.tag === "orchestration.getThreadProjection") exit(ws, f.id, projection);
+    if (f.tag === "orchestration.getTurnItem") {
+      fetched.push(f.payload.itemId);
+      exit(ws, f.id, { item: { ...projection.turnItems.find((i: any) => i.id === f.payload.itemId), outputOmitted: undefined, output: outputs[f.payload.itemId] } });
+    }
+  } });
+  const adapter = new T3Adapter({ baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {}, auth: { issue: async () => ({ token: "good", sessionId: "s", expiresAt: new Date(Date.now() + 86400000).toISOString() }), revoke: async () => {} } });
+  try {
+    await adapter.start();
+    const report = await adapter.report("t1");
+    // Not "tests pass" at the launch: the failure before it stands, with the change after it.
+    assert.deepEqual(report.checks, { tests: { ok: false, runs: 1, failed: 1, label: "pnpm test", stale: true } });
+    assert.equal(report.running, undefined, "a test run left in the background isn't a pass for a green watch");
+    // The test run finishes in the foreground and passes: that counts, once its output has been read.
+    projection.turnItems.push(cmd(8, "r2", "pnpm test", "completed"));
+    const next = await adapter.report("t1");
+    assert.deepEqual(next.running, { tests: { ok: true, runs: 1, failed: 0, label: "pnpm test", edited: true } });
+    // One whose status says it exited clean but whose output says a test failed (a script ending `|| true`): a failure.
+    projection.turnItems.push(cmd(9, "r2", "pnpm test", "completed"));
+    const third = await adapter.report("t1");
+    assert.deepEqual(third.running, { tests: { ok: false, runs: 2, failed: 1, label: "pnpm test", edited: true } });
+    assert.deepEqual(fetched.sort(), ["i3", "i6", "i7", "i8", "i9"], "each read once");
+    assert.doesNotMatch(JSON.stringify([report, next, third]), /SECRET_|background/);
+  } finally { await adapter.close(); t3.close(); }
+});
+
+test("receipts: reading a run back stops at its start, at T3's first item, at the page limit, or at a page that can't be read", async () => {
+  const it = (ordinal: number, runId: string) => ({ id: `i${ordinal}`, runId, ordinal });
+  const pages = (all: any[]) => {
+    const asked: (string | null)[] = [];
+    const page = async (cursor: string | null) => {
+      asked.push(cursor);
+      const skip = cursor === null ? 0 : Number(cursor);
+      const items = all.slice(Math.max(0, all.length - skip - 3), all.length - skip);
+      return { items, cursor: all.length - skip - 3 > 0 ? String(skip + 3) : null };
+    };
+    return { asked, page };
+  };
+  // The window starts before the run: nothing read.
+  const before = pages([]);
+  assert.deepEqual(await runItems([it(1, "r1"), it(2, "r2")], "r2", before.page), { items: [it(1, "r1"), it(2, "r2")], whole: true });
+  assert.deepEqual(before.asked, []);
+  // The run is the thread's first: read to T3's first item, whole.
+  const first = Array.from({ length: 7 }, (_, n) => it(n + 1, "r1"));
+  const f = pages(first);
+  assert.equal((await runItems(first.slice(-2), "r1", f.page)).whole, true);
+  assert.deepEqual(f.asked, [null, "3", "6"]);
+  // Longer than the pages read: as read, neither whole nor failed (kept, not read again).
+  const long = Array.from({ length: 3 * (HISTORY_PAGES + 3) }, (_, n) => it(n + 1, "r1"));
+  const l = pages(long);
+  const got = await runItems(long.slice(-2), "r1", l.page);
+  assert.deepEqual([got.whole, got.failed, l.asked.length], [false, undefined, HISTORY_PAGES + 1]);
+  // A page T3 couldn't give: failed, so it's tried again next time.
+  assert.deepEqual(await runItems([it(5, "r1")], "r1", async () => null), { items: [it(5, "r1")], whole: false, failed: true });
+});
+
+// Sol on 45ec9eccdf6f (F2): a run still going was read from the projection's newest 77 items alone, so a failure read at
+// one report was forgotten once it left that window, and a passing tail rang "tests pass" mid-run; a finished run whose
+// history T3 refused, or longer than the pages read, passed on its tail. A run is read from its start (its items kept
+// once read, and read back from T3's history where the window doesn't reach them); read only in part, its failures
+// stand and nothing passes.
+test("receipts: a failure that leaves T3's window still stands; a run read only in part (history refused, or past the page limit) never passes", async (t) => {
+  const item = (ordinal: number, runId: string, over: object) => ({ id: `i${ordinal}`, threadId: "t1", runId, ordinal, status: "completed", updatedAt: "2026-11-20T09:00:00Z", ...over });
+  const cmd = (ordinal: number, input: string, exitCode: number) => item(ordinal, "r2", { type: "command_execution", input, exitCode, status: exitCode ? "failed" : "completed" });
+  const filler = (from: number, n: number) => Array.from({ length: n }, (_, k) => item(from + k, "r2", { type: "reasoning", text: "thinking" }));
+  /** A T3 holding `all` (newest last): its projection the newest 77, its bounded window 75, its history 75 a page; `refuse`, no history. */
+  async function standIn(all: () => any[], run: { status: string; completedAt?: string }, refuse: () => boolean) {
+    const asked: string[] = [];
+    const projection = () => ({ runs: [{ id: "r1", status: "completed", completedAt: "2026-11-20T08:00:00Z" }, { id: "r2", startedAt: "2026-11-20T08:30:00Z", ...run }],
+      messages: run.status === "completed" ? [{ id: "reply", role: "assistant", runId: "r2", text: "All done!", streaming: false }] : [], turnItems: all().slice(-77) });
+    const t3 = await fakeT3({
+      onRequest: (f, ws) => {
+        if (f.tag === "orchestration.subscribeShell") ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [{ kind: "snapshot", snapshot: { projects: [{ id: "p1", title: "api", workspaceRoot: "/work/api" }], threads: [thread("t1", { status: "running" })] } }] }));
+        if (f.tag === "orchestration.getThreadProjection") exit(ws, f.id, projection());
+        // A failing run's output, as its runner prints it (after `cd api &&`, what makes the failure its own).
+        if (f.tag === "orchestration.getTurnItem") exit(ws, f.id, { item: { ...all().find((i) => i.id === f.payload.itemId), output: "ℹ tests 1\nℹ fail 1\n" } });
+      },
+      onHttp: (url) => {
+        if (refuse()) return null;
+        const items = all(), newest = (n: number, before: number) => items.slice(Math.max(0, before - n), before);
+        asked.push(url.pathname.endsWith("/bounded") ? "bounded" : `history ${url.searchParams.get("cursor")}`);
+        if (url.pathname.endsWith("/bounded")) return { snapshotSequence: 9, projection: { ...projection(), turnItems: newest(75, items.length) }, historyCursor: "75", hasMoreHistory: items.length > 75 };
+        const skip = Number(url.searchParams.get("cursor"));
+        return { snapshotSequence: 9, items: newest(75, items.length - skip).map((i, position) => ({ position, item: i })), nextCursor: String(skip + 75), hasMoreHistory: items.length - skip - 75 > 0 };
+      },
+    });
+    const adapter = new T3Adapter({ baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {}, auth: { issue: async () => ({ token: "good", sessionId: "s", expiresAt: new Date(Date.now() + 86400000).toISOString() }), revoke: async () => {} } });
+    t.after(async () => { await adapter.close(); t3.close(); });
+    await adapter.start();
+    return { adapter, asked, run };
+  }
+  const failing = { tests: { ok: false, runs: 1, failed: 1, label: "npm test" } };
+
+  await t.test("history refused: the failure read before stays as long as it's read, and nothing passes", async () => {
+    let all: any[] = [item(1, "r1", { type: "assistant_message", text: "Earlier.", streaming: false }), cmd(2, "cd api && npm test", 1)];
+    const s = await standIn(() => all, { status: "running" }, () => true);
+    assert.deepEqual((await s.adapter.report("t1")).running, failing, "the failure, in the window");
+    // 75 items later, an edit and the root's whole run passing: the failure is out of the window.
+    all = [...all, ...filler(3, 75), item(78, "r2", { type: "file_change" }), cmd(79, "npm test", 0)];
+    assert.equal((await s.adapter.report("t1")).running, undefined, "was { ok: true, edited: true }: api's failure may stand");
+    Object.assign(s.run, { status: "completed", completedAt: "2026-11-20T09:00:00Z" });
+    const done = await s.adapter.report("t1");
+    assert.deepEqual([done.checks, done.checksUnread], [undefined, true], "was { ok: true }: its checks weren't read, never a pass");
+  });
+
+  await t.test("history read: the run is read from its start once, then on from what was read; a failure out of the window stands until its own folder passes", async () => {
+    let all: any[] = [item(1, "r1", { type: "assistant_message", text: "Earlier.", streaming: false }), cmd(2, "cd api && npm test", 1), ...filler(3, 80)];
+    const s = await standIn(() => all, { status: "running" }, () => false);
+    assert.deepEqual((await s.adapter.report("t1")).running, failing, "read back to the run's start");
+    const paged = s.asked.length;
+    assert.ok(paged > 0);
+    all = [...all, item(83, "r2", { type: "file_change" }), cmd(84, "npm test", 0)];
+    assert.deepEqual((await s.adapter.report("t1")).running, { ...failing, tests: { ...failing.tests, stale: true } }, "was { ok: true, edited: true }: the root's pass leaves api's failure standing");
+    assert.equal(s.asked.length, paged, "read on from what was read: no history read again");
+    all = [...all, cmd(85, "cd api && npm test", 0)];
+    const passed = await s.adapter.report("t1");
+    assert.deepEqual(passed.running, { tests: { ok: true, runs: 2, failed: 1, label: "npm test", edited: true } });
+    assert.equal(passed.runningId, "r2", "its run, as its reply will carry it (F6)");
+    // More than the window's worth since the last read: read back until it meets what was read.
+    all = [...all, ...filler(86, 100), item(186, "r2", { type: "file_change" }), cmd(187, "cd api && npm test", 1), ...filler(188, 100), cmd(288, "npm test", 0)];
+    assert.deepEqual((await s.adapter.report("t1")).running, { tests: { ok: false, runs: 3, failed: 2, label: "npm test", edited: true } }, "the failure between two reads");
+    assert.ok(s.asked.length > paged, "read back over T3's history to what was read");
+  });
+
+  await t.test("past the page limit: a passing tail is never a pass, and isn't read again", async () => {
+    const all = [cmd(1, "cd api && npm test", 1), ...filler(2, 75 * (HISTORY_PAGES + 2)), item(100_000, "r2", { type: "file_change" }), cmd(100_001, "npm test", 0)];
+    const s = await standIn(() => all, { status: "completed", completedAt: "2026-11-20T09:00:00Z" }, () => false);
+    const done = await s.adapter.report("t1");
+    assert.deepEqual([done.checks, done.checksUnread], [undefined, true], "was { ok: true, edited: true }");
+    const pages = s.asked.length;
+    await s.adapter.report("t1");
+    assert.equal(s.asked.length, pages, "kept: a run that long won't be read whole later");
+  });
+});
+
+// Sol on 45ec9eccdf6f (F4): a check after `cd … &&` that failed may never have run (the cd failed). T3 gives its exit
+// code, never its output, so the output is read once: the runner's own failure is a failure, the cd's is unknown.
+test("receipts: a check that failed after a cd is a failure only when its output is the runner's", async () => {
+  const item = (ordinal: number, over: object) => ({ id: `i${ordinal}`, threadId: "t1", runId: "r1", ordinal, status: "failed", exitCode: 1, type: "command_execution", updatedAt: "2026-11-20T09:00:00Z", ...over });
+  const outputs: Record<string, string> = {
+    i1: "bash: line 1: cd: no-such: No such file or directory\n", i2: "ℹ tests 1\nℹ pass 0\nℹ fail 1\n",
+    i3: "\n> web@1.0.0 build\n> vite build\n\nvite v5.4.11 building for production...\nx Build failed in 120ms\nerror during build:\n[vite]: Rollup failed to resolve import \"./x\".\n",
+  };
+  const projection = {
+    runs: [{ id: "r1", status: "completed", completedAt: "2026-11-20T09:00:00Z" }],
+    messages: [{ id: "m1", role: "assistant", runId: "r1", text: "Done.", streaming: false }],
+    turnItems: [item(0, { type: "user_message", status: "completed", exitCode: undefined, runId: "r0" }), item(1, { input: "cd no-such && npm test" })] as any[],
+  };
+  const t3 = await fakeT3({ onRequest: (f, ws) => {
+    if (f.tag === "orchestration.subscribeShell") ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [{ kind: "snapshot", snapshot: { projects: [{ id: "p1", title: "api", workspaceRoot: "/work/api" }], threads: [thread("t1")] } }] }));
+    if (f.tag === "orchestration.getThreadProjection") exit(ws, f.id, projection);
+    if (f.tag === "orchestration.getTurnItem") exit(ws, f.id, { item: { ...projection.turnItems.find((i) => i.id === f.payload.itemId), output: outputs[f.payload.itemId] } });
+  } });
+  const adapter = new T3Adapter({ baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {}, auth: { issue: async () => ({ token: "good", sessionId: "s", expiresAt: new Date(Date.now() + 86400000).toISOString() }), revoke: async () => {} } });
+  try {
+    await adapter.start();
+    const cdFailed = await adapter.report("t1");
+    assert.deepEqual([cdFailed.checks, cdFailed.checksUnread], [undefined, undefined], "was { ok: false }: the cd failed, npm never ran");
+    projection.runs[0] = { id: "r2", status: "completed", completedAt: "2026-11-20T09:10:00Z" };
+    projection.messages[0] = { id: "m2", role: "assistant", runId: "r2", text: "Done again.", streaming: false };
+    projection.turnItems = [item(0, { type: "user_message", status: "completed", exitCode: undefined, runId: "r0" }), item(2, { input: "cd api && npm test", runId: "r2" })];
+    assert.deepEqual((await adapter.report("t1")).checks, { tests: { ok: false, runs: 1, failed: 1, label: "npm test" } }, "the runner's own failure");
+    // The skeptic on 7717d10f3219: a build through npm that failed, npm's banner and vite's error but no summary, is a failure.
+    projection.runs[0] = { id: "r3", status: "completed", completedAt: "2026-11-20T09:20:00Z" };
+    projection.messages[0] = { id: "m3", role: "assistant", runId: "r3", text: "Built.", streaming: false };
+    projection.turnItems = [item(0, { type: "user_message", status: "completed", exitCode: undefined, runId: "r0" }), item(3, { input: "cd web && npm run build", runId: "r3" })];
+    assert.deepEqual((await adapter.report("t1")).checks, { build: { ok: false, runs: 1, failed: 1, label: "npm build" } }, "was unknown");
+  } finally { await adapter.close(); t3.close(); }
+});
+
+// The review's finding on 3.10: a long run whose history T3 wouldn't give back said only what the window held, nothing
+// when that was none, which the brain took for "no test ran". It says its checks weren't read (`checksUnread`).
+test("receipts: a long run whose history can't be read says its checks weren't read, not that none ran", async () => {
+  const at = "2026-11-16T09:00:00Z";
+  const item = (ordinal: number, runId: string, over: object) => ({ id: `i${ordinal}`, threadId: "t1", runId, ordinal, status: "completed", updatedAt: at, ...over });
+  const all = [
+    item(1, "r2", { type: "user_message", text: "Refactor it" }),
+    item(2, "r2", { type: "command_execution", input: "pnpm test", status: "failed", exitCode: 1 }),
+    ...Array.from({ length: 100 }, (_, n) => item(3 + n, "r2", { type: "reasoning", text: "thinking" })),
+    item(103, "r2", { type: "assistant_message", text: "All done!", streaming: false }),
+  ];
+  const projection = {
+    runs: [{ id: "r2", status: "completed", completedAt: at }],
+    messages: [{ id: "i103", role: "assistant", runId: "r2", text: "All done!", streaming: false }],
+    turnItems: all.slice(-77),
+  };
+  const t3 = await fakeT3({
+    onRequest: (f, ws) => {
+      if (f.tag === "orchestration.subscribeShell") ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [{ kind: "snapshot", snapshot: { projects: [{ id: "p1", title: "api", workspaceRoot: "/work/api" }], threads: [thread("t1")] } }] }));
+      if (f.tag === "orchestration.getThreadProjection") exit(ws, f.id, projection);
+    },
+    // T3 refuses its history.
+    onHttp: () => null,
+  });
+  const adapter = new T3Adapter({ baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {}, auth: { issue: async () => ({ token: "good", sessionId: "s", expiresAt: new Date(Date.now() + 86400000).toISOString() }), revoke: async () => {} } });
+  try {
+    await adapter.start();
+    const report = await adapter.report("t1");
+    assert.equal(report.text, "All done!");
+    assert.equal(report.checks, undefined);
+    assert.equal(report.checksUnread, true);
+  } finally { await adapter.close(); t3.close(); }
+});
+
+test("T3Adapter: a thread with pendingBackgroundTasks stays running with its latest reply and safe progress, then completes when cleared", async () => {
+  let push: (v: any) => void = () => {};
+  const t3 = await fakeT3({
+    onRequest: (f, ws) => {
+      if (f.tag === "orchestration.subscribeShell") {
+        push = (v) => ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [v] }));
+        ws.send(JSON.stringify({ _tag: "Chunk", requestId: f.id, values: [{ kind: "snapshot", snapshot: {
+          projects: [{ id: "p1", title: "game" }],
+          threads: [
+            thread("parent", {
+              title: "Recursive Turret Defense Game Design",
+              status: "completed",
+              pendingBackgroundTasks: [
+                { taskId: "bg1", kind: "subagent", description: "Phase 3 combat tuning", childThreadId: "sub1" },
+                { taskId: "bg2", kind: "command", awaited: true, description: "Run test suite", command: "SECRET=xyz bun test" },
+              ],
+            }),
+            thread("sub1", { title: "Phase 3 combat tuning", status: "running", pendingBackgroundTasks: [], lineage: { parentThreadId: "parent", relationshipToParent: "subagent" } }),
+            // Older T3 server (no pendingBackgroundTasks field): falls back to running subagent children.
+            thread("legacy", { title: "Legacy parent", status: "completed" }),
+            thread("legacy-sub", { title: "Legacy worker", status: "running", lineage: { parentThreadId: "legacy", relationshipToParent: "subagent" } }),
+          ],
+        } }] }));
+      } else if (f.tag === "orchestration.getThreadProjection") {
+        exit(ws, f.id, {
+          runs: [{ id: "r1", status: "completed", completedAt: "2026-10-16T08:00:00Z" }],
+          messages: [{ id: "m1", role: "assistant", text: "Kickoff posted; delegating Phase 3 now.", streaming: false, runId: "r1" }],
+          turnItems: [],
+        });
+      }
+    },
+  });
+  const adapter = new T3Adapter({
+    baseUrl: t3.base, cli: ["t3"], label: "test", log: () => {},
+    auth: { issue: async () => ({ token: "good", sessionId: "s1", expiresAt: new Date(Date.now() + 86_400_000).toISOString() }), revoke: async () => {} },
+  });
+  try {
+    await adapter.start();
+    const byId = Object.fromEntries((await adapter.list()).map((i) => [i.id, i]));
+    assert.equal(byId.parent!.status, "running");
+    assert.equal(byId.legacy!.status, "running");
+
+    const rep = await adapter.report("parent");
+    assert.equal(rep.text, "Kickoff posted; delegating Phase 3 now.");
+    assert.equal(rep.reply?.messageId, "m1");
+    assert.ok(rep.progress && /Phase 3 combat tuning/.test(rep.progress) && /Run test suite/.test(rep.progress), String(rep.progress));
+    assert.doesNotMatch(rep.progress!, /SECRET=xyz/, "never leak raw shell commands into progress");
+
+    const legacyRep = await adapter.report("legacy");
+    assert.match(legacyRep.progress ?? "", /Legacy worker/);
+
+    const changes: string[][] = [];
+    adapter.watch((ids) => changes.push(ids));
+    push({ kind: "thread.updated", location: "active", thread: thread("parent", { title: "Recursive Turret Defense Game Design", status: "completed", pendingBackgroundTasks: [] }) });
+    push({ kind: "thread.updated", location: "active", thread: thread("legacy-sub", { title: "Legacy worker", status: "completed", lineage: { parentThreadId: "legacy", relationshipToParent: "subagent" } }) });
+    await new Promise((r) => setTimeout(r, 100));
+    const after = Object.fromEntries((await adapter.list()).map((i) => [i.id, i]));
+    assert.equal(after.parent!.status, "completed");
+    assert.equal(after.legacy!.status, "completed");
+    assert.ok(changes.some((ids) => ids.includes("parent")));
+    assert.ok(changes.some((ids) => ids.includes("legacy")));
   } finally {
     await adapter.close();
     t3.close();

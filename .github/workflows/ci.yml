@@ -1,6 +1,6 @@
-# The 10and2 package's checks, on every push and pull request: `npm run check` (types, tests, the bundles and their
-# smoke test) on Linux, macOS and Windows with Node 22 and 24, the built package on Node 22.13 (the oldest package.json
-# allows), and the Nix package on Linux and macOS. Like the rest of this repository, exported with each release from Self-Deprecated's
+# The 10and2 package's checks, on every push and pull request: `npm run check:node` (types, tests, the bundles and their
+# smoke test, with Node's own tools: it's Node the package runs on) on Linux, macOS and Windows with Node 22 and 24, the
+# built package on Node 22.13 (the oldest package.json allows), and the Nix package on Linux and macOS. Like the rest of this repository, exported with each release from Self-Deprecated's
 # own, where the connector is also tested against the service.
 name: CI
 
@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   check:
-    name: npm run check (${{ matrix.os }}, Node ${{ matrix.node }})
+    name: npm run check:node (${{ matrix.os }}, Node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -35,7 +35,7 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci --no-audit --no-fund
-      - run: npm run check
+      - run: npm run check:node
       # What npm installs runs on any Node from 22.13: the bundles just built, on exactly that one.
       - if: matrix.node == 22
         uses: actions/setup-node@v7

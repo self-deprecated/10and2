@@ -8,6 +8,9 @@ import { describe } from "./util.ts";
 
 export type ReadDeps = { adapter: Adapter; briefing: Briefing; store: Store; log: (m: string) => void };
 
+/** How long after a reply's own time its run may end (`lastRunAt`): the same run, not a newer one. */
+export const RUN_ENDS_MS = 1000;
+
 /** The threads with a reply new to the user, newest first, as the phone lists them. */
 export async function newReplies(deps: Pick<ReadDeps, "adapter" | "briefing">) {
   const live = await deps.adapter.list().catch(() => undefined);
@@ -33,7 +36,7 @@ export async function markRead(deps: ReadDeps, itemId: string, messageId: string
   // What T3 is told the user has seen: the thread as it is now, if no run has finished since this reply (its state
   // when the reply was read can predate the reply's own run ending); otherwise as it was then.
   const live = (await deps.adapter.list().catch(() => [])).find((i) => i.id === itemId);
-  const caughtUp = live && (!live.lastRunAt || Date.parse(live.lastRunAt) <= Date.parse(reply.at) + 1000);
+  const caughtUp = live && (!live.lastRunAt || Date.parse(live.lastRunAt) <= Date.parse(reply.at) + RUN_ENDS_MS);
   deps.store.markRead(itemId, { ...reply, watermark: caughtUp ? live.updatedAt : reply.watermark });
   // Heard in full is heard: a starred thread doesn't call back with it, and it isn't news again in this conversation.
   deps.store.markSeen(itemId, { runAt: Date.parse(reply.at), question: null }, conversationId);

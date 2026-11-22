@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:net";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { TestContext } from "node:test";
@@ -39,6 +39,47 @@ test("hooks merge idempotently, back up settings, add PermissionRequest only for
   assert.equal(uninstalled.hooks.Stop[0].hooks[0].command, "cohabiting-hook"); assert.equal(uninstalled.theme, "dark");
   assert.equal((await hooksStatus(h.config)).installed, false);
   await uninstallHooks(h.config); assertPrivate(path);
+});
+
+test("a settings.json that's a link (stow, home-manager, chezmoi) stays one, and every save keeps one backup, not one more", { skip: WINDOWS && "symlinks need privileges on Windows" }, async (t) => {
+  const h = harness(t), path = join(h.config, "settings.json");
+  const dotfiles = join(h.root, "dotfiles"); mkdirSync(dotfiles, { recursive: true });
+  const target = join(dotfiles, "claude-settings.json");
+  writeFileSync(target, JSON.stringify({ theme: "dark" }));
+  symlinkSync(target, path);
+  await installHooks(h.config, "driver-connector");
+  assert.equal(lstatSync(path).isSymbolicLink(), true, "still a link");
+  assert.equal(JSON.parse(readFileSync(target, "utf8")).theme, "dark");
+  assert.equal((await hooksStatus(h.config)).installed, true, "written through the link, to its target");
+  await uninstallHooks(h.config); await installHooks(h.config, "other-connector"); await uninstallHooks(h.config);
+  assert.equal(lstatSync(path).isSymbolicLink(), true);
+  assert.deepEqual(readdirSync(h.config).filter((n) => n.includes("driver")), ["settings.json.driver-backup"], "one backup, however many saves");
+  assert.deepEqual(readdirSync(dotfiles), ["claude-settings.json"], "nothing left beside the target");
+  assert.ok(JSON.parse(readFileSync(join(h.config, "settings.json.driver-backup"), "utf8")).hooks, "the backup is what was there before the last save");
+  assertPrivate(target);
+});
+
+test("a settings.json linked into a read-only store (Home Manager /nix/store) falls back cleanly on install and uninstall", { skip: (WINDOWS || process.getuid?.() === 0) && "needs POSIX non-root chmod" }, async (t) => {
+  const { chmodSync } = await import("node:fs");
+  const h = harness(t), path = join(h.config, "settings.json");
+  const roDir = join(h.root, "nix-store"); mkdirSync(roDir, { recursive: true });
+  const target = join(roDir, "settings.json");
+  writeFileSync(target, JSON.stringify({ theme: "dark" }));
+  chmodSync(target, 0o444);
+  chmodSync(roDir, 0o555);
+  try {
+    symlinkSync(target, path);
+    await installHooks(h.config, "driver-connector");
+    assert.equal(lstatSync(path).isSymbolicLink(), false, "replaced the immutable symlink in place");
+    assert.equal(JSON.parse(readFileSync(path, "utf8")).theme, "dark");
+    assert.equal((await hooksStatus(h.config)).installed, true);
+    assert.equal(JSON.parse(readFileSync(join(h.config, "settings.json.driver-backup"), "utf8")).theme, "dark");
+    await uninstallHooks(h.config);
+    assert.equal((await hooksStatus(h.config)).installed, false);
+  } finally {
+    chmodSync(roDir, 0o755);
+    chmodSync(target, 0o644);
+  }
 });
 
 test("malformed settings are preserved, and missing settings can be installed", async (t) => {
@@ -163,7 +204,7 @@ test("on Windows the hooks are added only where Claude Code has Git Bash to run 
   const h = harness(t), path = join(h.config, "settings.json");
   const none = { PATH: join(h.root, "empty") };
   assert.match(hooksUnavailable(h.config, none, "win32") ?? "", /Install Git for Windows/);
-  await assert.rejects(installHooks(h.config, "10and2", "win32", none), /Git Bash/);
+  await assert.rejects(installHooks(h.config, "10and2", false, undefined, undefined, "win32", none), /Git Bash/);
   assert.equal((await hooksStatus(h.config)).installed, false, "nothing is written");
   // Git for Windows: git.exe in cmd\, bash.exe in bin\.
   const git = join(h.root, "Git");
@@ -172,12 +213,21 @@ test("on Windows the hooks are added only where Claude Code has Git Bash to run 
   const withGit = { PATH: join(git, "cmd") };
   assert.equal(gitBash(withGit, "win32"), join(git, "bin", "bash.exe"));
   assert.equal(gitBash({ PATH: "", CLAUDE_CODE_GIT_BASH_PATH: join(git, "bin", "bash.exe") }, "win32"), join(git, "bin", "bash.exe"));
-  await installHooks(h.config, "10and2", "win32", withGit);
+  await installHooks(h.config, "10and2", false, undefined, undefined, "win32", withGit);
   const windows = readFileSync(path, "utf8");
   await uninstallHooks(h.config);
-  await installHooks(h.config, "10and2", "linux", none);
+  await installHooks(h.config, "10and2", false, undefined, undefined, "linux", none);
   assert.equal(readFileSync(path, "utf8"), windows, "the same hooks as on macOS and Linux");
   assert.equal(hooksUnavailable(h.config, none, "linux"), null);
+});
+
+test("on Windows the gate's entry names no socket: the pipe is new at each start, found with its secret in hooks.pipe", async (t) => {
+  const h = harness(t), bash = join(h.root, "Git", "bin", "bash.exe");
+  mkdirSync(join(h.root, "Git", "bin"), { recursive: true }); writeFileSync(bash, "");
+  await installHooks(h.config, "10and2", true, "C:\\Users\\a\\connector.json", undefined, "win32", { PATH: "", CLAUDE_CODE_GIT_BASH_PATH: bash });
+  const entry = JSON.parse(readFileSync(join(h.config, "settings.json"), "utf8")).hooks.PreToolUse[0].hooks[0].command;
+  assert.match(entry, /^10and2 hook --policy 'C:\\Users\\a\\connector\.json' --settings '/);
+  assert.doesNotMatch(entry, /--socket/);
 });
 
 test("on Windows Git Bash is looked for only where Claude Code looks for it", (t) => {
@@ -210,7 +260,7 @@ test("on Windows CLAUDE_CODE_GIT_BASH_PATH in Claude Code's settings.json env co
   mkdirSync(join(h.root, "Other")); writeFileSync(other, "");
   writeFileSync(path, "﻿" + JSON.stringify({ env: { CLAUDE_CODE_GIT_BASH_PATH: bash } }));
   assert.equal(hooksUnavailable(h.config, empty, "win32"), null);
-  await installHooks(h.config, "10and2", "win32", empty);
+  await installHooks(h.config, "10and2", false, undefined, undefined, "win32", empty);
   assert.equal((await hooksStatus(h.config)).installed, true);
   assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).env, { CLAUDE_CODE_GIT_BASH_PATH: bash }, "the user's env is kept");
   // One there that isn't a shell sends Claude Code on to look for Git for Windows, not to its environment's.

@@ -2,7 +2,7 @@
 // runs and how often, what kind of failure each check is, and the rule that says whether a gate passed. Pure: eval/run.ts
 // reports with it, scripts/eval-config sends what it reported, and the cloud judges it before recording a pass.
 
-/** What a full gate runs: each scenario of eval/run.ts, and how many times (24 + 4×10 regular, 8 + 10 demo). */
+/** What a full gate runs: each scenario of eval/run.ts, and how many times (60 + 4×10 regular, 8 + 10 demo). */
 export const GATE = {
   regular: { brief: 1, settle: 1, cancel: 1, "follow-up": 1, snooze: 1, tidy: 1, facts: 1, next: 1, goodbye: 10, "open-bye": 10, "open-ask": 10,
     // A new call opened with only a hello, and one opened back from dictating a new thread's prompt (14 November).
@@ -16,7 +16,22 @@ export const GATE = {
     // A new thread asked for, under each of the phone's New threads settings (14 November).
     "new-ask": 1, "new-ask-dictate": 1, "new-ask-tell": 1, "new-ask-said": 1, "new-dictate": 1, "new-dictate-said": 1, "new-say": 1, "new-say-dictate": 1,
     // Settings → New threads' defaults: a default machine, the user's own machine over it, a default project (14 November).
-    "new-default-machine": 1, "new-default-said": 1, "new-default-project": 1 },
+    "new-default-machine": 1, "new-default-said": 1, "new-default-project": 1,
+    // The engine's spoken lines, each in a fresh brain: a followed thread's question in a call and on Call back, Commute's
+    // readback and its answers, its lines without the level's name, and Face ID every time (18 November).
+    "engine-ask-in-call": 1, "engine-callback-ask": 1, "engine-commute-yes": 1, "engine-commute-no": 1, "engine-yes-fine": 1, "engine-yes-alright": 1,
+    "engine-yes-sure": 1, "engine-yes-please": 1, "engine-unnamed": 1, "engine-why": 1, "engine-faceid": 1,
+    // Stages 3.6 to 3.8's: a call-back's mode stated, the level's length read back, times on the phone's clock, a length,
+    // no zone, and a computer gone offline (19 November).
+    "engine-all-done": 1, "engine-only-failed": 1, "engine-not-before": 1, "engine-overnight-yes": 1, "engine-overnight-no": 1, "engine-check-in": 1,
+    "engine-length": 1, "engine-no-zone": 1, "engine-offline": 1,
+    // Stages 3.9 and 3.10's: a watch for a thread's tests stated, a call-back's first sentence from the computer (its last
+    // test run failed, no test run seen), and Away's lines only when asked (20 November).
+    "engine-tests-watch": 1, "engine-tests-failed": 1, "engine-tests-none": 1, "engine-away-on": 1, "engine-away-ended": 1,
+    // Stage 2b's: Watching said and stopped by voice, a new call opening with news the app hasn't told, and Face ID's
+    // lines by where the phone is (20 November).
+    "engine-watching-one": 1, "engine-watching-four": 1, "engine-stop-one": 1, "engine-stop-both": 1, "engine-open-news-one": 1, "engine-open-news-four": 1,
+    "engine-faceid-screen": 1, "engine-faceid-ear": 1, "engine-faceid-locked": 1, "engine-faceid-car": 1, "engine-couldnt-see": 1 },
   demo: { "demo-brief": 1, "demo-open": 10, "demo-answer": 1, "demo-upload": 1, "demo-rundown": 1, "demo-tidy": 1, "demo-start": 1, "demo-facts": 1,
     // What a thread is for, more of it, and the user's own words for it noted (17 November).
     "demo-purpose": 1 },
@@ -26,7 +41,7 @@ export const gateTimes = (suite: keyof typeof GATE) => Object.entries(GATE[suite
 
 /**
  * A failure's kind (§5's table). `unsafe`: something done that wasn't asked for, the wrong thread, or a change without a
- * heard readback answered by yes. `missed`: the user said yes and nothing happened, the wrong count, or what they said a thread is for wasn't noted. `language`: speech
+ * heard readback answered by yes. `missed`: the user said yes and nothing happened, the wrong count, what they said a thread is for wasn't noted, or a hang-up cut what Driver was saying. `language`: speech
  * outside Latin script. `nohangup`: the goodbye didn't end the call. `wording`: an answer or opener missed the expected
  * words (or, with speak-first off, Driver spoke first). `harness`: the session never heard the user: not the prompt's fault.
  */

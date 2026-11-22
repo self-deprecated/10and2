@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { uptime } from "node:os";
 import { Transcript, projectFolder, t3Cwd } from "../src/claude/transcript.ts";
-import { holderState, pidState, procStart, readRegistry, registrySnapshot, knownVersion, parsePsStart, darwinIdentity, parseTasklist, processImages } from "../src/claude/registry.ts";
+import { holderState, pidState, procStart, readRegistry, registrySnapshot, knownVersion, parsePsStart, darwinIdentity, parseTasklist, processImages, parseDarwinPs, listing } from "../src/claude/registry.ts";
 import { harness, until, pause } from "./fixtures/claude/helpers.ts";
 import { assertPrivate } from "./fixtures/platform.ts";
 
@@ -44,6 +44,20 @@ test("on Windows a pid is Claude Code's by its image, from one tasklist that's l
   const failing = processImages(() => { failed++; return null; });
   assert.equal(failing(101), undefined); assert.equal(failing(102), undefined);
   assert.equal(failed, 1, "a listing that failed isn't tried again at once");
+});
+
+test("on macOS every pid's start and command come from one ps, kept for a couple of seconds, not two per session", () => {
+  const out = "  101 Sat Nov 21 10:00:05 2026     /Users/me/.local/bin/claude\n  102 Sat Nov 21 09:59:00 2026     /bin/zsh\n junk\n";
+  assert.deepEqual([...parseDarwinPs(out)], [[101, { lstart: "Sat Nov 21 10:00:05 2026", comm: "/Users/me/.local/bin/claude" }], [102, { lstart: "Sat Nov 21 09:59:00 2026", comm: "/bin/zsh" }]]);
+  let runs = 0;
+  const procs = listing(() => { runs++; return out; }, parseDarwinPs, 2000);
+  const of = (pid: number) => () => procs(pid === process.pid ? 101 : pid);
+  // process.kill(pid, 0) must find it alive first: this process stands in for each.
+  for (let i = 0; i < 20; i++) assert.equal(pidState(process.pid, "darwin:" + Date.parse("Sat Nov 21 10:00:05 2026 UTC"), "darwin", undefined, undefined, of(process.pid)), "verified");
+  assert.equal(procStart(101, "darwin", undefined, procs), `darwin:${Date.parse("Sat Nov 21 10:00:05 2026 UTC")}`);
+  assert.equal(runs, 1, "twenty sessions' checks, one ps");
+  assert.equal(pidState(process.pid, null, "darwin", undefined, undefined, () => ({ lstart: "Sat Nov 21 09:59:00 2026", comm: "/bin/zsh" })), "dead", "a pid macOS gave to another program");
+  assert.equal(pidState(process.pid, null, "darwin", undefined, undefined, () => undefined), "unverified", "no listing says nothing");
 });
 
 test("on Windows an entry from before the computer started is gone", () => {
@@ -155,6 +169,29 @@ test("final reply extraction keeps text and tool names, never tool inputs or thi
   const publicData = JSON.stringify([item, report, await h.adapter.replies(f.id)]);
   assert.doesNotMatch(publicData, /SECRET_/);
   h.registry(f.id, "busy"); assert.equal((await h.adapter.report(f.id)).progress, "Making progress.");
+});
+
+test("what a waiting session waits on: a tool's permission is an approval, its own question input, and nothing says when it can't tell", async (t) => {
+  const h = harness(t);
+  const waiting = (tool: string | null) => {
+    const f = h.completed();
+    f.append({ type: "user", uuid: "prompt-2", promptId: "turn-2", message: { content: "Next request." } });
+    if (tool) f.append({ type: "assistant", uuid: `call-${tool}`, message: { content: [{ type: "tool_use", id: `tool-${tool}`, name: tool, input: tool === "AskUserQuestion" ? { questions: [{ question: "Which?", options: [{ label: "A" }, { label: "B" }] }] } : {} }], stop_reason: "tool_use" } });
+    return f;
+  };
+  const bash = waiting("Bash"), ask = waiting("AskUserQuestion"), plan = waiting("ExitPlanMode"), unknown = waiting(null), idle = h.completed();
+  // A tool that has its result isn't what it waits on: here, a question Claude Code hasn't written down yet.
+  const ran = waiting("Read");
+  ran.append({ type: "user", uuid: "result-1", message: { content: [{ type: "tool_result", tool_use_id: "tool-Read", content: "README" }] } });
+  await h.adapter.start();
+  const kinds: (string | undefined)[] = [];
+  // The registry holds one session at a time here (one per process): each is the one waiting in turn.
+  for (const f of [bash, ask, plan, unknown, ran, idle]) {
+    h.registry(f.id, f === idle ? "idle" : "waiting");
+    kinds.push((await h.adapter.list()).find((i) => i.id === f.id)?.questionKind);
+    assert.equal((await h.adapter.report(f.id)).choices, null, "nothing the hook holds: no choices");
+  }
+  assert.deepEqual(kinds, ["approval", "input", "input", undefined, undefined, undefined]);
 });
 
 for (const [label, record, expected] of [
@@ -409,4 +446,165 @@ test("a transcript whose first records rule it out is read no further, however b
   sdk.append({ type: "assistant", uuid: "late", message: { content: [{ type: "text", text: big }], stop_reason: "end_turn" } });
   await h.adapter.list();
   assert.equal(readers.has(sdk.path), false);
+});
+
+// Receipts (docs/launch/spikes/run-receipts.md): what the reply's run ran of its checks, from Bash's exits as Claude Code
+// writes them (is_error false; true with "Exit code N"), checked against this machine's transcripts: every one of 997
+// results starting "Exit code" was is_error, and none that wasn't.
+test("receipts: the reply's run's checks from its Bash exits: pass, fail, pass, then an edit; sidechains, pipes and refusals don't count", async (t) => {
+  const h = harness(t), f = h.completed(); h.clock.now += 1000;
+  const bash = (id: string, command: string, extra: object = {}) => f.append({ type: "assistant", uuid: `u-${id}`, message: { content: [{ type: "tool_use", id, name: "Bash", input: { command, description: "SECRET_DESCRIPTION", ...extra } }], stop_reason: "tool_use" } });
+  const result = (id: string, ok: boolean, text: string, extra: object = {}) => f.append({ type: "user", uuid: `r-${id}`, message: { content: [{ type: "tool_result", tool_use_id: id, is_error: !ok, content: text }] }, toolUseResult: { stdout: text, stderr: "", interrupted: false, isImage: false }, ...extra });
+  f.append({ type: "user", uuid: "prompt-2", promptId: "turn-2", message: { content: "Fix the flaky test." } });
+  // A filtered run isn't a whole run: its pass isn't counted (checks.ts `FULL`).
+  bash("t1", "cd SECRET_DIR && pnpm test --filter SECRET_PKG"); result("t1", true, "SECRET_OUTPUT 12 passed");
+  bash("t2", "pnpm test"); result("t2", false, "Exit code 1\nSECRET_FAILURE billing.test.ts");
+  f.append({ type: "assistant", uuid: "u-e1", message: { content: [{ type: "tool_use", id: "e1", name: "Edit", input: { file_path: "/SECRET_PATH", old_string: "a", new_string: "b" } }], stop_reason: "tool_use" } });
+  f.append({ type: "user", uuid: "r-e1", message: { content: [{ type: "tool_result", tool_use_id: "e1", content: "ok" }] } });
+  // Not counted: a piped test run whose output shows no summary (its exit is tail's): its result isn't known, so it
+  // leaves no pass before it standing (checks.test.ts), and here the run before it failed.
+  bash("p1", "pnpm test 2>&1 | tail -5"); result("p1", false, "Exit code 1\nx");
+  bash("t3", "pnpm test"); result("t3", true, "SECRET_OUTPUT all passed");
+  bash("b1", "npx tsc --noEmit"); result("b1", false, "Exit code 2\nSECRET_TYPE_ERROR");
+  // Nor one a hook refused, one left in the background, or a subagent's.
+  bash("h1", "pnpm test"); result("h1", false, "<tool_use_error>Blocked by a hook</tool_use_error>");
+  bash("g1", "pnpm test", { run_in_background: true }); result("g1", true, "Command running in background with ID: x", { toolUseResult: { backgroundTaskId: "x" } });
+  f.append({ type: "assistant", isSidechain: true, uuid: "side", message: { content: [{ type: "tool_use", id: "s1", name: "Bash", input: { command: "pnpm test" } }], stop_reason: "tool_use" } });
+  f.append({ type: "user", isSidechain: true, uuid: "side-r", message: { content: [{ type: "tool_result", tool_use_id: "s1", is_error: true, content: "Exit code 1" }] } });
+  // Then an edit after the last test run: stale. The turn ends with a happy reply.
+  f.append({ type: "assistant", uuid: "u-e2", message: { content: [{ type: "tool_use", id: "e2", name: "Write", input: { file_path: "/SECRET_PATH2", content: "x" } }], stop_reason: "tool_use" } });
+  f.append({ type: "user", uuid: "r-e2", message: { content: [{ type: "tool_result", tool_use_id: "e2", content: "ok" }] } });
+  f.append({ type: "assistant", uuid: "reply-2", message: { content: [{ type: "text", text: "All done! Tests pass." }], stop_reason: "end_turn" } });
+  await h.adapter.start();
+  const report = await h.adapter.report(f.id);
+  assert.equal(report.text, "All done! Tests pass.");
+  assert.deepEqual(report.checks, { tests: { ok: true, runs: 2, failed: 1, label: "pnpm test", stale: true, edited: true }, build: { ok: false, runs: 1, failed: 1, label: "tsc", stale: true, edited: true } });
+  assert.doesNotMatch(JSON.stringify([report, await h.adapter.replies(f.id)]), /SECRET_|--filter|billing|Exit code/);
+  // A new prompt starts a new run: its own reply has its own checks, here none.
+  h.clock.now += 1000;
+  f.append({ type: "user", uuid: "prompt-3", promptId: "turn-3", message: { content: "Thanks." } });
+  f.append({ type: "assistant", uuid: "reply-3", message: { content: [{ type: "text", text: "You're welcome." }], stop_reason: "end_turn" } });
+  assert.equal((await h.adapter.report(f.id)).checks, undefined);
+});
+
+// The Skeptic on 3.9 and 3.10: 10 & 2's follow-up reaches an open session through its inbox, which Claude Code 2.1.321
+// writes as another session's message (isMeta, promptSource "system", origin peer; the record as the harness read it).
+// It starts a run: before, the follow-up's reply had the previous run's tests, id and start.
+test("receipts: a follow-up through the inbox is a run of its own: its reply has its own checks (none here) and id, and mid-run its own start", async (t) => {
+  const h = harness(t), f = h.completed(); h.clock.now += 1000;
+  f.append({ type: "user", uuid: "prompt-2", promptId: "turn-2", message: { content: "Run the tests." } });
+  f.append({ type: "assistant", uuid: "u-t1", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "npm test" } }], stop_reason: "tool_use" } });
+  f.append({ type: "user", uuid: "r-t1", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: false, content: "ok" }] } });
+  f.append({ type: "assistant", uuid: "reply-2", message: { content: [{ type: "text", text: "Tests pass." }], stop_reason: "end_turn" } });
+  await h.adapter.start();
+  assert.deepEqual((await h.adapter.report(f.id)).checks, { tests: { ok: true, runs: 1, failed: 0, label: "npm test" } });
+  const peer = (uuid: string, promptId: string, words: string) => ({
+    type: "user", uuid, promptId, isMeta: true, entrypoint: "cli", promptSource: "system", turnOrigin: "peer",
+    origin: { kind: "peer", from: "unknown", name: "10 & 2", fromMode: "prompting", body: `${words}\n\n(Your user said this to 10 & 2, their voice assistant, and confirmed it.)` },
+    message: { role: "user", content: `Another Claude session sent a message:\n<cross-session-message from-name="10 & 2" from-mode="prompting">\n${words}\n</cross-session-message>` },
+  });
+  h.clock.now += 1000;
+  f.append(peer("peer-3", "turn-3", "Plain words, no tests."));
+  f.append({ type: "assistant", uuid: "reply-3", message: { content: [{ type: "text", text: "Done, nothing to run." }], stop_reason: "end_turn" } });
+  const after = await h.adapter.report(f.id);
+  assert.equal(after.text, "Done, nothing to run.");
+  assert.equal(after.checks, undefined, "not the previous run's tests");
+  assert.equal(after.reply?.runId, "turn-3");
+  assert.deepEqual((await h.adapter.replies(f.id)).map((r) => r.runId), ["turn-3", "turn-2", "turn-1"], "the earlier reply kept, not replaced");
+  // Mid-run: a follow-up that runs the tests says when it started, so a pass after it isn't taken as queued behind it.
+  h.clock.now += 1000;
+  const since = new Date(h.clock.now - 1000).toISOString();
+  f.append(peer("peer-4", "turn-4", "Run them again."));
+  f.append({ type: "assistant", uuid: "u-t2", message: { content: [{ type: "tool_use", id: "t2", name: "Bash", input: { command: "npm test" } }], stop_reason: "tool_use" } });
+  f.append({ type: "user", uuid: "r-t2", message: { content: [{ type: "tool_result", tool_use_id: "t2", is_error: false, content: "ok" }] } });
+  h.registry(f.id, "busy");
+  const busy = await h.adapter.report(f.id);
+  assert.deepEqual(busy.running, { tests: { ok: true, runs: 1, failed: 0, label: "npm test" } });
+  assert.equal(busy.runningSince, since, "the follow-up's, not the earlier prompt's");
+  assert.equal(busy.runningId, "turn-4", "its run, as its reply will carry it (F6)");
+  assert.equal((await h.adapter.list()).find((i) => i.id === f.id)?.typed?.at ?? null, null, "never a person's write");
+});
+
+test("receipts: a check piped on (as agents run them) goes by its runner's summary, since its exit is tail's", async (t) => {
+  const h = harness(t), f = h.completed(); h.clock.now += 1000;
+  f.append({ type: "user", uuid: "prompt-2", promptId: "turn-2", message: { content: "Run the tests." } });
+  f.append({ type: "assistant", uuid: "u-p", message: { content: [{ type: "tool_use", id: "p", name: "Bash", input: { command: "cd /SECRET_DIR && node --test test/*.test.ts 2>&1 | tail -4" } }], stop_reason: "tool_use" } });
+  f.append({ type: "user", uuid: "r-p", message: { content: [{ type: "tool_result", tool_use_id: "p", is_error: false, content: "ℹ tests 12\nℹ pass 11\nℹ fail 1\nℹ duration_ms 812" }] }, toolUseResult: { stdout: "x", stderr: "", interrupted: false, isImage: false } });
+  f.append({ type: "assistant", uuid: "reply-2", message: { content: [{ type: "text", text: "Done: the suite runs." }], stop_reason: "end_turn" } });
+  await h.adapter.start();
+  assert.deepEqual((await h.adapter.report(f.id)).checks, { tests: { ok: false, runs: 1, failed: 1, label: "node --test" } });
+});
+
+// The skeptic on 5828b30370cf: Claude Code's shell keeps the folder a `cd` left it in, and each record carries the folder
+// as it was when written (a Bash result's, the folder after its command; as on this machine's 2.1.302 transcripts). A
+// test run that failed in api, then one that passed back in the root, isn't the tests passing.
+test("receipts: a test run in the folder an earlier cd left Claude Code's shell in is that folder's; another folder's pass never covers its failure", async (t) => {
+  const h = harness(t), f = h.completed(); h.clock.now += 1000;
+  const root = h.cwd, api = join(h.cwd, "api");
+  const bash = (id: string, command: string, cwd: string) => f.append({ type: "assistant", uuid: `u-${id}`, cwd, message: { content: [{ type: "tool_use", id, name: "Bash", input: { command } }], stop_reason: "tool_use" } });
+  const result = (id: string, ok: boolean, text: string, cwd: string) => f.append({ type: "user", uuid: `r-${id}`, cwd, message: { content: [{ type: "tool_result", tool_use_id: id, is_error: !ok, content: text }] }, toolUseResult: { stdout: text, stderr: "", interrupted: false, isImage: false } });
+  f.append({ type: "user", uuid: "prompt-2", promptId: "turn-2", cwd: root, message: { content: "Fix api's test." } });
+  bash("c1", "cd api", root); result("c1", true, "", api);
+  bash("t1", "npm test", api); result("t1", false, "Exit code 1\nℹ tests 1\nℹ pass 0\nℹ fail 1", api);
+  f.append({ type: "assistant", uuid: "u-e1", cwd: api, message: { content: [{ type: "tool_use", id: "e1", name: "Edit", input: { file_path: "/SECRET_PATH", old_string: "a", new_string: "b" } }], stop_reason: "tool_use" } });
+  f.append({ type: "user", uuid: "r-e1", cwd: api, message: { content: [{ type: "tool_result", tool_use_id: "e1", content: "ok" }] } });
+  bash("c2", "cd ..", api); result("c2", true, "", root);
+  bash("t2", "npm test", root); result("t2", true, "ℹ tests 1\nℹ pass 1\nℹ fail 0", root);
+  f.append({ type: "assistant", uuid: "reply-2", cwd: root, message: { content: [{ type: "text", text: "Fixed; tests pass." }], stop_reason: "end_turn" } });
+  await h.adapter.start();
+  assert.deepEqual((await h.adapter.report(f.id)).checks, { tests: { ok: false, runs: 1, failed: 1, label: "npm test", stale: true } }, "was a pass");
+  // Back in api, the same run passing is the tests passing.
+  bash("c3", "cd api && npm test", root); result("c3", true, "ℹ tests 1\nℹ pass 1\nℹ fail 0", api);
+  f.append({ type: "assistant", uuid: "reply-3", cwd: api, message: { content: [{ type: "text", text: "Now they pass." }], stop_reason: "end_turn" } });
+  assert.deepEqual((await h.adapter.report(f.id)).checks, { tests: { ok: true, runs: 2, failed: 1, label: "npm test", edited: true } });
+});
+
+// One rule for a pass (engine.md): the transcript is read from its start, so each run's checks start where the
+// session's runs before it left them: a pass in the root after a prompt never settles api's failure before it.
+test("receipts: a run's checks start where the session's runs before it left them", async (t) => {
+  const h = harness(t), f = h.completed(); h.clock.now += 1000;
+  const bash = (id: string, command: string) => f.append({ type: "assistant", uuid: `u-${id}`, message: { content: [{ type: "tool_use", id, name: "Bash", input: { command } }], stop_reason: "tool_use" } });
+  const result = (id: string, ok: boolean, text: string) => f.append({ type: "user", uuid: `r-${id}`, message: { content: [{ type: "tool_result", tool_use_id: id, is_error: !ok, content: text }] }, toolUseResult: { stdout: text, stderr: "", interrupted: false, isImage: false } });
+  const edit = (id: string) => {
+    f.append({ type: "assistant", uuid: `u-${id}`, message: { content: [{ type: "tool_use", id, name: "Edit", input: { file_path: "/x", old_string: "a", new_string: "b" } }], stop_reason: "tool_use" } });
+    f.append({ type: "user", uuid: `r-${id}`, message: { content: [{ type: "tool_result", tool_use_id: id, content: "ok" }] } });
+  };
+  const turn = (n: number, reply: string, work: () => void) => {
+    h.clock.now += 1000;
+    f.append({ type: "user", uuid: `prompt-${n}`, promptId: `turn-${n}`, message: { content: `Prompt ${n}.` } });
+    work();
+    f.append({ type: "assistant", uuid: `reply-${n}`, message: { content: [{ type: "text", text: reply }], stop_reason: "end_turn" } });
+  };
+  turn(2, "api's tests fail.", () => { bash("t1", "cd api && npm test"); result("t1", false, "Exit code 1\nℹ fail 1"); });
+  turn(3, "Fixed; the tests pass.", () => { edit("e1"); bash("t2", "npm test"); result("t2", true, "ℹ fail 0"); });
+  await h.adapter.start();
+  assert.equal((await h.adapter.report(f.id)).checks, undefined, "the root's pass leaves api's failure standing, so it isn't counted");
+  turn(4, "Now api's pass.", () => { bash("t3", "cd api && npm test"); result("t3", true, "ℹ fail 0"); });
+  assert.deepEqual((await h.adapter.report(f.id)).checks, { tests: { ok: true, runs: 1, failed: 0, label: "npm test" } });
+  // The skeptic on 7717d10f3219: after a cd, a build through npm that failed is a failure (npm's banner, vite's error);
+  // a check after a command that printed nothing and failed isn't, Claude Code's "Exit code 1" not being the command's.
+  turn(5, "The build fails.", () => { bash("b1", "cd web && npm run build"); result("b1", false, "Exit code 1\n\n> web@1.0.0 build\n> vite build\n\nerror during build:\n[vite]: Rollup failed to resolve import \"./x\".\n"); });
+  assert.deepEqual((await h.adapter.report(f.id)).checks, { build: { ok: false, runs: 1, failed: 1, label: "npm build" } }, "was none");
+  turn(6, "Nothing to test.", () => { bash("t4", "test -d api2 && go test ./..."); result("t4", false, "Exit code 1"); });
+  assert.equal((await h.adapter.report(f.id)).checks, undefined, "was a failed test run: test -d failed, and go never ran");
+});
+
+// "Call me when the tests pass" mid-run (the skeptic, 16 November): while the session is busy, its run's checks so far.
+test("receipts: a busy session's report carries its run's checks so far as running; a finished one's doesn't", async (t) => {
+  const h = harness(t), f = h.completed(); h.clock.now += 1000;
+  f.append({ type: "user", uuid: "prompt-2", promptId: "turn-2", message: { content: "Fix the flaky test and run the tests." } });
+  f.append({ type: "assistant", uuid: "u-t1", message: { content: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "pnpm test" } }], stop_reason: "tool_use" } });
+  f.append({ type: "user", uuid: "r-t1", message: { content: [{ type: "tool_result", tool_use_id: "t1", is_error: true, content: "Exit code 1\nx" }] } });
+  f.append({ type: "assistant", uuid: "u-t2", message: { content: [{ type: "tool_use", id: "t2", name: "Bash", input: { command: "pnpm test" } }], stop_reason: "tool_use" } });
+  f.append({ type: "user", uuid: "r-t2", message: { content: [{ type: "tool_result", tool_use_id: "t2", is_error: false, content: "all passed" }] } });
+  h.registry(f.id, "busy");
+  await h.adapter.start();
+  const busy = await h.adapter.report(f.id);
+  assert.deepEqual(busy.running, { tests: { ok: true, runs: 2, failed: 1, label: "pnpm test" } });
+  assert.equal(busy.checks, undefined, "the earlier reply's run ran none");
+  h.registry(f.id, "idle");
+  f.append({ type: "assistant", uuid: "reply-2", message: { content: [{ type: "text", text: "Fixed; tests pass." }], stop_reason: "end_turn" } });
+  const done = await h.adapter.report(f.id);
+  assert.equal(done.running, undefined);
+  assert.deepEqual(done.checks, { tests: { ok: true, runs: 2, failed: 1, label: "pnpm test" } });
 });

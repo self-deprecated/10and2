@@ -8,7 +8,7 @@ import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { AcpAdapter } from "../src/acp/adapter.ts";
 import { changes } from "../src/acp/turn.ts";
-import { parseLsofCwd, parsePs, type Proc } from "../src/acp/processes.ts";
+import { parseLsofCwd, parsePs, recentProcesses, type Proc } from "../src/acp/processes.ts";
 import { GeminiSession } from "../src/gemini/session.ts";
 import { GeminiSource, isGemini } from "../src/gemini/source.ts";
 import { askText, CopilotSession, parseWorkspace } from "../src/copilot/session.ts";
@@ -19,7 +19,7 @@ import { createServer } from "node:net";
 import type { ChildProcess } from "node:child_process";
 import type { Action, LaunchProfile } from "../src/contract.ts";
 import type { Policy } from "../src/policy.ts";
-import { nodeCommand, removeDir, SLOW } from "./fixtures/platform.ts";
+import { NODE, nodeBin, nodeCommand, removeDir, SLOW } from "./fixtures/platform.ts";
 
 const agentScript = resolve(import.meta.dirname, "fixtures", "acp", "agent.mjs");
 const runner = resolve(import.meta.dirname, "fixtures", "acp", "turn.ts");
@@ -156,6 +156,20 @@ test("processes: a Gemini CLI is told by its command, and macOS's ps and lsof ar
   assert.deepEqual([...parseLsofCwd("p412\nfcwd\nn/Users/me/app\np413\nn/tmp\n")], [[412, "/Users/me/app"], [413, "/tmp"]]);
 });
 
+test("processes are listed at most once in a while, and not at all when there's no Gemini session to tell open", () => {
+  let clock = 0, lists = 0;
+  const procs: Proc[] = [{ pid: 7, args: ["gemini"], cwd: "/p", startMs: 0 }];
+  const recent = recentProcesses(() => { lists++; return procs; }, 10_000, () => clock);
+  assert.equal(recent(isGemini), procs); assert.equal(recent(isGemini), procs);
+  assert.equal(lists, 1, "a burst of scans lists once");
+  clock = 10_000; recent(isGemini);
+  assert.equal(lists, 2, "listed again once it's old");
+  let asked = 0;
+  const source = new GeminiSource({ dir: "/nonexistent", processes: () => { asked++; return procs; } });
+  assert.deepEqual([...source.open([], new Set())], []);
+  assert.equal(asked, 0, "no sessions: no process listing");
+});
+
 type Opts = { policy?: Partial<Policy>; procs?: Proc[]; env?: Record<string, string> };
 /** A private Gemini folder, a project, the fake ACP agent as `gemini --acp`, and an adapter over them. */
 function harness(t: TestContext, opts: Opts = {}) {
@@ -168,7 +182,7 @@ function harness(t: TestContext, opts: Opts = {}) {
   const procs = opts.procs ?? [];
   const source = new GeminiSource({ dir: gemini, command: nodeCommand(agentScript), processes: () => procs });
   const logs: string[] = [];
-  const adapter = new AcpAdapter({ policy, source, db: join(root, "gemini.db"), stateDir: join(root, "state"), entryScript: runner, readCacheMs: 0,
+  const adapter = new AcpAdapter({ policy, source, db: join(root, "gemini.db"), stateDir: join(root, "state"), nodeBin, entryScript: runner, readCacheMs: 0,
     log: (s) => logs.push(s), acceptanceTimeoutMs: 8000 * SLOW });
   t.after(async () => { await adapter.close(); for (const k of Object.keys(process.env)) if (!(k in saved)) delete process.env[k]; Object.assign(process.env, saved); removeDir(root); });
   /** A session the user had in a terminal, as Gemini writes it. */
@@ -328,7 +342,7 @@ test("through 10 & 2's Copilot extension, an open session is sent to (steered wh
 test("closing stops an agent still being asked for its models, so nothing of the adapter's runs on in its folder", async () => {
   const home = realpathSync(mkdtempSync(join(tmpdir(), "acp-close-")));
   // An agent that never answers: unless closing stops it, it runs on (in the adapter's state folder) for the read's minute.
-  const command = [process.execPath, "-e", "setInterval(() => {}, 1000)"];
+  const command = [NODE, "-e", "setInterval(() => {}, 1000)"];
   const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [home], actions: [], maxRuntimeMode: "approval-required",
     claude: false, t3: false, codex: false, opencode: false, pi: false, copilot: true, steer: false, answer: false, limits: {}, worktreeBase: "HEAD" };
   const adapter = new AcpAdapter({ policy, source: new CopilotSource({ dir: home, command }), db: join(home, "c.db"), stateDir: join(home, "state"), log: () => {}, readCacheMs: 0 });
@@ -348,7 +362,7 @@ test("closing also stops a worker the agent's launcher started, as Gemini's does
   const launcher = `const w = require("node:child_process").spawn(process.execPath, ["-e", ${JSON.stringify(worker)}], { stdio: "inherit" }); require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(w.pid)); w.on("exit", (c) => process.exit(c ?? 0));`;
   const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [home], actions: [], maxRuntimeMode: "approval-required",
     claude: false, t3: false, codex: false, opencode: false, pi: false, copilot: true, steer: false, answer: false, limits: {}, worktreeBase: "HEAD" };
-  const adapter = new AcpAdapter({ policy, source: new CopilotSource({ dir: home, command: [process.execPath, "-e", launcher] }), db: join(home, "c.db"), stateDir: join(home, "state"), log: () => {}, readCacheMs: 0 });
+  const adapter = new AcpAdapter({ policy, source: new CopilotSource({ dir: home, command: [NODE, "-e", launcher] }), db: join(home, "c.db"), stateDir: join(home, "state"), log: () => {}, readCacheMs: 0 });
   await adapter.start();
   for (let i = 0; i < 100 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 50));
   const pid = Number(readFileSync(pidFile, "utf8"));
@@ -362,7 +376,7 @@ test("closing also stops a worker the agent's launcher started, as Gemini's does
 test("closing doesn't wait for good on an agent that ignores SIGTERM", { skip: process.platform === "win32" && "Windows ends a process whatever it handles" }, async () => {
   const home = realpathSync(mkdtempSync(join(tmpdir(), "acp-close-")));
   const ready = join(home, "ready");
-  const command = [process.execPath, "-e", `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(ready)}, ""); setInterval(() => {}, 1000);`];
+  const command = [NODE, "-e", `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(ready)}, ""); setInterval(() => {}, 1000);`];
   const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [home], actions: [], maxRuntimeMode: "approval-required",
     claude: false, t3: false, codex: false, opencode: false, pi: false, copilot: true, steer: false, answer: false, limits: {}, worktreeBase: "HEAD" };
   const adapter = new AcpAdapter({ policy, source: new CopilotSource({ dir: home, command }), db: join(home, "c.db"), stateDir: join(home, "state"), log: () => {}, readCacheMs: 0 });

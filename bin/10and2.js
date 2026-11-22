@@ -21,4 +21,5 @@ if (parts[0] < 22 || (parts[0] === 22 && parts[1] < 13)) {
 }
 process.removeAllListeners("warning");
 process.on("warning", (w) => { if (w.name !== "ExperimentalWarning") console.error(`${w.name}: ${w.message}`); });
-await import("../dist/10and2.js");
+// A Claude Code hook loads only its own small bundle: with commands that wait it runs on every Bash call.
+await import(process.argv[2] === "hook" ? "../dist/hook.js" : "../dist/10and2.js");

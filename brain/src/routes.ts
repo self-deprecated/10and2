@@ -20,7 +20,7 @@
 export type Access = "signed_in" | "anonymous" | "pairing" | "connector" | "webhook" | "internal";
 
 /** What an id in a request names, in the account it belongs to. */
-export type IdKind = "thread" | "kept" | "proposal" | "reading" | "conversation" | "draft" | "device" | "run" | "message" | "place";
+export type IdKind = "thread" | "kept" | "proposal" | "reading" | "conversation" | "draft" | "device" | "run" | "message" | "place" | "rule";
 
 /**
  * A field of a request that names something in the caller's account: the path's `:id`, a query parameter, or a body
@@ -84,9 +84,12 @@ export const ROUTES: Route[] = [
   { method: "POST", path: "/internal/data/export", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/data/restore", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/data/reset", access: "internal", by: "brain", where: "cloud" },
+  { method: "POST", path: "/internal/try-level", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/flag-work", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/close-active", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/analytics-consent", access: "internal", by: "brain", where: "cloud" },
+  { method: "POST", path: "/internal/call-audio-off", access: "internal", by: "brain", where: "cloud" },
+  { method: "POST", path: "/internal/data/tables", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/devices/add", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/credit", access: "internal", by: "brain", where: "cloud" },
   { method: "POST", path: "/internal/revenuecat", access: "internal", by: "brain", where: "cloud" },
@@ -141,6 +144,14 @@ export const ROUTES: Route[] = [
     method: "PUT", path: "/api/account/stale-after", access: "signed_in", by: "brain", where: "both", body: { days: 14 },
     idempotent: { key: "days: it sets the account's stale age" },
   },
+  {
+    method: "PUT", path: "/api/account/privacy", access: "signed_in", by: "brain", where: "both", body: { names: false, security: "faceid" },
+    idempotent: { key: "names and security: it sets both" },
+  },
+  {
+    method: "PUT", path: "/api/account/follow-new", access: "signed_in", by: "brain", where: "both", body: { choice: "every" },
+    idempotent: { key: "choice: it sets it, and Every new thread chosen again keeps when it was first chosen" },
+  },
   { method: "PUT", path: "/api/analytics", access: "signed_in", by: "brain", where: "both", body: { share: true } },
   { method: "POST", path: "/api/machines/revoke", access: "signed_in", by: "brain", where: "cloud", body: { deviceId: "d-0123456789" }, ids: [body("deviceId", "device")] },
   { method: "GET", path: "/api/credits/packs", access: "signed_in", by: "worker", where: "cloud" },
@@ -168,6 +179,40 @@ export const ROUTES: Route[] = [
   { method: "POST", path: "/api/wait/cancel", access: "signed_in", by: "brain", where: "both", body: {} },
   { method: "POST", path: "/api/phone", access: "signed_in", by: "brain", where: "both", body: { token: "ab".repeat(32), env: "sandbox" } },
   { method: "DELETE", path: "/api/phone", access: "signed_in", by: "brain", where: "both", body: {} },
+  { method: "POST", path: "/api/phone/test", access: "signed_in", by: "brain", where: "both", body: {} },
+  // The lock screen's board (docs/launch/engine.md §11, stage 5): the call's Live Activity left there at End on hold, and
+  // taken back. Each replaces or forgets the one activity, so sent again it has the same effect.
+  { method: "POST", path: "/api/activity", access: "signed_in", by: "brain", where: "both", body: { token: "cd".repeat(40), env: "sandbox" } },
+  { method: "DELETE", path: "/api/activity", access: "signed_in", by: "brain", where: "both", body: {} },
+  // Watching (docs/launch/engine.md §2): each call-back still watching, and Stop; from stage 5, a watch made by hand
+  // (a thread's page, Siri) or by the call's card's OK, and the sheet's changes to one.
+  { method: "GET", path: "/api/rules", access: "signed_in", by: "brain", where: "both" },
+  {
+    method: "POST", path: "/api/rules", access: "signed_in", by: "brain", where: "both", body: { id: "t-12", requestId: REQUEST_ID }, ids: [body("id", "thread", { with: { requestId: "<fresh>" } })],
+    idempotent: { key: "requestId", tested: ["brain/test/watch.test.ts", "POST /api/rules on a working thread: one watch, made by the app"] },
+  },
+  {
+    method: "PUT", path: "/api/rules/:id", access: "signed_in", by: "brain", where: "both", body: { when: "replies" }, ids: [pathId("rule")],
+    idempotent: { key: "the choices: it sets each one given", tested: ["brain/test/watch.test.ts", "PUT /api/rules/:id changes a watch in place, its row the answer; sent twice"] },
+  },
+  { method: "DELETE", path: "/api/rules/:id", access: "signed_in", by: "brain", where: "both", ids: [pathId("rule")] },
+  // Your rules (docs/launch/engine.md §11, 3.4): the file, each line's reading and the examples; saved over the version it
+  // was opened at (a save after another is refused, 409). Quiet for a while, and the Focus filter's report.
+  { method: "GET", path: "/api/rules/file", access: "signed_in", by: "brain", where: "both" },
+  { method: "PUT", path: "/api/rules/file", access: "signed_in", by: "brain", where: "both", body: { text: "# My rules\n\n- Let me know when anything needs my input.\n", ifV: 0 } },
+  // Stage 3.5: the reader over your own words, Use these rules, a line's question answered.
+  { method: "POST", path: "/api/rules/read", access: "signed_in", by: "brain", where: "both" },
+  { method: "POST", path: "/api/rules/use", access: "signed_in", by: "brain", where: "both", body: { v: 0 } },
+  { method: "POST", path: "/api/rules/answer", access: "signed_in", by: "brain", where: "both", body: { line: "Tell me when nix is idle.", choice: 0 } },
+  // Stage 3.5, "Allowing a call": a call in your own words rings only once you allow it with a tap; Stop calls.
+  { method: "POST", path: "/api/rules/allow", access: "signed_in", by: "brain", where: "both", body: { v: 0, line: "Call me if a build fails.", reading: "0000000000000000", night: false } },
+  { method: "POST", path: "/api/rules/disallow", access: "signed_in", by: "brain", where: "both", body: { v: 0, line: "Call me if a build fails." } },
+  {
+    method: "PUT", path: "/api/quiet", access: "signed_in", by: "brain", where: "both", body: { until: Date.now() + 3600_000 },
+    idempotent: { key: "until: it sets when Quiet for a while ends", tested: ["brain/test/my-rules.test.ts", "PUT /api/quiet sent twice: one Quiet, its start kept, the same answer"] },
+  },
+  { method: "DELETE", path: "/api/quiet", access: "signed_in", by: "brain", where: "both" },
+  { method: "PUT", path: "/api/focus", access: "signed_in", by: "brain", where: "both", body: { on: true } },
   { method: "GET", path: "/api/drafts/:id", access: "signed_in", by: "brain", where: "both", ids: [pathId("draft")] },
   { method: "GET", path: "/api/calls/current", access: "signed_in", by: "brain", where: "both" },
   {
@@ -177,6 +222,15 @@ export const ROUTES: Route[] = [
   {
     method: "POST", path: "/api/proposals/:id/cancel", access: "signed_in", by: "brain", where: "both", body: { requestId: REQUEST_ID }, ids: [pathId("proposal")],
     idempotent: { key: "requestId" },
+  },
+  // Face ID, asked on the phone's screen for the change waiting in the live call, didn't see the user (the engine's stage
+  // 2b): it's kept in Drafts, waiting for Face ID, and the voice says so.
+  { method: "POST", path: "/api/proposals/:id/unseen", access: "signed_in", by: "brain", where: "both", body: {}, ids: [pathId("proposal")] },
+  // "Approve to send" answered from its notification (stage 2b): a change waiting in the live call, or after it, a reply
+  // or prompt kept waiting for Face ID.
+  {
+    method: "POST", path: "/api/approvals/:id", access: "signed_in", by: "brain", where: "both", body: { approve: false, requestId: REQUEST_ID }, ids: [pathId("kept")],
+    idempotent: { key: "requestId: an Approve is a tap's send, its id the tap's; Don't send sets the draft plain", tested: ["brain/test/faceid.test.ts", "Approve to send after the call"] },
   },
   { method: "GET", path: "/api/updates", access: "signed_in", by: "brain", where: "both" },
   { method: "GET", path: "/api/conversations", access: "signed_in", by: "brain", where: "both" },
@@ -195,6 +249,15 @@ export const ROUTES: Route[] = [
   {
     method: "POST", path: "/api/star", access: "signed_in", by: "brain", where: "both", body: { id: "t-12", starred: true }, ids: [body("id", "thread")],
     idempotent: { key: "starred: it sets the star, never toggles it" },
+  },
+  {
+    // Commands that wait (docs/launch/engine.md §11 stage 4): Let it run or Stop it, for that hold only.
+    method: "POST", path: "/api/held", access: "signed_in", by: "brain", where: "both", body: { id: "t-12", hold: "g-1", letRun: false }, ids: [body("id", "thread")],
+    idempotent: { key: "hold: the computer answers a hold once, and the same answer again gets its receipt", tested: ["brain/test/held.test.ts", "Let it run and Stop it from the phone: that hold only, once, on every level, and what the notification and the Timeline say after"] },
+  },
+  {
+    method: "PUT", path: "/api/threads/:id/notify", access: "signed_in", by: "brain", where: "both", body: { notify: "nothing" }, ids: [pathId("thread")],
+    idempotent: { key: "notify: it sets the thread's setting" },
   },
   {
     method: "POST", path: "/api/snooze", access: "signed_in", by: "brain", where: "both", body: { id: "t-12", until: TOMORROW, requestId: REQUEST_ID }, ids: [body("id", "thread")],

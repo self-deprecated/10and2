@@ -2,11 +2,17 @@
 // read with only what changed. Pure bookkeeping: no I/O, no timers.
 import { createHash, randomBytes } from "node:crypto";
 import type { ActionKind, LaunchProfile, CodingModel, Place, WirePlace, WorkItem } from "./contract.ts";
+import type { Rules } from "./policy.ts";
+import type { Held } from "./schedules.ts";
 
 export type Refusals = Record<string, Partial<Record<ActionKind, string>>>;
 export type Connection = { prefix: string; name: string; connected: boolean };
-/** `ceiling`: the most a launch may run with here, so a proposal asking for more is refused before it's read back. */
-export type View = { items: WorkItem[]; places: Place[]; connections: Connection[]; refusals: Refusals; ceiling: LaunchProfile["runtimeMode"] };
+/**
+ * `ceiling`: the most a launch may run with here, so a proposal asking for more is refused before it's read back.
+ * `rules`: what sends and starts set up for later may do here; `schedules`: what this computer holds for later, always
+ * whole (docs/launch/engine.md §5; stage 4a). An older brain ignores both.
+ */
+export type View = { items: WorkItem[]; places: Place[]; connections: Connection[]; refusals: Refusals; ceiling: LaunchProfile["runtimeMode"]; rules?: Rules; schedules?: Held[] };
 /** As `tenandtwo://work` carries it: each place's models named by `catalog`, a key into `catalogs` (`pack`). */
 export type Read = Omit<View, "places"> & { places: WirePlace[]; catalogs: Record<string, CodingModel[]>; rev: string; full: boolean; removed: string[] };
 
@@ -26,10 +32,13 @@ export function pack(places: Place[]): { places: WirePlace[]; catalogs: Record<s
   return { places: wire, catalogs };
 }
 
-/** The fields the brain's briefing diffs on (an updatedAt-only change means nothing to it). */
-const briefed = (i: WorkItem) => JSON.stringify([i.status, i.title, i.settled, i.snoozedUntil, i.pendingQuestion, i.questionId ?? null, i.lastRunAt ?? null, i.group, i.parentId, i.visitedAt ?? null]);
+/**
+ * The fields the brain's briefing diffs on, what a question waits on, and when you last wrote in it yourself (the
+ * engine's stage 3.9: news you've seen is dropped, and Away ends); an updatedAt-only change means nothing to it.
+ */
+const briefed = (i: WorkItem) => JSON.stringify([i.status, i.title, i.settled, i.snoozedUntil, i.pendingQuestion, i.questionId ?? null, i.questionKind ?? null, i.lastRunAt ?? null, i.group, i.parentId, i.visitedAt ?? null, i.typed ?? null]);
 /** Places with their models: a change in any list is a change. */
-const rest = (v: View) => JSON.stringify([v.places, v.connections, v.refusals, v.ceiling]);
+const rest = (v: View) => JSON.stringify([v.places, v.connections, v.refusals, v.ceiling, v.rules ?? null, v.schedules ?? null]);
 
 export class Sent {
   /** A fresh prefix per connector run, so a rev from an earlier run is never mistaken for this one's. */
@@ -67,6 +76,7 @@ export class Sent {
     this.others = rest(v);
     this.touched.clear();
     this.rev = `${this.prefix}-${++this.n}`;
-    return { rev: this.rev, full: !delta, items, removed, ...pack(v.places), connections: v.connections, refusals: v.refusals, ceiling: v.ceiling };
+    return { rev: this.rev, full: !delta, items, removed, ...pack(v.places), connections: v.connections, refusals: v.refusals, ceiling: v.ceiling,
+      ...(v.rules ? { rules: v.rules } : {}), ...(v.schedules ? { schedules: v.schedules } : {}) };
   }
 }

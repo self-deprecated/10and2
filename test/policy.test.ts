@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, symlinkSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { allows, answers, ceilingFor, loadPolicy, parsePolicy, steers, visible, withinCeiling } from "../src/policy.ts";
@@ -149,4 +149,22 @@ test("a policy saved by Windows PowerShell (a byte-order mark, or UTF-16) is rea
   writeFileSync(join(dir, "bom.json"), "\uFEFF" + json);
   writeFileSync(join(dir, "utf16.json"), Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(json, "utf16le")]));
   for (const f of ["bom.json", "utf16.json"]) assert.deepEqual(loadPolicy(join(dir, f)).actions, ["settle"], f);
+});
+
+test("a listed folder that can't be resolved (a dangling link, a drive that isn't there) is left out and said, not a refusal", { skip: process.platform === "win32" && "symlinks need privileges on Windows" }, (t) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "policy-unresolved-")));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  mkdirSync(join(root, "work"));
+  // A link to a drive that's unmounted now (or a folder renamed away).
+  symlinkSync(join(root, "Volumes", "External", "code"), join(root, "external"));
+  const p = parsePolicy(JSON.stringify({ ...base, projects: [join(root, "work"), join(root, "external")] }));
+  assert.deepEqual(p.unresolved, [join(root, "external")]);
+  assert.equal(visible(p, join(root, "work", "app")), true, "the rest still seen");
+  assert.equal(visible(p, join(root, "external", "app")), false);
+  // Every one gone: it runs, and sees nothing.
+  const none = parsePolicy(JSON.stringify({ ...base, projects: [join(root, "external")] }));
+  assert.deepEqual(none.projects, []); assert.deepEqual(none.unresolved, [join(root, "external")]);
+  assert.equal(parsePolicy(JSON.stringify({ ...base, projects: [join(root, "work")] })).unresolved, undefined);
+  // A folder deleted since it was listed still resolves (through its parent): seen again once it's back.
+  assert.deepEqual(parsePolicy(JSON.stringify({ ...base, projects: [join(root, "gone")] })).projects, [join(root, "gone")]);
 });

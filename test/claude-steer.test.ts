@@ -15,6 +15,8 @@ import { relayHook } from "../src/claude/hooks.ts";
 import type { Action, LaunchProfile } from "../src/contract.ts";
 import { filetime, harness, keyFile, PEER_TOKEN, until } from "./fixtures/claude/helpers.ts";
 import { ipcPath, WINDOWS } from "./fixtures/platform.ts";
+import { Local } from "../src/local.ts";
+import { ANSWERED } from "../src/util.ts";
 
 function env(t: TestContext, key: string, value: string) {
   const old = process.env[key]; process.env[key] = value;
@@ -82,6 +84,18 @@ test("a follow-up to a session open in a terminal goes to its inbox, with its to
   assert.equal(lines[1].message.content, envelope(action.message, "prompting"));
   assert.deepEqual(await h.adapter.execute(action, "steer"), { ok: true }, "the same key never posts twice");
   assert.equal(lines.filter((l) => l.type === "user").length, 1);
+});
+
+test("a message set up for later reaches the session's inbox saying when it was set up and confirmed (engine.md §5)", async (t) => {
+  const h = harness(t), f = h.completed(undefined, h.cwd, "auto"), sock = ipcPath(h.root, "inbox.sock");
+  const lines = await inbox(t, sock, (line) => f.append({ type: "queue-operation", operation: "enqueue", content: line.message.content }));
+  h.registry(f.id, "idle", { messagingSocketPath: sock });
+  await h.adapter.start();
+  const local = new Local([{ prefix: "claude", adapter: h.adapter }], h.policy);
+  const scheduled = { agreedAt: "2026-11-19T21:14:00Z", at: "2026-11-20T02:00:00Z", zone: "Europe/Copenhagen" };
+  assert.deepEqual(await local.dispatch({ kind: "follow_up", itemId: `claude:${f.id}`, message: "carry on" }, "R-r1-1:a", { scheduled }), { ok: true });
+  assert.equal(lines.find((l) => l.type === "user").message.content, envelope("carry on", "prompting", scheduled));
+  assert.match(lines.find((l) => l.type === "user").message.content, /\(Your user set this up with 10 & 2 yesterday at 22:14, to be sent at 03:00, and confirmed it then\.\)/);
 });
 
 test("a message that starts a turn counts by its own id in the transcript", async (t) => {
@@ -157,6 +171,82 @@ test("Claude's question, held by the hook, is read out with its options and answ
     updatedInput: { questions, answers: { "Should lap times show seconds or milliseconds?": "Milliseconds" } } } } });
 });
 
+test("a question the hook holds is input, with its options as choices, and a tap with its questionId answers it with that option", async (t) => {
+  const h = harness(t), { f, questions } = asking(h); await h.adapter.start();
+  const local = new Local([{ prefix: "claude", adapter: h.adapter }], h.policy);
+  const before = (await h.adapter.list())[0]!;
+  assert.equal(before.questionKind, undefined, "before the hook nothing says what it waits on");
+  assert.equal((await h.adapter.report(f.id)).choices, null);
+  let printed = "";
+  const hook = relayHook(JSON.stringify({ session_id: f.id, hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion", tool_input: { questions } }), h.adapter.socketPath, (s) => { printed += s; });
+  await until(async () => (await h.adapter.list())[0]?.questionKind === "input");
+  assert.deepEqual((await h.adapter.report(f.id)).choices, ["Seconds", "Milliseconds"]);
+  const questionId = (await h.adapter.list())[0]!.questionId!;
+  const tap = (id: string): Action => ({ kind: "follow_up", itemId: `claude:${f.id}`, message: "Milliseconds", questionId: id });
+  assert.deepEqual(await local.execute(tap("an-earlier-question"), "T-1"), { ok: false, error: ANSWERED });
+  assert.equal(printed, "", "nothing sent for a question it no longer asks");
+  assert.deepEqual(await local.execute(tap(questionId), "T-2"), { ok: true });
+  await hook;
+  assert.deepEqual(JSON.parse(printed).hookSpecificOutput.decision.updatedInput.answers, { "Should lap times show seconds or milliseconds?": "Milliseconds" });
+});
+
+test("a tap on a question the hook no longer holds (the connector restarted since it asked) is refused, never sent as a message", async (t) => {
+  const h = harness(t), f = h.completed(undefined, h.cwd, "auto");
+  const questions = [{ question: "Seconds or milliseconds?", multiSelect: false, options: [{ label: "Seconds" }, { label: "Milliseconds" }] }];
+  f.append({ type: "user", uuid: "prompt-2", promptId: "turn-2", permissionMode: "auto", message: { content: "Ask me about the format." } });
+  const socket = ipcPath(h.root, "inbox.sock"), sent = await inbox(t, socket);
+  h.registry(f.id, "waiting", { messagingSocketPath: socket });
+  await h.adapter.start();
+  const hook = relayHook(JSON.stringify({ session_id: f.id, hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion", tool_input: { questions } }), h.adapter.socketPath, () => {});
+  await until(async () => (h.adapter as any).asks.has(f.id));
+  const questionId = (await h.adapter.list())[0]!.questionId!;
+  (h.adapter as any).asks.get(f.id).socket.end();
+  await hook;
+  await until(async () => !(h.adapter as any).asks.has(f.id));
+  assert.equal((await h.adapter.list())[0]!.questionId, questionId, "the terminal still asks it");
+  assert.equal((await h.adapter.report(f.id)).choices, null);
+  const tap: Action = { kind: "follow_up", itemId: f.id, message: "Milliseconds", questionId };
+  assert.equal(await h.adapter.check(tap), "It's asking in its terminal now, where 10 & 2 can't answer it. Answer it there.");
+  assert.equal((await h.adapter.execute(tap, "T-1")).ok, false);
+  assert.deepEqual(sent, []);
+  // Words with no questionId still go to its inbox, as before.
+  assert.equal(await h.adapter.check({ kind: "follow_up", itemId: f.id, message: "Use milliseconds" }), null);
+});
+
+test("a tap answers only the question it was for: one asked instead, or none, while Local's check awaited sends nothing", async (t) => {
+  for (const asksAgain of [true, false]) {
+    const h = harness(t), { f, questions } = asking(h), sock = ipcPath(h.root, "inbox.sock"), sent = await inbox(t, sock);
+    h.registry(f.id, "waiting", { messagingSocketPath: sock });
+    await h.adapter.start();
+    const local = new Local([{ prefix: "claude", adapter: h.adapter }], h.policy);
+    const hook = relayHook(JSON.stringify({ session_id: f.id, hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion", tool_input: { questions } }), h.adapter.socketPath, () => {});
+    await until(async () => (await h.adapter.list())[0]?.questionKind === "input");
+    const questionId = (await h.adapter.list())[0]!.questionId!;
+    // After Local looked, while the adapter's check yields: the question goes (answered in the terminal), and Claude asks
+    // another, held by a new hook, or goes back to idle with its inbox open.
+    let printed = "", moved = false;
+    const check = h.adapter.check.bind(h.adapter);
+    h.adapter.check = async (a) => {
+      const why = await check(a);
+      if (moved) return why;
+      moved = true;
+      (h.adapter as any).asks.get(f.id).socket.end();
+      await hook;
+      h.registry(f.id, asksAgain ? "waiting" : "idle", { messagingSocketPath: sock, statusUpdatedAt: h.clock.now + 5000 });
+      if (asksAgain) {
+        const other = [{ question: "Delete the production database?", multiSelect: false, options: [{ label: "Yes" }, { label: "No" }] }];
+        void relayHook(JSON.stringify({ session_id: f.id, hook_event_name: "PermissionRequest", tool_name: "AskUserQuestion", tool_input: { questions: other } }), h.adapter.socketPath, (s) => { printed += s; });
+        await until(async () => (h.adapter as any).asks.has(f.id) && (await h.adapter.list())[0]!.questionId !== questionId);
+      }
+      return why;
+    };
+    assert.deepEqual(await local.execute({ kind: "follow_up", itemId: `claude:${f.id}`, message: "Milliseconds", questionId }, "old-tap"), { ok: false, error: ANSWERED });
+    assert.equal(printed, "", "never the answer to the question asked since");
+    assert.deepEqual(sent, [], "never sent as a message");
+    (h.adapter as any).asks.get(f.id)?.socket.end();
+  }
+});
+
 test("a question answered in the terminal lets the hook go with nothing; one 10 & 2 doesn't list is never held", async (t) => {
   const h = harness(t), { f, questions } = asking(h); await h.adapter.start();
   let printed = "";
@@ -228,7 +318,9 @@ test("a follow-up to a session nothing has open continues it as a background ses
   env(t, "FAKE_CLAUDE_BG", "1");
   const h = harness(t), f = h.completed(undefined, h.cwd, "auto"); await h.adapter.start();
   assert.deepEqual(await h.adapter.execute({ kind: "follow_up", itemId: f.id, message: "Now add tests" }, "bg-resume"), { ok: true });
+  // What the adapter said and ran, if it didn't start a background session (once on Windows CI, 22 November).
   const call = calls(h.config).find((c) => c.bg)!;
+  assert.ok(call, JSON.stringify({ logs: h.logs, calls: calls(h.config) }));
   assert.equal(call.args[call.args.indexOf("--resume") + 1], f.id);
   assert.equal(call.args[call.args.indexOf("--permission-mode") + 1], "auto");
   assert.deepEqual(JSON.parse(call.args[call.args.indexOf("--settings") + 1]), { worktree: { bgIsolation: "none" } }, "a user's own session isn't moved into a worktree");
@@ -336,4 +428,18 @@ test("on Windows a project is one place whatever the case its folder was recorde
   assert.equal(placeId("C:\\Users\\Me\\Proj", "win32"), placeId("c:\\users\\me\\proj", "win32"));
   assert.notEqual(placeId("/home/me/Proj", "linux"), placeId("/home/me/proj", "linux"));
   assert.equal(placeId("/home/me/proj", "linux"), placeId("/home/me/proj", "win32"));
+});
+
+// The Skeptic on 3.10: a follow-up through a session's inbox is recorded as another session's message, never a person's
+// prompt, so the Ledger drops its record of it (`sendLeftOut`) rather than let it claim the user's same words typed later.
+test("a follow-up through the inbox is never a person's prompt (sendLeftOut, asked once); a key never sent isn't either", async (t) => {
+  const h = harness(t), f = h.completed(undefined, h.cwd, "auto"), sock = ipcPath(h.root, "inbox.sock");
+  await inbox(t, sock, (line) => f.append({ type: "queue-operation", operation: "enqueue", content: line.message.content }));
+  h.registry(f.id, "busy", { messagingSocketPath: sock });
+  await h.adapter.start();
+  const action: Action = { kind: "follow_up", itemId: f.id, message: "Yes, go ahead." };
+  assert.deepEqual(await h.adapter.execute(action, "steer"), { ok: true });
+  assert.equal(h.adapter.sendLeftOut(action, "steer"), true);
+  assert.equal(h.adapter.sendLeftOut(action, "steer"), false, "asked once");
+  assert.equal(h.adapter.sendLeftOut(action, "never-sent"), false);
 });

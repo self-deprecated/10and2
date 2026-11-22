@@ -1,13 +1,16 @@
 // Threads on several machines as one work system. The brain's own machine keeps its ids; another machine's are
 // "<machine>|<id>", and their group says where they are ("expo, on Quartz"), so names and commands go to the right
 // machine. A machine that hasn't answered yet (asleep, offline) contributes nothing rather than holding everyone up.
-import type { Action, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "./adapter.ts";
+import type { Action, Adapter, DocumentText, FirstAsk, LaterLink, PastReply, Place, Receipt, Report, WorkItem } from "./adapter.ts";
 import { describe } from "./util.ts";
+
+/** A machine's own adapter, when it can be handed sends and starts for later (connector-client.ts `RemoteAdapter`). */
+type Later = { laterLink(): Omit<LaterLink, "machine" | "prefix">; onLater(l: (why: "linked" | "report") => void): () => void };
 
 export type Machine = {
   /** Its configured machine name, which is also how it's said: "on Quartz". */
   name: string;
-  adapter: Adapter & { readonly isLoaded?: boolean };
+  adapter: Adapter & { readonly isLoaded?: boolean } & Partial<Later>;
   /** The brain's own machine: its ids are kept as they are, and its failures are the brain's failures. */
   local?: boolean;
   /** How it's said when it isn't its name: the brain's own machine, by its host name ("Lattice"). */
@@ -59,6 +62,11 @@ export class Machines implements Adapter {
     return this.machines.find((m) => m.local)?.adapter.connected() ?? false;
   }
 
+  appOf(itemId: string): string | null {
+    const r = this.route(itemId);
+    return r.m.adapter.appOf?.(r.id) ?? null;
+  }
+
   isLocal(itemId: string): boolean {
     return this.route(itemId).m.local === true;
   }
@@ -104,6 +112,11 @@ export class Machines implements Adapter {
     return r.m.adapter.firstAsk?.(r.id) ?? null;
   }
 
+  async readDocument(id: string, docId: string): Promise<DocumentText | null> {
+    const r = this.route(id);
+    return r.m.adapter.readDocument?.(r.id, docId) ?? null;
+  }
+
   /** The time zone of the machine holding `itemId`, as its connector said it; null when it didn't, or no machine has it. */
   timeZone(itemId: string): string | null {
     try {
@@ -142,6 +155,29 @@ export class Machines implements Adapter {
   markRead(itemId: string, watermark: string, idempotencyKey: string): Promise<Receipt | "unsupported"> {
     const r = this.route(itemId);
     return r.m.adapter.markRead?.(r.id, watermark, idempotencyKey) ?? Promise.resolve("unsupported");
+  }
+
+  answerHold(itemId: string, questionId: string, run: boolean): Promise<Receipt | "unsupported"> {
+    const r = this.route(itemId);
+    return r.m.adapter.answerHold?.(r.id, questionId, run) ?? Promise.resolve("unsupported");
+  }
+
+  /**
+   * Every machine that can be handed sends and starts for later (stage 4b), by its name as said, and what its ids carry
+   * before their own (none for this brain's own machine).
+   */
+  laterLinks(): LaterLink[] {
+    return this.machines.flatMap((m) => (m.adapter.laterLink ? [this.laterOf(m)] : []));
+  }
+
+  private laterOf(m: Machine): LaterLink {
+    const own = m.adapter.laterLink!();
+    return Object.defineProperties({ machine: m.said ?? spoken(m.name), prefix: m.local ? "" : `${m.name}${SEP}` } as LaterLink, Object.getOwnPropertyDescriptors(own));
+  }
+
+  watchLater(l: (link: LaterLink, why: "linked" | "report") => void): () => void {
+    const stops = this.machines.flatMap((m) => (m.adapter.onLater ? [m.adapter.onLater((why) => l(this.laterOf(m), why))] : []));
+    return () => stops.forEach((s) => s());
   }
 
   watch(onChange: (ids: string[], urgent: boolean) => void): () => void {

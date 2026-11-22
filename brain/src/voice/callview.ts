@@ -6,23 +6,44 @@
 // call-back, back from a reading) keeps the conversation's view.
 import { randomUUID } from "node:crypto";
 import type { Briefing, BriefingView } from "../briefing.ts";
-import { KEPT, NOT_DONE, spokenDate } from "../proposals.ts";
+import type { DraftCard } from "../engine.ts";
+import { forLater, heldAskedKey, KEPT, NOT_DONE, spokenDate } from "../proposals.ts";
 import type { Proposal, Store } from "../store.ts";
+import { LATER_PREFIX, validLater } from "../later.ts";
+import type { LaterCard } from "../later-lines.ts";
+import { shownClock } from "../zone.ts";
 import { briefed } from "./prompts.ts";
 
 export type CallState = "listening" | "thinking" | "talking" | "waiting";
 export type AgendaItem = { threadId: string; name: string; project: string; status: "done" | "current" | "next"; outcome?: string; ask?: string };
-export type ReceiptState = "proposed" | "executed" | "failed" | "cancelled" | "expired" | "unknown" | "kept";
+/** `scheduled` (stage 4b): a send or a start set up for later, agreed to: nothing is sent now. */
+export type ReceiptState = "proposed" | "executed" | "failed" | "cancelled" | "expired" | "unknown" | "kept" | "scheduled";
 /**
  * `kind`: a lookup, a change (a proposal, a star, a note), or the brain's own: a moment flagged for review, a spoken
  * yes it refused (`proposalId` the change it was for), a claim it corrected, or the call hung up or ended.
  */
 export type ReceiptKind = "lookup" | "change" | "flag" | "refused" | "correction" | "call";
 export type Receipt = { id: string; at: number; kind: ReceiptKind; threadId?: string; text: string; state?: ReceiptState; words?: string; proposalId?: string };
-export type Pending = { proposalId: string; text: string; threadId?: string; expiresAt: number };
+/**
+ * `reason`: what the iPhone's own Face ID sheet says when the phone asks by itself (stage 2b: "Send to API"); only for a
+ * reply to one thread or a new thread (`faceIdReason`), the phone asking by itself for nothing else. `card` (stage 4b): a
+ * send or a start set up for later, as its card shows it (title, rows, Schedule; Fable's 4-A).
+ */
+export type Pending = { proposalId: string; text: string; reason?: string; threadId?: string; expiresAt: number; card?: LaterCard };
+/**
+ * The call's card (docs/launch/engine.md §11 stage 5; Fable's topic 1): a watch read back by `wait_for` and waiting for
+ * the user's yes, beside `pending`, with the sheet its Change opens. Its OK is `POST /api/rules {card: id}`.
+ */
+export type Draft = DraftCard & { id: string; state: "waiting"; expiresAt: number };
 /** What a call leaves for History: its agenda as it ended (the item under way counts as done) and its receipts. */
 export type CallRecord = { agenda: AgendaItem[]; receipts: Receipt[] };
-export type CallSnapshot = { conversationId: string; state?: CallState; agenda: AgendaItem[]; receipts: Receipt[]; pending: Pending | null; next: string };
+export type CallSnapshot = { conversationId: string; state?: CallState; agenda: AgendaItem[]; receipts: Receipt[]; pending: Pending | null; held?: HeldCard | null; draft?: Draft; next: string };
+
+/**
+ * A held command the user asked to let run by voice in this call, with Call mode on screen (Commands that wait; Fable's
+ * 4-H3): its card, with Stop it and Let it run (`POST /api/held`), while the thread still holds it.
+ */
+export type HeldCard = { itemId: string; questionId: string; thread: string; command: string; matched: string; since: string; machine: string | null };
 
 /** A thread a tool was about, as the tool found it. */
 export type About = { itemId: string; handle: string; group: string };
@@ -109,9 +130,25 @@ export function receiptOf(name: string, args: any, result: Record<string, unknow
 /** A proposal as the user glances at it: what it will do, the start of a message in quotes. */
 export function glance(p: Proposal): string {
   const quote = p.fields.message ? `: “${cut(p.fields.message.replace(/\s+/g, " ").trim(), 80)}”` : "";
+  // Set up for later (stage 4b): what its card's title says, and the words; never "Send" (nothing is sent now).
+  if (p.fields.card) return `${p.fields.card.title}${p.action === "follow_up" ? ` to ${list(p.targets.map((t) => t.handle))}` : ""}${quote}`;
   if (p.action === "follow_up") return `Send your reply to ${p.targets[0]?.handle ?? "the thread"}${quote}`;
   if (p.action === "start_work") return p.fields.title ? `Start ${p.fields.title} in ${p.fields.place}${quote}` : `Start a new thread in ${p.fields.place}${quote}`;
   return p.readback.replace(/\.$/, "");
+}
+
+/**
+ * What the iPhone's own Face ID sheet says it's for, when the phone asks by itself for a send waiting in the call (the
+ * engine's stage 2b; Fable's 2b topic 4): "Send to API", a new thread "Start a new thread in shop". Only those two, which
+ * Face ID every time sends with Send alone: anything else (an archive, a settle, a reply to several threads) has none,
+ * so the phone never asks by itself for it, and a glance can't carry out a change whose readback and yes are still due.
+ * Nor one set up for later (stage 4b): its card's Schedule is tapped (Fable's 4-A).
+ */
+export function faceIdReason(p: Proposal): string | null {
+  if (forLater(p)) return null;
+  if (p.action === "follow_up" && p.targets.length === 1) return `Send to ${p.targets[0].handle}`;
+  if (p.action === "start_work") return `Start a new thread in ${p.fields.place ?? "a project"}`;
+  return null;
 }
 
 /**
@@ -132,7 +169,7 @@ function outcomeOf(p: Proposal): string {
     case "follow_up":
       return "Sent your reply";
     case "snooze":
-      return p.fields.until ? `Snoozed until ${spokenDate(new Date(p.fields.until), p.createdAt).text}` : "Snoozed";
+      return p.fields.until ? `Snoozed until ${spokenDate(new Date(p.fields.until), p.createdAt, p.fields.tz).text}` : "Snoozed";
     case "start_work":
       return "Started";
     case "archive":
@@ -179,6 +216,8 @@ export class CallView {
   /** The cursor: each receipt's revision, bumped whenever what it says changes. */
   private rev = 0;
   private readonly revs = new Map<string, { rev: number; said: string }>();
+  /** The card waiting for a yes, as the session last gave it (`drafted`), until its time is up. */
+  private draft: Draft | null = null;
 
   private readonly deps: { store: Store; briefing: Briefing };
   readonly conversationId: string;
@@ -232,6 +271,11 @@ export class CallView {
     this.lookups.push({ ...r, id: this.nextId(), at: this.now() });
   }
 
+  /** The session's card waiting for a yes (stage 5), or none: answered, called off, or the call over. */
+  drafted(d: Draft | null) {
+    this.draft = d;
+  }
+
   /** A receipt of the brain's own: a moment flagged for review, or a claim it corrected. */
   note(r: { kind: "flag" | "correction" | "call"; text: string; threadId?: string }) {
     const { threadId, ...rest } = r;
@@ -257,8 +301,21 @@ export class CallView {
       if (this.revs.get(k.id)!.rev > after) receipts.push(shown);
     }
     const open = this.deps.store.openProposals(this.conversationId).filter((p) => now <= p.expiresAt).at(-1);
-    const pending = open ? { proposalId: open.id, text: glance(open), ...(threadsOf(open).length === 1 ? { threadId: threadsOf(open)[0] } : {}), expiresAt: open.expiresAt } : null;
-    return { conversationId: this.conversationId, ...(state ? { state } : {}), agenda: this.agendaOf(all), receipts, pending, next: `${this.key}.${this.rev}` };
+    const reason = open ? faceIdReason(open) : null;
+    const pending = open ? { proposalId: open.id, text: glance(open), ...(reason ? { reason } : {}), ...(threadsOf(open).length === 1 ? { threadId: threadsOf(open)[0] } : {}), expiresAt: open.expiresAt, ...(open.fields.card ? { card: open.fields.card } : {}) } : null;
+    const draft = this.draft && now <= this.draft.expiresAt ? { draft: this.draft } : {};
+    return { conversationId: this.conversationId, ...(state ? { state } : {}), agenda: this.agendaOf(all), receipts, pending, held: this.held(), ...draft, next: `${this.key}.${this.rev}` };
+  }
+
+  /** The hold asked about by voice in this call (`heldAskedKey`), while its thread still holds it. */
+  private held(): HeldCard | null {
+    let asked: { itemId?: unknown; questionId?: unknown } | null = null;
+    try { asked = JSON.parse(this.deps.store.get(heldAskedKey(this.conversationId)) ?? "null"); } catch { return null; }
+    if (!asked || typeof asked.itemId !== "string") return null;
+    const item = this.deps.briefing.allItems().find((i) => i.id === asked!.itemId);
+    if (!item?.gate || item.questionId !== asked.questionId) return null;
+    const name = this.deps.briefing.names().get(item.id) ?? item.title;
+    return { itemId: item.id, questionId: item.questionId!, thread: name, command: item.gate.command, matched: item.gate.matched, since: item.gate.since, machine: item.machine ?? null };
   }
 
   /** The call's record, as it ended: the thread under way counts as covered. */
@@ -286,6 +343,8 @@ export class CallView {
         if (p.state === "cancelled" && p.result === KEPT) {
           return { id: p.id, at: p.createdAt, kind: "change", text: threadsOf(p).length === 1 ? "Kept your reply" : `Kept your reply to ${p.targets[0]?.handle ?? "the thread"}`, state: "kept", threads: threadsOf(p), done: { at: p.createdAt, outcome: "Reply kept", threads: threadsOf(p) } };
         }
+        // Set up for later (stage 4b; Fable's 4-A): "For 03:00 tomorrow · Quartz has it", or "· waiting for Quartz".
+        if (p.state === "scheduled") return { id: p.id, at: p.createdAt, kind: "change", text: this.scheduledText(p, now), state, threads: threadsOf(p), done: { at: p.createdAt, outcome: "Scheduled", threads: threadsOf(p) } };
         // A change tried says how it went (its receipt); one not carried out says what it was.
         const tried = done || p.state === "failed" || p.state === "unknown";
         return {
@@ -296,6 +355,24 @@ export class CallView {
     const all = [...this.lookups, ...changes].sort((a, b) => a.at - b.at);
     this.wordsFor(all);
     return all;
+  }
+
+  /** A scheduled change's line under "Scheduled": when it's for, and whether its computer has it, as its rule says now. */
+  private scheduledText(p: Proposal, now: number): string {
+    const row = this.deps.store.ruleRows().find((r) => r.id === `${LATER_PREFIX}${p.id}`);
+    let rule: unknown = null;
+    try {
+      rule = row ? JSON.parse(row.rule) : null;
+    } catch {}
+    // A chain's (4-J): "When Schema finishes", and only that while the brain watches its thread on another computer.
+    const when = p.fields.chain ? `When ${p.fields.chain.after.handle} finishes` : `For ${shownClock(p.fields.at ?? now, p.fields.tz ?? "UTC", now)}`;
+    if (!validLater(rule)) return when;
+    const t = rule.targets[0];
+    if (t.step?.cross && t.step.met === undefined) return when;
+    // The card names the computer only with more than one (its "On" row).
+    const named = !!p.fields.card?.rows.some((r) => r.label === "On") || p.action === "start_work" && !!p.fields.card?.rows.find((r) => r.label === "On")?.text.includes(" · ");
+    const machine = named ? t.machine : "your computer";
+    return `${when} · ${t.state === "pending" ? `waiting for ${machine}` : `${machine} has it`}`;
   }
 
   private carriedOutOf(p: Proposal): { at: number; threads: string[] } {

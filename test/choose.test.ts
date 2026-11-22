@@ -9,7 +9,7 @@ import { applyChoice, applyFlags, capsFor, choiceOf, defaultChoice, policyFields
 import { describeFound, detect, type Found } from "../src/agents.ts";
 import { allows, answers, ceilingFor, parsePolicy, steers } from "../src/policy.ts";
 import { drawList, listStep, marks, type ListState } from "../src/ui.ts";
-import { removeDir, SLOW, WINDOWS } from "./fixtures/platform.ts";
+import { NODE, removeDir, SLOW, WINDOWS } from "./fixtures/platform.ts";
 
 const found = (installed: Partial<Record<Found["agent"], boolean>>): Found[] =>
   (["claude", "codex", "pi", "opencode", "t3"] as const).map((agent) => ({
@@ -205,7 +205,7 @@ test("a command still running when detection stops waiting is found, version unk
   const installedMark = join(dir, "installed");
   writeFileSync(join(bin, "t3.mjs"), `import { writeFileSync } from "node:fs";\nsetTimeout(() => { writeFileSync(${JSON.stringify(installedMark)}, ""); console.log("t3 v0.1.11"); }, ${1500 * SLOW});\n`);
   if (WINDOWS) writeFileSync(join(bin, "t3.cmd"), `@ECHO off\r\nnode "%~dp0\\t3.mjs" %*\r\n`);
-  else writeFileSync(join(bin, "t3"), `#!/bin/sh\nexec "${process.execPath}" "${join(bin, "t3.mjs")}" "$@"\n`, { mode: 0o755 });
+  else writeFileSync(join(bin, "t3"), `#!/bin/sh\nexec "${NODE}" "${join(bin, "t3.mjs")}" "$@"\n`, { mode: 0o755 });
   const finished = async () => {
     for (let i = 0; i < 60 * SLOW && !existsSync(installedMark); i++) await new Promise((r) => setTimeout(r, 50));
     return existsSync(installedMark);
@@ -228,11 +228,11 @@ test("a short command that stops a slow --version isn't kept running by what tha
   const bin = join(dir, "bin");
   mkdirSync(bin);
   // A launcher that leaves its own child holding the output (as cmd.exe running T3's desktop app does on Windows).
-  writeFileSync(join(bin, "t3"), `#!/bin/sh\n"${process.execPath}" -e "setTimeout(() => {}, 8000)"\necho t3 v0.1.11\n`, { mode: 0o755 });
+  writeFileSync(join(bin, "t3"), `#!/bin/sh\n"${NODE}" -e "setTimeout(() => {}, 8000)"\necho t3 v0.1.11\n`, { mode: 0o755 });
   const env = { ...process.env, PATH: bin, CLAUDE_CONFIG_DIR: join(dir, "claude"), CODEX_HOME: join(dir, "codex"), PI_CODING_AGENT_DIR: join(dir, "pi"), XDG_DATA_HOME: join(dir, "data"), T3CODE_HOME: join(dir, "t3"), T3_CLI: "t3", GEMINI_CLI_HOME: join(dir, "gemini"), COPILOT_HOME: join(dir, "copilot") };
   const agents = new URL("../src/agents.ts", import.meta.url).href;
   const started = Date.now();
-  const r = spawnSync(process.execPath, ["--input-type=module", "-e", `const { detect } = await import(${JSON.stringify(agents)}); const f = (await detect(process.env, 200)).find((a) => a.agent === "t3"); console.log(JSON.stringify([f.installed, f.version]));`], { env, encoding: "utf8", timeout: 20_000 });
+  const r = spawnSync(NODE, ["--input-type=module", "-e", `const { detect } = await import(${JSON.stringify(agents)}); const f = (await detect(process.env, 200)).find((a) => a.agent === "t3"); console.log(JSON.stringify([f.installed, f.version]));`], { env, encoding: "utf8", timeout: 20_000 });
   assert.equal(r.stdout.trim(), "[true,null]", r.stderr);
   assert.ok(Date.now() - started < 6000, `exited ${Date.now() - started} ms after starting, not when the script's sleep ended`);
 });
@@ -247,4 +247,22 @@ test("the old Windows console gets marks its fonts have; Windows Terminal, VS Co
   assert.notEqual(old.cursor, unicode.cursor);
   assert.deepEqual(marks("win32", { WT_SESSION: "3f1c" }), unicode);
   assert.deepEqual(marks("win32", { TERM_PROGRAM: "vscode" }), unicode);
+});
+
+test("sends and starts for later: send until chosen, written only when chosen, and --later chooses without a terminal", () => {
+  const all = found({ claude: true });
+  assert.equal(defaultChoice(all).rules, "send", "starting threads later is turned on by hand, never offered on");
+  assert.equal(policyFields(defaultChoice(all)).rules, undefined, "a file stays as it was until its owner chooses");
+  assert.equal(parsePolicy(JSON.stringify({ ...base })).rules, "send", "every install, new or existing");
+  const start = applyFlags(defaultChoice(all), flags({ later: "start" }), all);
+  const written = applyChoice({ ...base, rules: "off" }, start);
+  assert.equal(written.rules, "start");
+  assert.equal(choiceOf(written).rules, "start");
+  assert.equal(parsePolicy(JSON.stringify(written)).rules, "start");
+  assert.equal(applyChoice(written, defaultChoice(all)).rules, undefined, "back to send: the field goes");
+  assert.throws(() => applyFlags(defaultChoice(all), flags({ later: "yes" }), all), /--later takes off, send, start/);
+  assert.throws(() => parsePolicy(JSON.stringify({ ...base, rules: "always" })), /rules must be one of off, send, start/);
+  assert.equal(summary(start, all).at(-1), "What you set up for later in a call, it sends or starts at its time, from this computer.");
+  assert.equal(summary(defaultChoice(all), all).at(-1), "What you set up for later in a call, it sends at its time, from this computer.");
+  assert.ok(!summary({ ...defaultChoice(all), rules: "off" }, all).some((l) => l.includes("later")));
 });

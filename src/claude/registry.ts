@@ -31,9 +31,23 @@ export function parsePsStart(text: string): number | null {
   const at = Date.parse(`${value} UTC`);
   return Number.isFinite(at) ? at : null;
 }
-const ps = (pid: number, field: string) => execFileSync("ps", ["-o", `${field}=`, "-p", String(pid)], {
-  encoding: "utf8", timeout: 1000, env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
-});
+/** `ps -ax -o pid=,lstart=,comm=`'s lines as each pid's start (ps's lstart, as UTC) and command. */
+export function parseDarwinPs(text: string): Map<number, { lstart: string; comm: string }> {
+  const out = new Map<number, { lstart: string; comm: string }>();
+  for (const line of text.split("\n")) {
+    const m = /^\s*(\d+)\s+([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.*)$/.exec(line);
+    if (m) out.set(Number(m[1]), { lstart: m[2]!, comm: m[3]!.trim() });
+  }
+  return out;
+}
+/** On macOS, each process's start and command: one `ps` for every pid, kept for a couple of seconds (`listing`). */
+export type DarwinProcOf = (pid: number) => { lstart: string; comm: string } | null | undefined;
+const darwinPs = () => {
+  try {
+    return execFileSync("ps", ["-axww", "-o", "pid=,lstart=,comm="], { encoding: "utf8", timeout: 3000, env: { ...process.env, LC_ALL: "C", TZ: "UTC" }, maxBuffer: 16 * 1024 * 1024 });
+  } catch { return null; }
+};
+const darwinProcs: DarwinProcOf = listing(darwinPs, parseDarwinPs);
 export function darwinIdentity(command: string, lstart: string, start: string | null, startedAt?: unknown): "dead" | "verified" | "unverified" {
   // `comm` is the process's title where it sets one: Claude Code's background sessions show `claude bg-spare`.
   if (!/^(claude|node|nodejs)(?:$|[-.\s])/.test(basename(command.trim()))) return "dead";
@@ -67,13 +81,20 @@ export type ImageOf = (pid: number) => string | null | undefined;
  * for a minute: each try holds the connector up.
  */
 export function processImages(list: () => string | null, ttlMs = 2000): ImageOf {
-  let last: { at: number; images: Map<number, string> | null } | null = null;
-  const fresh = () => { const out = list(); last = { at: Date.now(), images: out === null ? null : parseTasklist(out) }; return last.images; };
+  return listing(list, parseTasklist, ttlMs);
+}
+/**
+ * One listing of every process (`list`, read by `parse`), kept for `ttlMs`, as each pid's entry: null when it has none,
+ * undefined when the listing failed. A pid it doesn't have is listed again first; one that fails waits a minute.
+ */
+export function listing<T>(list: () => string | null, parse: (text: string) => Map<number, T>, ttlMs = 2000, now = Date.now): (pid: number) => T | null | undefined {
+  let last: { at: number; rows: Map<number, T> | null } | null = null;
+  const fresh = () => { const out = list(); last = { at: now(), rows: out === null ? null : parse(out) }; return last.rows; };
   return (pid) => {
-    const kept = last && Date.now() - last.at < (last.images ? ttlMs : 60_000) ? last.images : undefined;
-    let images = kept === undefined ? fresh() : kept;
-    if (kept && !kept.has(pid)) images = fresh();
-    return images ? images.get(pid) ?? null : undefined;
+    const kept = last && now() - last.at < (last.rows ? ttlMs : 60_000) ? last.rows : undefined;
+    let rows = kept === undefined ? fresh() : kept;
+    if (kept && !kept.has(pid)) rows = fresh();
+    return rows ? rows.get(pid) ?? null : undefined;
   };
 }
 const tasklist = () => {
@@ -91,11 +112,12 @@ const CLAUDE_IMAGES = ["claude.exe", "node.exe", "bun.exe"];
  * start ticks on Linux, ps's start on macOS, and on Windows only its image name (`win32:claude.exe`), the same minimum
  * macOS accepts. /proc's command name can contain spaces and parentheses: split after its final closing parenthesis.
  */
-export function procStart(pid: number, platform = process.platform, imageOf: ImageOf = windowsImages): string | null {
+export function procStart(pid: number, platform = process.platform, imageOf: ImageOf = windowsImages, darwinOf: DarwinProcOf = darwinProcs): string | null {
   try {
     if (platform === "win32") { const image = imageOf(pid); return image ? `win32:${image}` : null; }
     if (platform === "darwin") {
-      const at = parsePsStart(ps(pid, "lstart"));
+      const p = darwinOf(pid);
+      const at = p ? parsePsStart(p.lstart) : null;
       return at === null ? null : `darwin:${at}`;
     }
     const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -118,7 +140,7 @@ const bootAt = () => (boot = Math.min(boot, Date.now() - uptime() * 1000));
  * clock), and is gone. A pid there that refuses the check (EPERM) is "foreign": a Claude Code run as administrator, or
  * another account's process, which may hold its session but whose state and inbox the connector can't use.
  */
-export function holderState(pid: number, start: string | null, platform = process.platform, startedAt?: unknown, imageOf: ImageOf = windowsImages): "dead" | "verified" | "unverified" | "foreign" {
+export function holderState(pid: number, start: string | null, platform = process.platform, startedAt?: unknown, imageOf: ImageOf = windowsImages, darwinOf: DarwinProcOf = darwinProcs): "dead" | "verified" | "unverified" | "foreign" {
   let refused = false;
   try { process.kill(pid, 0); }
   catch (e) { const code = (e as NodeJS.ErrnoException).code; if (code === "ESRCH") return "dead"; refused = code === "EPERM"; }
@@ -130,8 +152,9 @@ export function holderState(pid: number, start: string | null, platform = proces
     return refused ? "foreign" : image === undefined ? "unverified" : "verified";
   }
   if (platform === "darwin") {
-    try { return darwinIdentity(ps(pid, "comm"), ps(pid, "lstart"), start, startedAt); }
-    catch { return "unverified"; }
+    // Not in the listing (it ended just now, or ps couldn't say): as when ps refused to answer for it.
+    const p = darwinOf(pid);
+    return p ? darwinIdentity(p.comm, p.lstart, start, startedAt) : "unverified";
   }
   if (platform !== "linux" || !start) return "unverified";
   const actual = procStart(pid);
@@ -142,8 +165,8 @@ export function holderState(pid: number, start: string | null, platform = proces
  * holderState, for the connector's own processes and the runs it started: those answer the check, so on Windows one
  * that refuses it is a later process given the pid, perhaps another account's, and is gone.
  */
-export function pidState(pid: number, start: string | null, platform = process.platform, startedAt?: unknown, imageOf: ImageOf = windowsImages): "dead" | "verified" | "unverified" {
-  const state = holderState(pid, start, platform, startedAt, imageOf);
+export function pidState(pid: number, start: string | null, platform = process.platform, startedAt?: unknown, imageOf: ImageOf = windowsImages, darwinOf: DarwinProcOf = darwinProcs): "dead" | "verified" | "unverified" {
+  const state = holderState(pid, start, platform, startedAt, imageOf, darwinOf);
   return state === "foreign" ? "dead" : state;
 }
 

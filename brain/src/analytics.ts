@@ -46,7 +46,10 @@ export type Consent = { off: boolean; explicit: boolean; seq: number };
 export type Ticket = { arrival: number; seq: number };
 
 /**
- * An account's analytics consent (contracts §5), one per account object, made before anything else in it. Changed only
+ * An account's analytics consent (contracts §5), one per account object, made before anything else in it: whether the
+ * account's own server-side events go (legitimate interest, docs/launch/analytics-consent.md). The phone's own
+ * analytics are asked for on the phone and never change it: today's apps send only an id while they share, and
+ * `share: true` on a yes. An older app's Settings switch, saying off, still does; so does staff's `object()`. Changed only
  * synchronously, as each request arrives (never after an await, so a request that started earlier can't land later),
  * and read by `Analytics.track` when each event is recorded.
  *
@@ -55,6 +58,7 @@ export type Ticket = { arrival: number; seq: number };
  * - `PUT /api/analytics`: `next()` as it arrives, then `set(share, ticket)` once its body is read, which counts only if
  *   nothing changed in between (an `off` from any request, or a later `PUT`).
  * - `adopt(off, seq)`: what the account's brain says, in its Demo object; an older one is ignored.
+ * - `object()`: the user objected by email, and staff marked the account in Clerk (`public_metadata.driver.analytics`).
  *
  * `seq` moves on with every change; `onChange` is told after each, to keep the latest or pass it on.
  */
@@ -92,6 +96,11 @@ export class ConsentHolder {
     if (ticket.arrival !== this.arrivals || ticket.seq !== this.seq) return false;
     this.change(!share, true);
     return true;
+  }
+
+  /** The user objected (staff's Clerk label `analytics: "off"`): off, as an older app's switch would say, kept and passed on. */
+  object() {
+    if (!this.off || !this.explicit) this.change(true, true);
   }
 
   /** The account's consent as its brain passed it on: each change has its own number, so one not newer is old news. */

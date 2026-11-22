@@ -14,6 +14,7 @@ import type { Action, Adapter, CodingModel, FirstAsk, PastReply, Place, Receipt,
 import { allows, answers, ceilingFor, steers, visible, withinCeiling, RUNTIME_MODES, type Policy, type RuntimeMode } from "../policy.ts";
 import { talk, type Question } from "../pi/bridge.ts";
 import { answersFor } from "../claude/adapter.ts";
+import type { ThreadDocContext } from "../documents.ts";
 import { addWorktree, firstAsk, folderOf, gitRoot, group } from "../work.ts";
 import { Store } from "../claude/store.ts";
 import { pidState, procStart } from "../claude/registry.ts";
@@ -26,6 +27,8 @@ import { NOT_STARTED } from "./turn.ts";
 /** One session as a source read it. */
 export type Found = {
   id: string; cwd: string; title: string | null; createdAt: string | null; mtimeMs: number;
+  /** The agent's own session folder (Copilot session-state/<id>, Gemini tmp/<project>), if any. */
+  sessionDir?: string;
   projection: Projection;
   /** The user has said something in it (agents leave files for sessions never started). */
   started: boolean;
@@ -287,6 +290,11 @@ export class AcpAdapter implements Adapter {
     const row = this.rows.get(id);
     if (!row || !visible(this.opts.policy, row.found.cwd)) throw new Error("That session isn't visible to 10 & 2.");
     return row;
+  }
+  docContext(id: string): ThreadDocContext | null {
+    const row = this.rows.get(id);
+    if (!row || !visible(this.opts.policy, row.found.cwd)) return null;
+    return { agent: this.source.agent, cwd: row.found.cwd, projectRoot: gitRoot(row.found.cwd) ?? row.found.cwd, sessionDir: row.found.sessionDir ?? null };
   }
   async report(id: string): Promise<Report> {
     this.fresh();

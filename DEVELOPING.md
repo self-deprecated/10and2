@@ -4,10 +4,11 @@ This repository is the source of the `10and2` npm package: the connector for [10
 exported from Self-Deprecated's own repository at each release, where the connector is tested against the service it
 talks to; changes are made there and arrive here as one commit per version.
 
-- `npm ci && npm run check`: types, tests, the bundles (`dist/10and2.js`, and `dist/brain/main.js` from `brain/`) and a smoke test of them. Node 22.13 or newer.
+- `npm ci && npm run check:node`: types, tests, the bundles (`dist/10and2.js`, and `dist/brain/main.js` from `brain/`) and a smoke test of them, with Node's own tools. Node 22.13 or newer.
+- `bun ci && bun run check`: the same with Bun's (`bun check`, `bun test`; Bun 1.4.4), as Self-Deprecated's repository runs it; the smoke test still runs on Node. `package-lock.json` is the lockfile for both: change a dependency with `npm install`.
 - `nix build` (or `nix run . -- help`): the same bundle on Node 24. `nix develop` for a shell with Node.
-- CI (`.github/workflows/ci.yml`), on every push and pull request: `npm run check` on Linux, macOS and Windows with Node 22 and 24, the built package on Node 22.13, and `nix run . -- version` on Linux and macOS.
+- CI (`.github/workflows/ci.yml`), on every push and pull request: `npm run check:node` on Linux, macOS and Windows with Node 22 and 24, the built package on Node 22.13, and `nix run . -- version` on Linux and macOS.
 - `src/contract.ts`: the types the connector shares with the service.
-- Publishing: `npm publish` from a clean checkout of a release tag (`prepublishOnly` runs the check).
+- Publishing: `npm publish` from a clean checkout of a release tag (`prepublishOnly` runs `check:node`).
 
 Source-available, not open source: see [LICENSE](LICENSE).

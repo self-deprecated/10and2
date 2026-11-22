@@ -1,7 +1,7 @@
 {
   "name": "10and2",
   "type": "module",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "The connector for 10 & 2: lets you talk to the coding agents on your computer (Claude Code, Codex, Copilot CLI, Gemini CLI, Cursor, OpenCode, Pi, T3 Code) from the 10 & 2 iPhone app.",
   "keywords": [
     "10and2",
@@ -46,15 +46,20 @@
   "scripts": {
     "start": "node src/main.ts run",
     "build": "node build.mjs",
-    "test": "node --test --test-timeout=120000 --test-force-exit test/*.test.ts",
+    "test": "bun test --timeout=120000 --parallel=8 ./test/*.test.ts",
     "test:harness": "bash test/harness/run.sh",
-    "typecheck": "tsc --noEmit",
-    "check": "tsc --noEmit && node --test --test-timeout=120000 --test-force-exit test/*.test.ts && npm run build && node test/smoke.mjs",
-    "prepublishOnly": "npm run check"
+    "typecheck": "bun check --no-script",
+    "precheck": "bun -e \"if (Bun.semver.order(Bun.version, '1.4.3') < 0) { console.error('needs Bun 1.4.3 or later, not ' + Bun.version + ': one before it has no bun check, so this check would run itself forever'); process.exit(1) }\"",
+    "check": "bun check --no-script && bun test --timeout=120000 --parallel=8 ./test/*.test.ts && bun run build && node test/smoke.mjs",
+    "check:node": "tsc --noEmit && node --test --test-concurrency=8 --test-timeout=120000 --test-force-exit test/*.test.ts && npm run build && node test/smoke.mjs",
+    "prepublishOnly": "npm run check:node"
   },
   "allowScripts": {
     "esbuild": true
   },
+  "trustedDependencies": [
+    "esbuild"
+  ],
   "devDependencies": {
     "@types/node": "^26.6.4",
     "@types/ws": "^8.18.2",

@@ -2,3 +2,6 @@ node_modules/
 dist/
 result
 *.tgz
+# package-lock.json is the lockfile; bun ci would read one of these instead.
+bun.lock
+bun.lockb

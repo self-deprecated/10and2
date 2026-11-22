@@ -14,10 +14,17 @@ import { modelKey } from "../util.ts";
 import type { Live } from "./registry.ts";
 import { Transcript, projectFolder, t3Cwd, typedUser } from "./transcript.ts";
 import { Store } from "./store.ts";
+import type { ThreadDocContext } from "../documents.ts";
 import { firstAsk, folderOf, gitRoot, group } from "../work.ts";
+import { ANSWERED, choicesOf, goAhead } from "../util.ts";
+/** Kept here too, where the tests and Codex found it before it moved (util.ts). */
+export { goAhead };
+import type { Write } from "../typed.ts";
+import type { How } from "../local.ts";
 import { attestedMode, envelope, heldFor, peerToken, post } from "./inbox.ts";
 import { execFileCommand, spawnCommand, which } from "../command.ts";
 import { proof, randomHex, replaceFile } from "../util.ts";
+import { GATE_NOT_ALLOWED, GATE_NOT_SHOWN, GATE_ONE_AT_A_TIME, type GateClaim, gateOf, gateRefusal, gateReport, Gates, type HeldSummary, NOT_ANSWERING, stopGate } from "../gate.ts";
 import { asked } from "./transcript.ts";
 import type { Asked } from "./transcript.ts";
 import type { Socket } from "node:net";
@@ -39,6 +46,14 @@ export type Options = {
   hookSocketPath?: string;
   /** False keeps starts and follow-ups headless (`claude -p`) even where background sessions are available. */
   background?: boolean;
+  /** Commands that wait: where a held command of a session this adapter doesn't list may be held instead (a T3 Code thread's). */
+  claimGate?: GateClaim;
+  /** Commands that wait: a command on the list of a session nobody shows was stopped at once (status counts them). */
+  onUnheld?: () => void;
+  /** Commands that wait: what's held here changed (status.json). */
+  onHolds?: (held: HeldSummary[]) => void;
+  /** Tests: how long a hold waits before the agent is told no (gate.ts `GATE_MS`). */
+  gateMs?: number;
 };
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 export function sessionForKey(key: string): string {
@@ -81,15 +96,15 @@ const NOT_DELIVERED = "That session didn't take the message. 10 & 2 won't send i
 const NO_KEY = "That session wouldn't take a message from 10 & 2, so nothing was sent. Try reopening it in Claude Code.";
 const NOT_INSTALLED = "Claude couldn't be started. Check that it's installed on this machine.";
 const AWAITING_OK = "It's waiting for your OK in that session's terminal. 10 & 2 won't send it again.";
+/** Claude Code's own questions to the user: its question tool, and its plan's "go ahead?" (hooks.ts holds both). */
+const ASKING = ["AskUserQuestion", "ExitPlanMode"];
+/** An answer to one question (a tap) the hook no longer holds: sent, it would be a message, and leave the question open. */
+const NOT_HELD = "It's asking in its terminal now, where 10 & 2 can't answer it. Answer it there.";
 /**
  * An open AskUserQuestion that 10 & 2's PermissionRequest hook is holding for Driver (hooks.ts): the terminal shows the
  * question meanwhile, and whichever answers first wins. The hook gets the answers as one JSON line, then exits.
  */
 type Ask = { socket: Socket; heldAt: string } & ({ questions: Asked[]; plan?: undefined } | { plan: string; questions?: undefined });
-/** Words that let a plan go ahead as it is: a short yes, with nothing asking for a change. */
-export const goAhead = (words: string) => words.trim().length <= 60
-  && /^(yes|yeah|yep|yup|sure|ok|okay|go|go ahead|do it|approve|approved|proceed|sounds good|looks good|ship it|that works|go for it|let's go|start)\b/i.test(words.trim())
-  && !/\b(but|except|change|instead|first|wait|don't|not)\b/i.test(words);
 /**
  * The answer to each question from the user's words: an option whose label they said (every one, for a multi-select),
  * or else their words themselves, which Claude Code takes as a typed-in answer.
@@ -101,7 +116,9 @@ export function answersFor(questions: Asked[], words: string): Record<string, st
   const out: Record<string, string> = {};
   for (const q of questions) {
     const named = q.options.filter((o) => plain(o).trim() !== "" && said.includes(plain(o)));
-    const exact = q.options.find((o) => plain(o) === said);
+    // An option's own label first (a tap sends one), so "C#" isn't taken for "C++", which reads the same once its
+    // punctuation is dropped.
+    const exact = q.options.find((o) => o === words.trim()) ?? q.options.find((o) => plain(o) === said);
     out[q.question] = exact ?? (q.multiSelect && named.length ? named.join(", ") : named.length === 1 ? named[0]! : words);
   }
   return out;
@@ -182,6 +199,8 @@ export function listClaudeModels(command: string[], env: NodeJS.ProcessEnv, cwd:
 
 export class ClaudeAdapter implements Adapter {
   readonly name = "claude";
+  /** It reads its threads' test runs (`Report.checks`, docs/launch/engine.md §11 stage 3.10). */
+  readonly readsChecks = true;
   readonly actions = ["follow_up", "settle", "snooze", "archive", "start_work", "unsnooze", "unsettle"] as const;
   readonly configDir: string;
   readonly socketPath: string;
@@ -215,6 +234,8 @@ export class ClaudeAdapter implements Adapter {
   private background = false;
   /** Open AskUserQuestions held by the hook, by session. */
   private asks = new Map<string, Ask>();
+  /** Commands on this computer's list held by the PreToolUse hook (gate.ts), by session: one at a time each. */
+  private readonly gates: Gates;
   /** Transcripts left out on their first records, by path, with the inode they had (a new file is read again). */
   private skipped = new Map<string, number | bigint>();
   /** What a new session can start on (`claudeModels`), as Claude Code last said. */
@@ -224,6 +245,12 @@ export class ClaudeAdapter implements Adapter {
   private modelsRetry = 0;
   /** Stops a models read under way when the adapter closes. */
   private readonly stopping = new AbortController();
+  /**
+   * Sends that went a way Claude Code never records as a person's prompt (`sendLeftOut`): its inbox (another session's
+   * message), the hook's answer (a tool's result), a headless run (`promptSource` "sdk"). A background session's prompt
+   * (`claude --bg`) is recorded as typed, so it isn't one: the Ledger's row is what leaves it out.
+   */
+  private unwritten = new Set<string>();
 
   constructor(opts: Options) {
     this.opts = opts; this.now = opts.now ?? Date.now;
@@ -231,6 +258,9 @@ export class ClaudeAdapter implements Adapter {
     this.socketPath = opts.hookSocketPath ?? (process.platform === "win32" ? `\\\\.\\pipe\\10and2-hooks-${randomBytes(16).toString("hex")}`
       : join(process.env.XDG_RUNTIME_DIR ? join(process.env.XDG_RUNTIME_DIR, "10and2") : opts.stateDir, "hooks.sock"));
     this.store = new Store(opts.db);
+    this.gates = new Gates({ log: (m) => opts.log(`claude: ${m}`), now: this.now, timeoutMs: opts.gateMs,
+      // Scanned at once (not on the debounce), so the view says it's held, or no longer, the moment it changes.
+      changed: () => { this.opts.onHolds?.(this.gates.summary()); if (!this.closing && this.loaded) this.safeScan(); } });
   }
 
   async start(): Promise<void> {
@@ -275,7 +305,11 @@ export class ClaudeAdapter implements Adapter {
     const output = (flag: string) => new Promise<string>((resolve) => {
       let command: [string, string[]];
       try { command = this.claude([flag]); } catch { resolve(""); return; }
-      execFileCommand(...command, { timeout, maxBuffer: 1024 * 1024, env: this.childEnv() }, (err, stdout) => resolve(err ? "" : stdout));
+      execFileCommand(...command, { timeout, maxBuffer: 1024 * 1024, env: this.childEnv() }, (err, stdout) => {
+        // Said, since it turns worktrees and background sessions off until the connector starts again.
+        if (err) this.opts.log(`claude: \`claude ${flag}\` failed (${(err as NodeJS.ErrnoException).code ?? ((err as { killed?: boolean }).killed ? "timed out" : err.message.split("\n")[0])})`);
+        resolve(err ? "" : stdout);
+      });
     });
     const [version, help] = await Promise.all([output("--version"), output("--help")]);
     // Headless worktrees were measured starting at 2.1.310; require the flag as well.
@@ -359,7 +393,7 @@ export class ClaudeAdapter implements Adapter {
       if (!reader) {
         // Most transcripts are other programs' (T3's, headless runs, SDK apps), and some are hundreds of MB. Their
         // first records say so, so a new one is read that far first, and no further if it's left out.
-        reader = new Transcript(path, this.opts.log);
+        reader = new Transcript(path, this.opts.log, this.opts.policy.checks);
         reader.read(HEAD_BYTES);
         if (this.leftOut(reader, basename(path, ".jsonl"))) {
           try { this.skipped.set(path, statSync(path).ino); } catch { /* gone: the next scan drops it */ }
@@ -384,12 +418,13 @@ export class ClaudeAdapter implements Adapter {
       if (entrypoint?.startsWith("sdk-") && !this.store.startedByDriver(id)) continue;
       const overlay = this.store.overlay(id);
       if (overlay.archived) continue;
-      const pending = !t.unknown && holders.some((l) => l.status === "waiting");
-      const busy = !t.unknown && holders.some((l) => l.status === "busy");
+      const gate = this.gates.get(id);
+      const pending = !!gate || (!t.unknown && holders.some((l) => l.status === "waiting"));
+      const busy = !t.unknown && (holders.some((l) => l.status === "busy") || (!holders.length && !!this.store.run(id)?.pid));
       const liveAt = holders.map((l) => l.statusUpdatedAt).filter((x): x is string => x !== null).sort().at(-1);
       const updatedAt = [t.updatedAt, liveAt].filter((x): x is string => !!x).sort().at(-1) ?? t.mtime;
       if (!holders.length && !this.store.run(id) && Date.parse(updatedAt) < cutoff) continue;
-      const questionId = pending ? t.tool?.id ?? hash(id + (liveAt ?? "waiting")) : null;
+      const questionId = gate ? gate.id : pending ? t.tool?.id ?? hash(id + (liveAt ?? "waiting")) : null;
       const newer = (at: string | null) => !!at && !!t.lastRunAt && t.lastRunAt > at;
       const item: WorkItem = {
         id, title: t.title ?? holders.find((l) => l.name)?.name ?? `a Claude session in ${group(cwd)}`, group: group(cwd),
@@ -397,6 +432,10 @@ export class ClaudeAdapter implements Adapter {
         updatedAt, settled: !!overlay.settledAt && !newer(overlay.settledAt),
         snoozedUntil: overlay.snoozedUntil && Date.parse(overlay.snoozedUntil) > this.now() && !pending && !newer(overlay.snoozedAt) ? overlay.snoozedUntil : null,
         parentId: null, pendingQuestion: pending, questionId, lastRunAt: t.lastRunAt, wroteAt: t.wroteAt, createdAt: t.createdAt,
+        // Asking the user (a question, a plan to go ahead with), or waiting for a tool's permission; unknown otherwise,
+        // as when the last tool has its result (Claude Code writes a question's call only once it's answered).
+        ...(gate ? { gate: gateOf(gate) } : !pending ? {} : this.asks.has(id) || t.asking || (t.tool && !t.tool.done && ASKING.includes(t.tool.name)) ? { questionKind: "input" as const }
+          : t.tool && !t.tool.done ? { questionKind: "approval" as const } : {}),
       };
       next.set(id, { transcript: t, cwd, live: holders, item });
     }
@@ -404,7 +443,8 @@ export class ClaudeAdapter implements Adapter {
     const changed: string[] = []; let urgent = false;
     for (const [id, row] of next) {
       const w = row.item, reply = row.transcript.reply;
-      const key = JSON.stringify([w.status, w.title, w.settled, w.snoozedUntil, w.questionId, w.lastRunAt, reply?.messageId, reply?.text]);
+      // Whether the hook holds its question too: that's when its report has choices.
+      const key = JSON.stringify([w.status, w.title, w.settled, w.snoozedUntil, w.questionId, w.questionKind, this.asks.has(id), w.lastRunAt, reply?.messageId, reply?.text]);
       if (this.keys.get(id) !== key) {
         changed.push(id);
         urgent ||= w.pendingQuestion && this.questions.get(id) !== w.questionId;
@@ -476,18 +516,36 @@ export class ClaudeAdapter implements Adapter {
       activeAt: [...this.rows.values()].filter((r) => { const g = gitRoot(r.cwd); return g !== null && placeId(g) === id; }).map((r) => r.item.updatedAt).sort().at(-1) ?? null, models: this.models }));
   }
   async list(): Promise<WorkItem[]> { this.fresh(); return [...this.rows.values()].map((r) => ({ ...r.item })); }
+  /** What a person typed in a session, as its transcript says (transcript.ts `personWrote`): `WorkItem.typed`. */
+  personWrites(id: string): Write[] { return this.rows.get(id)?.transcript.writes ?? []; }
+  /** Whether send `key` went a way never recorded as a person's prompt (`unwritten`); asked once, after it went. */
+  sendLeftOut(_action: Action, key: string): boolean { return this.unwritten.delete(key); }
   private row(id: string): Row {
     const row = this.rows.get(id);
     if (!row || !visible(this.opts.policy, row.cwd)) throw new Error("That session isn't visible to 10 & 2.");
     return row;
   }
+  docContext(id: string): ThreadDocContext | null {
+    const row = this.rows.get(id);
+    if (!row || !visible(this.opts.policy, row.cwd)) return null;
+    return { agent: "claude", cwd: row.cwd, projectRoot: gitRoot(row.cwd) ?? row.cwd, extraPaths: row.transcript.writtenDocs };
+  }
   async report(id: string): Promise<Report> {
-    this.fresh(); const r = this.row(id), t = r.transcript, last = t.reply;
+    this.fresh(); const r = this.row(id), t = r.transcript, last = t.reply, held = this.asks.get(id);
+    // A held command: what it would run and since when (Commands that wait). 10 & 2 never allows it itself.
+    const gate = this.gates.get(id);
+    if (gate) return gateReport(gate, { text: last?.text ?? "", progress: null, reply: last ? { runId: last.runId, messageId: last.messageId, at: last.at } : null });
     return { text: last?.text ?? "", progress: r.item.status === "running" ? t.progress : null,
-      question: this.asks.get(id)?.plan ? `Claude has a plan ready and asks whether to go ahead with it: ${this.asks.get(id)!.plan!.slice(0, 3000)}`
-        : r.item.pendingQuestion || this.asks.has(id) ? (this.asks.get(id)?.questions ?? t.asking) ? (this.asks.get(id)?.questions ?? t.asking)!.map((q) => `${q.question}${q.options.length ? ` Options: ${q.options.join(" / ")}.` : ""}`).join(" ")
+      question: held?.plan ? `Claude has a plan ready and asks whether to go ahead with it: ${held.plan.slice(0, 3000)}`
+        : r.item.pendingQuestion || held ? (held?.questions ?? t.asking) ? (held?.questions ?? t.asking)!.map((q) => `${q.question}${q.options.length ? ` Options: ${q.options.join(" / ")}.` : ""}`).join(" ")
         : t.tool ? `wants to run ${t.tool.name}` : "Claude needs your input in its terminal." : null,
-      reply: last ? { runId: last.runId, messageId: last.messageId, at: last.at } : null };
+      // Only a question the hook holds: its answer selects an option. One only the terminal has (no hook, or a connector
+      // restarted since it asked) would take a tap as a message to its inbox, and leave the question open.
+      choices: held?.questions ? choicesOf(held.questions) : null,
+      reply: last ? { runId: last.runId, messageId: last.messageId, at: last.at } : null,
+      // What the reply's run ran of its checks, from its commands' exit codes, and the run still going's so far (stage 3.10).
+      ...(last && t.checksOf(last) ? { checks: t.checksOf(last) } : {}),
+      ...(r.item.status === "running" && t.soFar ? { running: t.soFar, ...(t.runId ? { runningId: t.runId } : {}), ...(t.wroteAt ? { runningSince: t.wroteAt } : {}) } : {}) };
   }
   async replies(id: string): Promise<PastReply[]> { this.fresh(); return this.row(id).transcript.replies().map((r) => ({ ...r })); }
   /** Read from the transcript's start, so it's complete. */
@@ -519,13 +577,23 @@ export class ClaudeAdapter implements Adapter {
     const row = this.rows.get(action.itemId);
     if (!row) return "That session isn't visible to 10 & 2.";
     if (action.kind === "snooze" && !iso(action.until)) return "That snooze time isn't valid.";
+    // A tap answers the question it was for, as this scan sees it, and only through the hook holding it. Execute's last
+    // preflight is this, just before the route is chosen.
+    // A held command: words that would let it run are refused (only the release path can), as is a tap on an earlier
+    // one; any other words stop it (`execute`).
+    const gate = action.kind === "follow_up" ? this.gates.get(action.itemId) : undefined;
+    if (gate && action.kind === "follow_up") return gateRefusal(gate, action);
+    if (action.kind === "follow_up" && action.questionId !== undefined) {
+      if (row.item.questionId !== action.questionId) return ANSWERED;
+      if (!this.asks.has(action.itemId)) return NOT_HELD;
+    }
     if (action.kind === "follow_up") return this.followUpRefusal(action.itemId, row, registrySnapshot(this.configDir, this.opts.log).uncertain);
     return null;
   }
   private followUpRefusal(id: string, row: Row, holdersUncertain: boolean): string | null {
     // A question Claude asked that the hook holds takes the answer; a live session (a terminal, a background session,
-    // Driver's own run) takes the message in its inbox, between steps or as its next turn.
-    if (this.asks.has(id)) return null;
+    // Driver's own run) takes the message in its inbox, between steps or as its next turn. A held command takes its words.
+    if (this.asks.has(id) || this.gates.has(id)) return null;
     if (row.live.length) return !steers(this.opts.policy, "claude") ? NO_STEERING : row.live.some((l) => l.socket) ? null : unreachable(row.live);
     if (this.store.run(id)) return "10 & 2 is already running that session, or can't yet verify that its previous run ended.";
     if (holdersUncertain) return "10 & 2 can't verify whether a terminal holds that session right now.";
@@ -545,7 +613,7 @@ export class ClaudeAdapter implements Adapter {
     return out;
   }
 
-  async execute(action: Action, key: string): Promise<Receipt> {
+  async execute(action: Action, key: string, how?: How): Promise<Receipt> {
     if (this.closed || this.closing) return { ok: false, error: "Claude adapter is closed." };
     const digest = hash(JSON.stringify(action));
     const prior = this.store.operation(key);
@@ -560,20 +628,23 @@ export class ClaudeAdapter implements Adapter {
     if (action.kind !== "follow_up" && action.kind !== "start_work") {
       const receipt = this.store.completeOverlay(key, digest, action.itemId, action.kind,
         new Date(this.now()).toISOString(), action.kind === "snooze" ? action.until : undefined);
-      if (!receipt) return this.execute(action, key);
+      if (!receipt) return this.execute(action, key, how);
       this.scan(); return receipt;
     }
     const id = action.kind === "start_work" ? sessionForKey(key) : action.itemId;
     // Re-read after the asynchronous preflight. Claude itself does not lock out terminal holders.
     const holders = registrySnapshot(this.configDir, this.opts.log);
     if (action.kind === "follow_up") {
+      if (this.gates.has(id)) return this.tracked(this.stopHeld(action, key, digest));
       const ask = this.asks.get(id);
       if (ask) return this.tracked(this.answer(action, key, digest, ask));
+      // Never a message in a tap's place.
+      if (action.questionId !== undefined) return { ok: false, error: NOT_HELD };
       const live = holders.live.filter((l) => l.sessionId === id);
       // The most recently active holder with an inbox: usually the terminal the user has open.
       const target = live.filter((l) => l.socket).sort((a, b) => (b.statusUpdatedAt ?? "").localeCompare(a.statusUpdatedAt ?? ""))[0];
       if (live.length && !steers(this.opts.policy, "claude")) return { ok: false, error: NO_STEERING };
-      if (target) return this.tracked(this.message(action, key, digest, target));
+      if (target) return this.tracked(this.message(action, key, digest, target, how));
       if (live.length) return { ok: false, error: unreachable(live) };
     }
     const held = holders.live.filter((l) => l.sessionId === id);
@@ -603,13 +674,14 @@ export class ClaudeAdapter implements Adapter {
    * inbox. It counts as sent once Claude Code queues it (its transcript's `enqueue` with these exact words) or records
    * it as a turn (a user record with this message's id). One it holds for the user's approval says so.
    */
-  private async message(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string, target: Live): Promise<Receipt> {
+  private async message(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string, target: Live, how?: How): Promise<Receipt> {
     const earlier = this.reserve(key, digest);
     if (earlier) return earlier;
+    this.unwritten.add(key);
     const id = action.itemId, row = this.rows.get(id);
     const sessionMode = row?.transcript.permissionMode ?? null;
     const mode = attestedMode(sessionMode, ceilingFor(this.opts.policy, "claude"));
-    const content = envelope(action.message, mode), uuid = randomUUID();
+    const content = envelope(action.message, mode, how?.scheduled), uuid = randomUUID();
     let path = row?.transcript.path || this.transcriptOf(id, target.cwd);
     let baseline = 0;
     try { if (path) baseline = statSync(path).size; } catch { /* No transcript yet: everything in it is new. */ }
@@ -635,10 +707,30 @@ export class ClaudeAdapter implements Adapter {
     return this.store.finish(key, { ok: false, unknown: true, error: held ? AWAITING_OK : NOT_DELIVERED });
   }
 
+  /**
+   * Words for a held command's thread (`preflight` refused any that would let it run): it's stopped, and the agent is
+   * told them as the reason (gate.ts `gateSaid`). Never a message in the inbox.
+   */
+  private async stopHeld(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string): Promise<Receipt> {
+    const earlier = this.reserve(key, digest);
+    if (earlier) return earlier;
+    this.unwritten.add(key);
+    const passed = await this.gates.stopWith(action.itemId, action.message);
+    return this.store.finish(key, passed ? { ok: true } : { ok: false, unknown: true, error: "That command may have been answered in its terminal already. 10 & 2 won't send it again." });
+  }
+
+  /** Answers a held command from the release path (`answer_hold`): only that hold, while it's held. */
+  async answerHold(id: string, questionId: string, run: boolean): Promise<Receipt> {
+    if (this.closed || this.closing) return { ok: false, error: "Claude adapter is closed." };
+    if (run && !answers(this.opts.policy, "claude")) return { ok: false, error: NOT_ANSWERING };
+    return this.gates.answer(id, questionId, run);
+  }
+
   /** The answer to a question Claude asked, through the hook holding it; the hook passes it on and exits. */
   private async answer(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string, ask: Ask): Promise<Receipt> {
     const earlier = this.reserve(key, digest);
     if (earlier) return earlier;
+    this.unwritten.add(key);
     this.asks.delete(action.itemId);
     // A plan goes ahead on a plain yes; any other words go back to Claude as what to change.
     const reply = ask.plan ? goAhead(action.message) ? { approve: true } : { revise: action.message } : { answers: answersFor(ask.questions!, action.message) };
@@ -746,6 +838,7 @@ export class ClaudeAdapter implements Adapter {
     if (action.kind === "start_work" && action.model) args.push("--model", action.model);
     // Driver's own headless records follow in this transcript; the session stays listed as Driver's whatever they say.
     this.store.markStarted(id);
+    this.unwritten.add(key);
     const messageId = randomUUID();
     const token = hash(key).slice(0, 24), stdoutPath = join(this.opts.stateDir, `${token}.stdout.jsonl`), stderrPath = join(this.opts.stateDir, `${token}.stderr.log`);
     const finish = (receipt: Receipt): Receipt => {
@@ -846,6 +939,7 @@ export class ClaudeAdapter implements Adapter {
             socket.write(proof(this.hookSecret, event.nonce) + "\n"); return;
           }
           if (event.hook_event_name === "PermissionRequest" && sessionId(event.session_id) && this.hold(event.session_id, socket, event)) return;
+          if (event.hook_event_name === "PreToolUse" && typeof event.command === "string") { void this.holdGate(event.session_id, socket, event.command, typeof event.matched === "string" ? event.matched : event.command); return; }
           // Payloads never set status or supply reply text. Only a fresh filesystem read may do that.
           if (sessionId(event.session_id) && ["SessionStart", "SessionEnd", "Stop", "Notification"].includes(event.hook_event_name)) this.schedule();
         } catch { /* Untrusted or incomplete local notification. */ }
@@ -892,8 +986,31 @@ export class ClaudeAdapter implements Adapter {
     this.schedule();
     return true;
   }
+  /**
+   * Holds a command on this computer's list for a session 10 & 2 shows, while the phone shows it; the hook waits on
+   * `socket`. A T3 Code thread run by Claude is T3's to show (`claimGate`), asked first, even where its transcript doesn't
+   * say so yet. Where it can't be shown or answered it's stopped at once, with why: a session nobody shows (another
+   * program's, a folder 10 & 2 doesn't see), a computer that doesn't let 10 & 2 answer, a second one in the same session.
+   */
+  private async holdGate(id: unknown, socket: Socket, command: string, matched: string) {
+    socket.setTimeout(0);
+    if (!sessionId(id) || this.closing) return stopGate(socket, GATE_NOT_SHOWN);
+    if (this.opts.claimGate && await this.opts.claimGate(id, socket, command, matched).catch(() => false)) return;
+    this.scan();
+    const row = this.rows.get(id);
+    if (!row) {
+      this.opts.log(`claude: a command on the list of a session 10 & 2 doesn't show (${id}) was stopped`);
+      this.opts.onUnheld?.();
+      return stopGate(socket, GATE_NOT_SHOWN);
+    }
+    if (!answers(this.opts.policy, "claude")) return stopGate(socket, GATE_NOT_ALLOWED);
+    if (!this.gates.hold(id, socket, command, matched, row.item.title)) return stopGate(socket, GATE_ONE_AT_A_TIME);
+    this.scan();
+  }
   /** A question answered in the terminal (or a session that ended) lets its hook go, with no answer. */
   private releaseAnswered() {
+    // A held command of a session no longer shown (archived, its folder hidden) is stopped: nobody can answer it.
+    for (const id of this.gates.ids()) if (!this.rows.has(id)) this.gates.drop(id, GATE_NOT_SHOWN);
     for (const [id, ask] of this.asks) {
       const row = this.rows.get(id), answered = row?.transcript.answeredAt;
       if (!row || !row.live.length || (answered && answered >= ask.heldAt)) { this.asks.delete(id); ask.socket.end(); }
@@ -915,6 +1032,7 @@ export class ClaudeAdapter implements Adapter {
     await Promise.allSettled([...this.writes]);
     this.closed = true; this.loaded = false; this.listeners.clear();
     for (const ask of this.asks.values()) ask.socket.end(); this.asks.clear();
+    this.gates.close();
     this.socket?.close();
     if (this.ownsSocket && process.platform === "win32") {
       // The pipe goes with its server; its name goes too, unless a newer connector has written its own.

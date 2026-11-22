@@ -13,7 +13,7 @@ import { Ledger, ledgerHeld } from "../src/ledger.ts";
 import { BRAIN, CONNECTOR, connectorRunning, RUN_KEY, runEntry, Service, STARTUP_APPROVED } from "../src/service.ts";
 import { ask, backoff, controlPipe, HIDDEN, loginFile, mergePath, readLogin, restartsAfter, rotate, saveLogin, supervise, withPath } from "../src/supervisor.ts";
 import { randomHex, replaceFile } from "../src/util.ts";
-import { assertPrivate, ipcPath, nodeCommand, removeDir, SLOW, WINDOWS } from "./fixtures/platform.ts";
+import { assertPrivate, ipcPath, NODE, nodeCommand, removeDir, SLOW, WINDOWS } from "./fixtures/platform.ts";
 
 const SUPERVISED = fileURLToPath(new URL("./fixtures/supervised.ts", import.meta.url));
 const SUPERVISOR = fileURLToPath(new URL("../src/supervisor.ts", import.meta.url));
@@ -196,7 +196,7 @@ test("something else on the supervisor's pipe name (another account's, on Window
 test("on Windows, closing the console (SIGHUP) stops the connector as SIGTERM does", { skip: WINDOWS && "Windows can't send SIGHUP" }, async (t) => {
   const dir = temp(t);
   const notes = join(dir, "notes");
-  const child = spawn(process.execPath, [SUPERVISED, notes, "", "win32"], { stdio: "ignore" });
+  const child = spawn(NODE, [SUPERVISED, notes, "", "win32"], { stdio: "ignore" });
   t.after(() => child.kill("SIGKILL"));
   const exited = new Promise<number | null>((resolve) => child.on("exit", (code) => resolve(code)));
   await until("started", () => starts(notes).length === 1);
@@ -207,7 +207,7 @@ test("on Windows, closing the console (SIGHUP) stops the connector as SIGTERM do
 
 test("the IPC channel doesn't keep a connector running once its work is done", async () => {
   const script = `const { stopLikeSigterm } = await import(${JSON.stringify(pathToFileURL(SUPERVISOR).href)}); stopLikeSigterm();`;
-  const child = spawn(process.execPath, ["--input-type=module", "-e", script], { stdio: ["ignore", "ignore", "inherit", "ipc"] });
+  const child = spawn(NODE, ["--input-type=module", "-e", script], { stdio: ["ignore", "ignore", "inherit", "ipc"] });
   const code = await new Promise<number | null>((resolve, reject) => {
     const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("still running")); }, 5000 * SLOW);
     child.on("exit", (c) => { clearTimeout(timer); resolve(c); });
@@ -222,14 +222,14 @@ test("10and2 login-service supervises the connector, hidden, and stops when it c
   const log = join(dir, "state", "10and2", "10and2.log");
   saveLogin(loginFile(CONNECTOR, env), join(dir, "setup-bin"));
   // Not set up: the connector exits 78, which isn't restarted, so the supervisor exits too.
-  const hidden = spawnSync(process.execPath, [...MAIN, "login-service", "connector"], { env: { ...env, [HIDDEN]: "1" }, encoding: "utf8", timeout: 20_000 * SLOW });
+  const hidden = spawnSync(NODE, [...MAIN, "login-service", "connector"], { env: { ...env, [HIDDEN]: "1" }, encoding: "utf8", timeout: 20_000 * SLOW });
   assert.equal(hidden.status, 0, hidden.stderr);
   assert.equal(hidden.stdout + hidden.stderr, "", "silent");
   assert.match(read(log), /connector: .*10and2 setup/);
   assert.match(read(log), /login-service: the connector exited 78; not starting it again/);
 
   writeFileSync(log, "");
-  const shown = spawnSync(process.execPath, [...MAIN, "login-service", "connector"], { env, encoding: "utf8", timeout: 20_000 * SLOW });
+  const shown = spawnSync(NODE, [...MAIN, "login-service", "connector"], { env, encoding: "utf8", timeout: 20_000 * SLOW });
   assert.equal(shown.status, 0, shown.stderr);
   assert.equal(shown.stdout + shown.stderr, "", "silent");
   // The hidden copy it started runs the connector, which exits as above.
@@ -239,7 +239,7 @@ test("10and2 login-service supervises the connector, hidden, and stops when it c
   const pipe = controlPipe(CONNECTOR, saved.token!, env);
   await until("the hidden copy exited", async () => await ask(pipe, "status", saved.secret!) === null);
 
-  assert.equal(spawnSync(process.execPath, [...MAIN, "login-service", "nonsense"], { env, encoding: "utf8" }).status, 64);
+  assert.equal(spawnSync(NODE, [...MAIN, "login-service", "nonsense"], { env, encoding: "utf8" }).status, 64);
 });
 
 /** Windows' registry as reg.exe shows it, and a supervisor that answers on its pipe, with everything asked in order. */
@@ -454,7 +454,7 @@ test("status counts the connector as running on Windows only while one holds its
   await ledger.close();
   assert.equal(connectorRunning(process.pid, "win32", held), false, "a live Node's pid, but no connector holds the ledger");
   // Elsewhere, whether it answers.
-  const gone = spawnSync(process.execPath, ["-e", ""]).pid!;
+  const gone = spawnSync(NODE, ["-e", ""]).pid!;
   assert.equal(connectorRunning(process.pid, "linux"), true);
   assert.equal(connectorRunning(gone, "linux"), false);
 });

@@ -17,6 +17,22 @@ export function processes(match: (args: string[]) => boolean, platform = process
   } catch { return []; }
 }
 
+/**
+ * `processes`, kept for `ttlMs` per `match`: macOS's `ps` and `lsof` and Windows' PowerShell take seconds and hold the
+ * connector up while they run, and a scan runs on every burst of file events. A terminal opened meanwhile is seen at
+ * the next listing.
+ */
+export function recentProcesses(list: (match: (args: string[]) => boolean) => Proc[] = processes, ttlMs = 10_000, now = Date.now): (match: (args: string[]) => boolean) => Proc[] {
+  const kept = new Map<(args: string[]) => boolean, { at: number; procs: Proc[] }>();
+  return (match) => {
+    const last = kept.get(match);
+    if (last && now() - last.at < ttlMs) return last.procs;
+    const procs = list(match);
+    kept.set(match, { at: now(), procs });
+    return procs;
+  };
+}
+
 function linux(match: (args: string[]) => boolean): Proc[] {
   const out: Proc[] = [];
   for (const name of readdirSync("/proc")) {

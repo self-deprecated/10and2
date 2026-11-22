@@ -8,7 +8,8 @@ import { join } from "node:path";
 import { OpenCodeAdapter } from "../../src/opencode/adapter.ts";
 import { installOpenCodePlugin } from "../../src/opencode/plugin.ts";
 import type { Action, LaunchProfile } from "../../src/contract.ts";
-import { has, home, inContainer, mockModel, project, Terminal, until } from "./lib.ts";
+import { ANSWERED } from "../../src/util.ts";
+import { checksByStart, has, home, inContainer, local, mockModel, project, scheduled, Terminal, typedOf, until } from "./lib.ts";
 
 const skip = !inContainer || !has("opencode") ? "runs in the harness container (test/harness/run.sh)" : false;
 
@@ -22,6 +23,8 @@ test("OpenCode: list, read, steer idle and busy, answer a question, continue a c
   writeFileSync(join(config, "opencode.json"), JSON.stringify({
     $schema: "https://opencode.ai/config.json", model: "mock/mock-model", small_model: "mock/mock-model", autoupdate: false, share: "disabled",
     provider: { mock: { npm: "@ai-sdk/openai-compatible", name: "Mock", options: { baseURL: `${mock.url}/v1`, apiKey: "dummy" }, models: { "mock-model": { name: "Mock Model", tool_call: true } } } },
+    // The "checks" subtest's test runs (the engine's stage 3.10), and nothing else, run without asking.
+    permission: { bash: { "node --test *": "allow", "npm test": "allow" } },
   }));
   await installOpenCodePlugin(config);
   // The terminal and Driver's own server (which inherits this process's environment) share this private OpenCode.
@@ -30,6 +33,10 @@ test("OpenCode: list, read, steer idle and busy, answer a question, continue a c
 
   const adapter = new OpenCodeAdapter({ dataDir: join(xdg.XDG_DATA_HOME, "opencode"), configDir: config, db: join(state, "opencode.db"), stateDir: state, log: (m) => t.diagnostic(m),
     policy: { brain: "wss://unused.invalid/connector", projects: [cwd], actions: ["follow_up", "settle", "snooze", "archive", "start_work"], maxRuntimeMode: "auto", claude: false, t3: false, codex: false, opencode: true, pi: false, steer: true, answer: true, limits: {}, worktreeBase: "HEAD" } });
+  // What the brain is told of who wrote (the engine's stage 3.9): every send below is 10 & 2's, recorded as it goes.
+  const typed = typedOf(adapter);
+  let typedFrom = 0, typedTo = 0;
+  const starts: string[] = [];
   const tui = new Terminal("opencode");
   t.after(async () => { tui.stop(); Terminal.stopAll(); await adapter.close(); });
 
@@ -75,6 +82,21 @@ test("OpenCode: list, read, steer idle and busy, answer a question, continue a c
     assert.match(tui.screen(), /"Which one\?"="Beta"/);
   });
 
+  await t.test("tap: its question is input, its own options its choices; a stale questionId sends nothing, and an option's label answers it", async () => {
+    await until("the last turn to end", async () => (await adapter.list())[0]!.status !== "running" && (await adapter.list())[0]!.status !== "waiting", 60_000);
+    typedFrom = Date.now();
+    await tui.type("Please OCASKQ again");
+    await until("the question to be held", async () => (await adapter.report(id)).choices?.length === 2, 60_000);
+    typedTo = Date.now();
+    assert.deepEqual((await adapter.report(id)).choices, ["Alpha", "Beta"]);
+    const item = (await adapter.list()).find((i) => i.id === id)!;
+    assert.equal(item.questionKind, "input");
+    const tap = (questionId: string): Action => ({ kind: "follow_up", itemId: id, message: "Alpha", questionId });
+    assert.deepEqual(await local(adapter).execute(tap("an-earlier-question"), "tap-stale"), { ok: false, error: ANSWERED });
+    assert.deepEqual(await local(adapter).execute(tap(item.questionId!), "tap"), { ok: true });
+    await until("the tapped option to come back from the model", () => /"Which one\?"="Alpha"/.test(tui.screen()), 60_000);
+  });
+
   await t.test("continue: a closed session is continued in 10 & 2's own server", async () => {
     const pid = entry()?.pid;
     tui.stop();
@@ -93,6 +115,7 @@ test("OpenCode: list, read, steer idle and busy, answer a question, continue a c
     await until("the model to get the new work", () => mock.saw("Start words STARTONE"), 60_000);
     const item = (await adapter.list()).find((i) => i.id === (started as { itemId: string }).itemId);
     assert.equal(item?.title, "Harness start");
+    starts.push(item!.id);
   });
 
   await t.test("start in a worktree: new work in a fresh worktree inside the project", async () => {
@@ -102,7 +125,29 @@ test("OpenCode: list, read, steer idle and busy, answer a question, continue a c
     assert.equal(inWorktree.ok, true, JSON.stringify(inWorktree));
     await until("the model to get the worktree's work", () => mock.saw("Worktree words WTONE"), 60_000);
     const wtId = (inWorktree as { itemId: string }).itemId;
+    starts.push(wtId);
     await until("its reply to be read", async () => (await adapter.report(wtId)).text === "ACK Worktree words WTONE", 60_000);
     assert.deepEqual(adapter.places().map((p) => p.id), [place], "the worktree isn't a project of its own");
+  });
+
+  await t.test("typed: what's typed in its terminal after a session's first prompt is yours, not known to be at a computer; 10 & 2's follow-ups, answers, continuing and new work aren't", async () => {
+    const mine = await typed(id);
+    assert.ok(mine?.at && Date.parse(mine.at) >= typedFrom - 2000 && Date.parse(mine.at) <= typedTo, `the last prompt typed (${JSON.stringify(mine)})`);
+    // Never known to be at a computer: a plugin or extension writes the same user message (the Skeptic on 3.9 and 3.10).
+    assert.equal(mine.desk, null);
+    for (const s of starts) assert.deepEqual(await typed(s), { at: null, desk: null }, "new work 10 & 2 started");
+  });
+
+  await t.test("checks: a test run's pass and failure, from its bash exit, are the run's (mid-run) and the reply's checks", async () => {
+    // Commands run unasked (`auto`; this config allows the test runs either way).
+    const profile: LaunchProfile = { name: "Auto", runtimeMode: "auto", workspace: "root", interactionMode: "default" };
+    await checksByStart(adapter, adapter.places()[0]!.id, profile, cwd);
+  });
+  await t.test("schedule: a message set up for later goes at its time and not before, held and sent by the connector (the engine's stage 4a)", async () => {
+    await until("it to be idle", async () => { const i = (await adapter.list()).find((x) => x.id === id); return !!i && i.status !== "running"; }, 60_000);
+    const held = await scheduled(adapter, id, "Later words LATERONE");
+    assert.equal(held.state, "sent", JSON.stringify(held));
+    await until("the model to get it", () => mock.saw("Later words LATERONE"), 60_000);
+    await until("its reply to be read", async () => (await adapter.report(id)).text === "ACK Later words LATERONE", 60_000);
   });
 });

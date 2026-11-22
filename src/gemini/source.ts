@@ -7,11 +7,11 @@
 import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { RuntimeMode } from "../policy.ts";
 import type { Found, Source } from "../acp/adapter.ts";
 import type { Settings } from "../acp/turn.ts";
-import { processes, type Proc } from "../acp/processes.ts";
+import { recentProcesses, type Proc } from "../acp/processes.ts";
 import { GeminiSession } from "./session.ts";
 
 /** Gemini's own folder: `$GEMINI_CLI_HOME/.gemini`, else `~/.gemini`. */
@@ -37,7 +37,7 @@ export class GeminiSource implements Source {
   constructor(opts: { dir?: string; command?: string[]; processes?: (match: (args: string[]) => boolean) => Proc[] } = {}) {
     this.dir = resolve(opts.dir ?? geminiDir());
     this.command = opts.command ?? ["gemini", "--acp"];
-    this.procs = opts.processes ?? ((m) => processes(m));
+    this.procs = opts.processes ?? recentProcesses();
   }
 
   env(): NodeJS.ProcessEnv {
@@ -71,7 +71,7 @@ export class GeminiSource implements Source {
     s.read();
     if (!s.id || s.kind !== "main") return null;
     const session = s;
-    return { id: s.id, cwd, title: s.summary, createdAt: s.startTime, mtimeMs: Date.parse(s.mtime) || 0, projection: s.projection,
+    return { id: s.id, cwd, sessionDir: dirname(dirname(path)), title: s.summary, createdAt: s.startTime, mtimeMs: Date.parse(s.mtime) || 0, projection: s.projection,
       started: s.started, question: null, userCount: s.userCount, says: (w, after) => session.says(w, after) };
   }
 
@@ -114,8 +114,10 @@ export class GeminiSource implements Source {
   }
 
   open(found: Found[], own: Set<number>): Set<string> {
-    const running = this.procs(isGemini).filter((p) => !own.has(p.pid));
     const out = new Set<string>();
+    // No session to tell open: no need to list processes, which is the slow part of a scan.
+    if (!found.length) return out;
+    const running = this.procs(isGemini).filter((p) => !own.has(p.pid));
     for (const f of found) {
       for (const p of running) {
         // Started before the session was last written, in its folder (or anywhere, where the folder can't be read).

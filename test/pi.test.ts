@@ -15,6 +15,8 @@ import type { Action, LaunchProfile } from "../src/contract.ts";
 import { harness, until } from "./fixtures/pi/helpers.ts";
 import { loadExtension, openPi } from "./fixtures/pi/extension.ts";
 import { assertPrivate, WINDOWS } from "./fixtures/platform.ts";
+import { Local } from "../src/local.ts";
+import { ANSWERED } from "../src/util.ts";
 
 const build: LaunchProfile = { name: "Build", runtimeMode: "full-access", workspace: "worktree", interactionMode: "default" };
 const plan: LaunchProfile = { name: "Plan", runtimeMode: "full-access", workspace: "worktree", interactionMode: "plan" };
@@ -136,6 +138,41 @@ test("an open Pi's status comes from the extension's registry; dead or socketles
   assert.equal((await h.adapter.report(asking.id)).question, "Which database? Options: Postgres / SQLite.");
   assert.ok(updates.some(([ids, urgent]) => urgent && ids.includes(asking.id)), "a question is urgent news");
   assert.match(h.adapter.refusals()[waiting.id]!.follow_up!, /Answer it in Pi/);
+});
+
+test("the extension's question is input, its options its choices; another extension's yes-or-no is an approval; other dialogs can't be told", async (t) => {
+  const h = harness(t);
+  const asking = h.completed(), confirm = h.completed(), select = h.completed(), busy = h.completed();
+  const lines = await h.live(asking.id, "waiting", { questions: [{ questionId: "q1", title: "Which database?", options: ["Postgres", "SQLite", "Skip"] }] });
+  await h.live(confirm.id, "waiting", { prompt: { kind: "confirm", title: "Allow rm -rf build?", since: "2026-11-10T07:00:00.000Z" } });
+  await h.live(select.id, "waiting", { prompt: { kind: "select", title: "Pick a theme", since: "2026-11-10T07:00:00.000Z" } });
+  await h.live(busy.id, "busy");
+  await h.adapter.start();
+  const items = new Map((await h.adapter.list()).map((i) => [i.id, i]));
+  assert.deepEqual([asking, confirm, select, busy].map((s) => items.get(s.id)!.questionKind), ["input", "approval", undefined, undefined]);
+  assert.deepEqual((await h.adapter.report(asking.id)).choices, ["Postgres", "SQLite", "Skip"]);
+  for (const s of [confirm, select, busy]) assert.equal((await h.adapter.report(s.id)).choices, null);
+  assert.deepEqual(await h.adapter.execute({ kind: "follow_up", itemId: asking.id, message: "SQLite", questionId: "q1" }, "tap"), { ok: true });
+  assert.deepEqual({ ...lines[0], id: undefined }, { id: undefined, type: "answer", questionId: "q1", value: "SQLite" });
+});
+
+test("a tap answers only the question it was for: one asked instead, or none, while Local's check awaited sends nothing", async (t) => {
+  for (const next of [[{ questionId: "q2", title: "Delete production?", options: ["Yes", "No"] }], []]) {
+    const h = harness(t), s = h.completed();
+    const lines = await h.live(s.id, "waiting", { questions: [{ questionId: "q1", title: "Deploy?", options: ["Yes", "No"] }] });
+    await h.adapter.start();
+    const local = new Local([{ prefix: "pi", adapter: h.adapter }], h.policy);
+    // Pi asks another question (or none, and goes on working) after Local looked, while the adapter's check yields.
+    const registry = join(h.agent, "10and2", `${s.id}.json`), check = h.adapter.check.bind(h.adapter);
+    let moved = false;
+    h.adapter.check = async (a) => {
+      const why = await check(a);
+      if (!moved) { moved = true; writeFileSync(registry, JSON.stringify({ ...JSON.parse(readFileSync(registry, "utf8")), questions: next, status: next.length ? "waiting" : "busy" })); }
+      return why;
+    };
+    assert.deepEqual(await local.execute({ kind: "follow_up", itemId: `pi:${s.id}`, message: "Yes", questionId: "q1" }, "old-tap"), { ok: false, error: ANSWERED });
+    assert.deepEqual(lines, [], next.length ? "never the answer to the question asked since" : "never sent as a steer");
+  }
 });
 
 test("a follow-up to an open Pi goes through its socket as a steer, and counts on the extension's ack, once", async (t) => {
@@ -467,4 +504,15 @@ test("the extension is installed, updated and removed only where the file is our
 test("the extension's test command exists only when asked for", () => {
   const source = readFileSync(extensionSource(), "utf8");
   assert.match(source, /if \(process\.env\.TENANDTWO_PI_TEST === "1"\) \{\s*pi\.registerCommand\("tt-ask"/);
+});
+
+// The Skeptic on 3.10: an answer to Pi's question (its extension's dialog) is no message at all, so the Ledger drops its
+// record of it (`sendLeftOut`).
+test("an answer to Pi's question is never a person's message (sendLeftOut)", async (t) => {
+  const h = harness(t), s = h.completed();
+  await h.live(s.id, "waiting", { questions: [{ questionId: "q7", title: "Which database?", options: ["Postgres", "SQLite"] }] });
+  await h.adapter.start();
+  assert.deepEqual(await h.adapter.execute(follow(s.id, "SQLite"), "answer"), { ok: true });
+  assert.equal(h.adapter.sendLeftOut(follow(s.id, "SQLite"), "answer"), true);
+  assert.equal(h.adapter.sendLeftOut(follow(s.id, "SQLite"), "steer"), false);
 });

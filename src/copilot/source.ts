@@ -49,7 +49,7 @@ export class CopilotSource implements Source {
     s.read();
     if (s.id !== id || !s.cwd) return null;
     const session = s;
-    return { id, cwd: s.cwd, title: s.name, createdAt: s.createdAt, mtimeMs: s.mtimeMs, projection: s.projection, started: s.started,
+    return { id, cwd: s.cwd, sessionDir: s.dir, title: s.name, createdAt: s.createdAt, mtimeMs: s.mtimeMs, projection: s.projection, started: s.started,
       question: s.question, userCount: s.userCount, says: (w, after) => session.says(w, after), holders: s.holders() };
   }
 

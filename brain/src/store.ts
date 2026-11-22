@@ -6,12 +6,18 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { nodeSql, type SqlDb } from "./sql.ts";
+import type { LaterCard } from "./later-lines.ts";
 import type { FirstAsk, LaunchProfile, ReplyRef } from "./adapter.ts";
 import { askText, cleanPurpose } from "./purposes.ts";
 import type { Segment } from "./reading.ts";
 import type { Wait } from "./waits.ts";
+import type { Delivery, ReachOut } from "./reach.ts";
+import { isNotify, type ThreadNotify } from "./follow.ts";
 import { reasonText, type EndReason } from "./voice/endReason.ts";
 import type { CostRow } from "./spend.ts";
+
+/** How long a reading (a reply's prepared text, a dictated readback) is kept: on Lattice and in the cloud alike. */
+export const READINGS_KEPT_MS = 30 * 86_400_000;
 
 export type Card = {
   itemId: string;
@@ -37,9 +43,16 @@ export type CardState = "needs_decision" | "ready_to_apply" | "blocked" | "runni
  */
 export const TAP = "tap";
 
-export type ProposalState = "proposed" | "executing" | "executed" | "partial" | "failed" | "unknown" | "cancelled" | "expired";
+/** `scheduled` (stage 4b): a send or a start set up for later, agreed to; its rule (later.ts) holds it from then. */
+export type ProposalState = "proposed" | "executing" | "executed" | "partial" | "failed" | "unknown" | "cancelled" | "expired" | "scheduled";
 /** `group`: the project the readback said it was in (proposals since targets kept it). */
 export type ProposalTarget = { itemId: string; handle: string; group?: string; parentId?: string };
+/** The kv key's start of the claim one write from a reply's notification takes (proposals.ts `wroteClaim`). */
+export const WROTE_CLAIM = "wrote:";
+
+/** How a send was agreed to (the Timeline's "how each send was approved"; Fable's 4-F and 4-K). */
+export type Approved = "voice" | "tap" | "faceid" | "lock_screen";
+
 export type Proposal = {
   id: string;
   conversationId: string;
@@ -53,7 +66,13 @@ export type Proposal = {
    * `confirm`: how the user must agree to it (proposals.ts `Level`); none (a proposal made before levels): the readback
    * heard, then a yes.
    */
-  fields: { message?: string; until?: string; draftId?: string; placeId?: string; place?: string; title?: string; profile?: LaunchProfile; model?: { id: string; name: string; said: boolean; provider?: string; /** The user named its provider. */ named?: boolean }; itemId?: string; target?: string; keptId?: string; confirm?: "none" | "yes" | "readback" | "tap"; /** Carried out by the brain on the user's spoken yes (`VoiceSession.yesHeard`). */ heardYes?: boolean; /** The user's first answer to its readback was a yes or a keep (`VoiceSession.answered`). */ answered?: boolean };
+  fields: { message?: string; until?: string; /** The zone `until` was read in (stage 3.8): its lines say it there. */ tz?: string; draftId?: string; placeId?: string; place?: string; title?: string; profile?: LaunchProfile; model?: { id: string; name: string; said: boolean; provider?: string; /** The user named its provider. */ named?: boolean }; itemId?: string; target?: string; keptId?: string; /** A tap on a question's own option (a notification's button): sent only while the thread asks it. */ questionId?: string; confirm?: "none" | "yes" | "readback" | "tap"; /** Carried out by the brain on the user's spoken yes (`VoiceSession.yesHeard`). */ heardYes?: boolean; /** The user's first answer to its readback was a yes or a keep (`VoiceSession.answered`). */ answered?: boolean; /** Stage 4b: set up for later, due then (ms), its readback's time read in `tz`. */ at?: number; /** Its card in Call mode (later-lines.ts `LaterCard`). */ card?: LaterCard; /** Commands that wait: a message for a thread holding a command, which stops it (its readback said so). */ held?: { matched: string; questionId: string }; /** Fable's 4-K: a write from a reply's notification (a quick reply, Reply…), the reach-out of the reply it answers: sent only while that reply is still the thread's latest. */ afterReply?: string; /** How the user agreed to a send (the Timeline's "how each send was approved"): a spoken yes, Send tapped, Face ID, or from a notification on the lock screen. */ approved?: Approved; /** Sent from a notification (`via: lock_screen`): an answer's button, a quick reply, Reply…, Send now. */ noted?: true; /** Not sent because its computer was offline (carryOut's refusal). */ offline?: true;
+    /**
+     * 4-J, a chain: the thread its first step waits for (its run at the readback, past which a clean finish is the
+     * trigger), the time it mustn't go before, the steps after the first, its tail ("and call me when that's done") and
+     * how long it watches.
+     */
+    chain?: { after: { itemId: string; handle: string; lastRunAt: string | null }; notBefore?: number; next: { itemId: string; handle: string; group?: string; message: string }[]; tail: "call" | "notify" | "kept" | null; watchMs: number } };
   readback: string;
   /**
    * What the user must have heard: for each group, at least `need` of its words, spoken after `from`; or, with `head`,
@@ -102,6 +121,8 @@ export type Handoff =
  */
 export type KeptReply = {
   id: string; threadId: string; threadName: string; project: string; text: string; note: string | null; draftId: string | null; conversationId: string; keptAt: number;
+  /** `faceid`: a send at Face ID every time (Privacy) not tapped in its call, kept so it isn't lost (engine.md §11, 2a item 12). */
+  waiting?: "faceid";
 };
 
 const SCHEMA = `
@@ -149,6 +170,14 @@ CREATE TABLE IF NOT EXISTS costs (
   requests INTEGER NOT NULL, input INTEGER NOT NULL, cached INTEGER NOT NULL, cache_write INTEGER NOT NULL, output INTEGER NOT NULL,
   reasoning INTEGER NOT NULL, seconds REAL NOT NULL, chars INTEGER NOT NULL, retries INTEGER NOT NULL, usd REAL NOT NULL, at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS costs_by_day ON costs (day);
+CREATE TABLE IF NOT EXISTS kept_waiting (id TEXT PRIMARY KEY, waiting TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS observations (item_id TEXT PRIMARY KEY, obs TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS rules (id TEXT PRIMARY KEY, rule TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS thread_notify (item_id TEXT PRIMARY KEY, notify TEXT NOT NULL, at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS reach_outs (key TEXT PRIMARY KEY, at INTEGER NOT NULL, state TEXT NOT NULL, keep_until INTEGER NOT NULL, reach TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS deliveries (
+  key TEXT NOT NULL, channel TEXT NOT NULL, state TEXT NOT NULL, at INTEGER NOT NULL, accepted_at INTEGER, missed_at INTEGER, callback TEXT,
+  PRIMARY KEY (key, channel));
 CREATE TABLE IF NOT EXISTS purposes (
   item_id TEXT PRIMARY KEY, first_ask TEXT, first_ask_at INTEGER, complete INTEGER NOT NULL DEFAULT 0, started_at INTEGER,
   purpose TEXT, about TEXT, made_by TEXT, made_at INTEGER, tried_at INTEGER, tried_run TEXT, missing_at INTEGER);
@@ -445,6 +474,10 @@ export class Store {
   finishOperation(key: string, state: OperationState, error: string | null) {
     this.db.prepare("UPDATE operations SET state = ?, error = ? WHERE idempotency_key = ?").run(state, error, key);
   }
+  /** Forgets an operation begun and never sent (Privacy stopped it just before), so a later Send begins it afresh. */
+  dropOperation(key: string) {
+    this.db.prepare("DELETE FROM operations WHERE idempotency_key = ? AND state = 'running'").run(key);
+  }
   // --- memory: what the user has been working on lately, never the state of anything ---
   /** Saves a note; one already saved word for word is only dated anew, so asking "is that noted?" never doubles it. False then. */
   remember(conversationId: string | null, note: string, now = Date.now()): boolean {
@@ -513,6 +546,10 @@ export class Store {
   stars(): Set<string> {
     return new Set(this.starsSeen().keys());
   }
+  /** When each starred thread was starred: where it joins the threads you follow (engine.ts). */
+  starTimes(): Map<string, number> {
+    return new Map((this.db.prepare("SELECT item_id, at FROM stars").all() as any[]).map((r) => [r.item_id, r.at]));
+  }
   /** Each starred thread, with the last reply and question the user heard. */
   starsSeen(): Map<string, Seen> {
     return new Map((this.db.prepare("SELECT item_id, seen_run_at, seen_question FROM stars").all() as any[]).map((r) => [r.item_id, { runAt: r.seen_run_at, question: r.seen_question }]));
@@ -535,6 +572,10 @@ export class Store {
   heard(conversationId: string, itemId: string): Seen | null {
     const r = this.db.prepare("SELECT run_at, question FROM heard WHERE conversation_id = ? AND item_id = ?").get(conversationId, itemId) as any;
     return r ? { runAt: r.run_at, question: r.question } : null;
+  }
+  /** What every conversation has told of `itemId`: each one's latest reply (and question). */
+  heardAll(itemId: string): Seen[] {
+    return (this.db.prepare("SELECT run_at, question FROM heard WHERE item_id = ?").all(itemId) as any[]).map((r) => ({ runAt: r.run_at, question: r.question }));
   }
   /** The threads whose news these conversations last told between `from` and `to`. */
   heardBetween(conversationIds: string[], from: number, to: number): string[] {
@@ -675,7 +716,7 @@ export class Store {
     if (conversationId) this.db.prepare("DELETE FROM handoffs WHERE conversation_id = ?").run(conversationId);
     else this.db.exec("DELETE FROM handoffs");
   }
-  /** Readings older than `before` go; they're made again from the reply if it's asked for. */
+  /** Readings older than `before` go (`READINGS_KEPT_MS` ago, hourly); they're made again from the reply if it's asked for. */
   forgetReadings(before: number) {
     this.db.prepare("DELETE FROM readings WHERE created_at < ?").run(before);
   }
@@ -685,31 +726,40 @@ export class Store {
   keepReply(k: KeptReply): KeptReply {
     const old = k.draftId ? this.keptByDraft(k.draftId) : null;
     const row = old ? { ...k, id: old.id } : k;
-    this.db.prepare(
-      `INSERT INTO kept VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET
-       thread_id = excluded.thread_id, thread_name = excluded.thread_name, project = excluded.project, text = excluded.text,
-       note = excluded.note, conversation_id = excluded.conversation_id, kept_at = excluded.kept_at`,
-    ).run(row.id, row.threadId, row.threadName, row.project, row.text, row.note, row.draftId, row.conversationId, row.keptAt);
+    this.db.transaction(() => {
+      this.db.prepare(
+        `INSERT INTO kept (id, thread_id, thread_name, project, text, note, draft_id, conversation_id, kept_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET
+         thread_id = excluded.thread_id, thread_name = excluded.thread_name, project = excluded.project, text = excluded.text,
+         note = excluded.note, conversation_id = excluded.conversation_id, kept_at = excluded.kept_at`,
+      ).run(row.id, row.threadId, row.threadName, row.project, row.text, row.note, row.draftId, row.conversationId, row.keptAt);
+      // Why it waits is a table of its own, not a column of `kept`: stage 1's code writes `kept` without naming its
+      // columns, so a rollback still keeps replies (engine.md §11, Rollback).
+      if (row.waiting) this.db.prepare("INSERT INTO kept_waiting (id, waiting) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET waiting = excluded.waiting").run(row.id, row.waiting);
+      else this.db.prepare("DELETE FROM kept_waiting WHERE id = ?").run(row.id);
+    });
     return row;
   }
   keptReply(id: string): KeptReply | null {
-    const r = this.db.prepare("SELECT * FROM kept WHERE id = ?").get(id);
+    const r = this.db.prepare(`${KEPT} WHERE k.id = ?`).get(id);
     return r ? rowToKept(r) : null;
   }
   keptByDraft(draftId: string): KeptReply | null {
-    const r = this.db.prepare("SELECT * FROM kept WHERE draft_id = ?").get(draftId);
+    const r = this.db.prepare(`${KEPT} WHERE k.draft_id = ?`).get(draftId);
     return r ? rowToKept(r) : null;
   }
   /** Every kept reply, newest first. */
   keptReplies(): KeptReply[] {
-    return (this.db.prepare("SELECT * FROM kept ORDER BY kept_at DESC, rowid DESC").all() as any[]).map(rowToKept);
+    return (this.db.prepare(`${KEPT} ORDER BY k.kept_at DESC, k.rowid DESC`).all() as any[]).map(rowToKept);
   }
   /** False when there's no such kept reply. */
   editKept(id: string, text: string): boolean {
     return Number(this.db.prepare("UPDATE kept SET text = ? WHERE id = ?").run(text, id).changes) === 1;
   }
   dropKept(id: string) {
-    this.db.prepare("DELETE FROM kept WHERE id = ?").run(id);
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM kept WHERE id = ?").run(id);
+      this.db.prepare("DELETE FROM kept_waiting WHERE id = ?").run(id);
+    });
   }
 
   // --- sessions: every GPT-Live session the brain created, and whether OpenAI has confirmed it's over ---
@@ -787,8 +837,28 @@ export class Store {
   deleteWait(conversationId: string) {
     this.db.prepare("DELETE FROM waits WHERE conversation_id = ?").run(conversationId);
   }
-  waits(): Wait[] {
-    return (this.db.prepare("SELECT wait FROM waits").all() as any[]).map((r) => JSON.parse(r.wait));
+  /**
+   * The saved waits. A row that isn't one (not JSON, or not an object with this row's `conversationId`, a `handle`, a
+   * finite `startedAt` and an `items` array) is skipped, told to `bad`, and left as it is (docs/launch/engine.md §10).
+   */
+  waits(bad?: (conversationId: string, why: string) => void): Wait[] {
+    return (this.db.prepare("SELECT conversation_id, wait FROM waits").all() as any[]).flatMap((r) => {
+      let w: any;
+      try {
+        w = JSON.parse(r.wait);
+      } catch {
+        bad?.(r.conversation_id, "not JSON");
+        return [];
+      }
+      const why = !w || typeof w !== "object" || Array.isArray(w) ? "not an object"
+        : w.conversationId !== r.conversation_id ? "not this conversation's"
+        : typeof w.handle !== "string" ? "no handle"
+        : !Number.isFinite(w.startedAt) ? "no start"
+        : !Array.isArray(w.items) ? "no threads"
+        : null;
+      if (why) bad?.(r.conversation_id, why);
+      return why ? [] : [w as Wait];
+    });
   }
   /** Call-back news not yet heard, per conversation (server.ts `untold`); null deletes it. */
   saveUntold<T>(conversationId: string, news: { at: number; replies: T[] } | null) {
@@ -797,16 +867,113 @@ export class Store {
   }
   /**
    * A call-back's session exists: its news is saved as untold and (with `dropWait`) its wait deleted, in one
-   * transaction, so a crash in between can't lose the wait without its news being kept.
+   * transaction, so a crash in between can't lose the wait without its news being kept. `also` runs in it too (the
+   * engine's call-back owning the other news it tells), and what it returns is returned once the transaction is kept.
    */
-  callBackStarted<T>(conversationId: string, news: { at: number; replies: T[] }, dropWait: boolean) {
-    this.db.transaction(() => {
+  callBackStarted<T, R>(conversationId: string, news: { at: number; replies: T[] }, dropWait: boolean, also?: () => R): R | undefined {
+    return this.db.transaction(() => {
       if (dropWait) this.deleteWait(conversationId);
       this.saveUntold(conversationId, news);
+      return also?.();
     });
   }
   untold<T>(): Map<string, { at: number; replies: T[] }> {
     return new Map((this.db.prepare("SELECT * FROM untold").all() as any[]).map((r) => [r.conversation_id, { at: r.at, replies: JSON.parse(r.replies) }]));
+  }
+
+  // --- the engine (engine.ts, docs/launch/engine.md §3): facts' identities, rules, reach-outs and deliveries ---
+  /** Each thread's observation (observations.ts), as JSON; null for none. */
+  observation(itemId: string): string | null {
+    return (this.db.prepare("SELECT obs FROM observations WHERE item_id = ?").get(itemId) as any)?.obs ?? null;
+  }
+  saveObservation(itemId: string, obs: string) {
+    this.db.prepare("INSERT INTO observations VALUES (?, ?) ON CONFLICT(item_id) DO UPDATE SET obs = excluded.obs").run(itemId, obs);
+  }
+  /** Every rule row, as written: each is checked where it's read (engine.ts), so one bad row loses only itself. */
+  ruleRows(): { id: string; rule: string }[] {
+    return (this.db.prepare("SELECT id, rule FROM rules").all() as any[]).map((r) => ({ id: r.id, rule: r.rule }));
+  }
+  saveRule(id: string, rule: unknown) {
+    this.db.prepare("INSERT INTO rules VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET rule = excluded.rule").run(id, JSON.stringify(rule));
+  }
+  deleteRule(id: string) {
+    this.db.prepare("DELETE FROM rules WHERE id = ?").run(id);
+  }
+  /**
+   * Each thread's own notifications (follow.ts, engine.md §11 stage 3.1), as last set by following, unfollowing or by
+   * hand, and when; a thread with no row has its default. A value this version doesn't know is left out.
+   */
+  threadNotifies(): Map<string, { notify: ThreadNotify; at: number }> {
+    return new Map((this.db.prepare("SELECT item_id, notify, at FROM thread_notify").all() as any[]).flatMap((r) => (isNotify(r.notify) ? [[r.item_id, { notify: r.notify, at: r.at }] as const] : [])));
+  }
+  threadNotify(itemId: string): ThreadNotify | null {
+    const r = this.db.prepare("SELECT notify FROM thread_notify WHERE item_id = ?").get(itemId) as any;
+    return r && isNotify(r.notify) ? r.notify : null;
+  }
+  /** Sets it; the same setting again keeps when it was set, which is where the thread joined what tells you. */
+  setThreadNotify(itemId: string, notify: ThreadNotify, now = Date.now()) {
+    this.db.prepare("INSERT INTO thread_notify VALUES (?, ?, ?) ON CONFLICT(item_id) DO UPDATE SET at = CASE WHEN notify = excluded.notify THEN at ELSE excluded.at END, notify = excluded.notify").run(itemId, notify, now);
+  }
+  /** The reach-outs, oldest first; a row that doesn't parse is skipped and told to `bad`. */
+  reachOuts(bad?: (key: string, why: string) => void): ReachOut[] {
+    return (this.db.prepare("SELECT key, reach FROM reach_outs ORDER BY at, key").all() as any[]).flatMap((r) => {
+      try {
+        const o = JSON.parse(r.reach);
+        if (o && typeof o === "object" && o.key === r.key) return [o as ReachOut];
+        bad?.(r.key, "not this key's");
+      } catch {
+        bad?.(r.key, "not JSON");
+      }
+      return [];
+    });
+  }
+  reachOut(key: string): ReachOut | null {
+    const r = this.db.prepare("SELECT reach FROM reach_outs WHERE key = ?").get(key) as any;
+    if (!r) return null;
+    try {
+      return JSON.parse(r.reach) as ReachOut;
+    } catch {
+      return null;
+    }
+  }
+  saveReachOut(o: ReachOut) {
+    this.db.prepare("INSERT INTO reach_outs VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET at = excluded.at, state = excluded.state, keep_until = excluded.keep_until, reach = excluded.reach")
+      .run(o.key, o.at, o.state, o.keepUntil, JSON.stringify(o));
+  }
+  /**
+   * Reach-outs dealt with (told or dropped) before `before` go: the Timeline keeps what happened, not these; and with
+   * each, the claim a write from its notification took (`WROTE_CLAIM`, Fable's 4-K).
+   */
+  pruneReachOuts(before: number) {
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM deliveries WHERE key IN (SELECT key FROM reach_outs WHERE state != 'untold' AND keep_until < ?)").run(before);
+      this.db.prepare("DELETE FROM kv WHERE key IN (SELECT ? || key FROM reach_outs WHERE state != 'untold' AND keep_until < ?)").run(WROTE_CLAIM, before);
+      this.db.prepare("DELETE FROM reach_outs WHERE state != 'untold' AND keep_until < ?").run(before);
+    });
+  }
+  /** Every delivery, or one fact's. */
+  deliveries(key?: string): Delivery[] {
+    const rows = (key === undefined ? this.db.prepare("SELECT * FROM deliveries ORDER BY at").all() : this.db.prepare("SELECT * FROM deliveries WHERE key = ? ORDER BY at").all(key)) as any[];
+    return rows.map((r) => ({
+      key: r.key, channel: r.channel, state: r.state, at: r.at,
+      ...(r.accepted_at != null ? { acceptedAt: r.accepted_at } : {}), ...(r.missed_at != null ? { missedAt: r.missed_at } : {}), ...(r.callback != null ? { callback: r.callback } : {}),
+    }));
+  }
+  /**
+   * A delivery's first write, before its push (§3's attempt): false when one was ever written for this fact and channel,
+   * which the primary key refuses, so a channel is tried at most once per fact.
+   */
+  attemptDelivery(d: Delivery): boolean {
+    const r = this.db.prepare("INSERT OR IGNORE INTO deliveries VALUES (?, ?, ?, ?, ?, ?, ?)").run(d.key, d.channel, d.state, d.at, d.acceptedAt ?? null, d.missedAt ?? null, d.callback ?? null);
+    return Number(r.changes) > 0;
+  }
+  /** A claim (`attemptDelivery`) whose push got no answer that counts: it goes, so the next attempt claims again. */
+  unclaimDelivery(key: string, channel: Delivery["channel"]) {
+    this.db.prepare("DELETE FROM deliveries WHERE key = ? AND channel = ? AND state = 'sending'").run(key, channel);
+  }
+  updateDelivery(d: Delivery) {
+    this.db.prepare("UPDATE deliveries SET state = ?, accepted_at = ?, missed_at = ?, callback = ? WHERE key = ? AND channel = ?")
+      .run(d.state, d.acceptedAt ?? null, d.missedAt ?? null, d.callback ?? null, d.key, d.channel);
   }
 
   // --- purposes: why each thread was started (purposes.ts) ---
@@ -898,9 +1065,12 @@ function withCorrections(text: string, corrected: { said: string; note: string }
   return out;
 }
 
+/** A kept reply with why it waits (`kept_waiting`), when it does. */
+const KEPT = "SELECT k.*, w.waiting AS waiting FROM kept k LEFT JOIN kept_waiting w ON w.id = k.id";
+
 const rowToKept = (r: any): KeptReply => ({
   id: r.id, threadId: r.thread_id, threadName: r.thread_name, project: r.project, text: r.text, note: r.note ?? null, draftId: r.draft_id ?? null,
-  conversationId: r.conversation_id, keptAt: r.kept_at,
+  conversationId: r.conversation_id, keptAt: r.kept_at, ...(r.waiting === "faceid" ? { waiting: "faceid" as const } : {}),
 });
 
 function rowToProposal(r: any): Proposal {

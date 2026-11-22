@@ -47,6 +47,8 @@ export class CallAudio {
   private startT = 0;
   private endT = 0;
   private writes: Promise<void>[] = [];
+  /** Switched off mid-call (`stop`): nothing more is kept. */
+  private stopped = false;
 
   constructor(files: Files, sessionId: string, opts: { log: (m: string) => void; pieceSeconds?: number }) {
     this.files = files;
@@ -57,6 +59,7 @@ export class CallAudio {
 
   /** A frame of microphone audio (base64 PCM) that arrived `t` ms into the recording. */
   feed(t: number, b64: string) {
+    if (this.stopped) return;
     let pcm: Uint8Array;
     try { pcm = decode(b64); } catch { return; }
     if (pcm.length === 0) return;
@@ -71,7 +74,7 @@ export class CallAudio {
   }
 
   private flush() {
-    if (this.size === 0) return;
+    if (this.size === 0 || this.stopped) return;
     const pcm = new Uint8Array(this.size);
     let at = 0;
     for (const p of this.parts) { pcm.set(p, at); at += p.length; }
@@ -84,6 +87,17 @@ export class CallAudio {
   /** Saves what's left; settles when every piece is written. */
   async close() {
     this.flush();
+    await Promise.all(this.writes);
+  }
+
+  /**
+   * The tester switched call audio off mid-call: what's gathered goes unsaved and nothing more is kept. Settles once
+   * the pieces already being written are, so deleting the account's call audio after it leaves none.
+   */
+  async stop() {
+    this.stopped = true;
+    this.parts = [];
+    this.size = 0;
     await Promise.all(this.writes);
   }
 }

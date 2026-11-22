@@ -27,6 +27,8 @@ export class Store {
     return (this.db.prepare("SELECT * FROM claude_overlay WHERE sessionId=?").get(id) as Overlay | undefined) ?? { settledAt: null, snoozedAt: null, snoozedUntil: null, archived: 0 };
   }
   operation(key: string): Operation | undefined { return this.db.prepare("SELECT hash, receipt FROM claude_operations WHERE key=?").get(key) as Operation | undefined; }
+  /** Every operation's key: what an adapter's own sends were made from (Codex's message ids). */
+  operationKeys(): string[] { return (this.db.prepare("SELECT key FROM claude_operations").all() as { key: string }[]).map((r) => r.key); }
   begin(key: string, hash: string, id?: string): boolean {
     this.db.exec("BEGIN IMMEDIATE");
     try {

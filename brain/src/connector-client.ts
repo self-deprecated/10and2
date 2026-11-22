@@ -4,8 +4,10 @@
 //
 // What the brain knows of the machine (its view, rev and tools) is plain data a host can save and restore, so a
 // Durable Object that hibernates between frames picks up where it left off without asking again.
-import { titleFrom, type Action, type ActionKind, type Adapter, type FirstAsk, type LaunchProfile, type CodingModel, type PastReply, type Place, type Receipt, type Report, type WirePlace, type WorkItem } from "./adapter.ts";
-import { validZone } from "./util.ts";
+import { titleFrom, type Action, type ActionKind, type Adapter, type DocumentText, type FirstAsk, type Held, type LaterLink, type LaterRules, type LaunchProfile, type CodingModel, type PastReply, type Place, type Receipt, type Report, type Schedule, type SetAnswer, type WirePlace, type WorkItem } from "./adapter.ts";
+import { validZone } from "./zone.ts";
+import { cleanChecks } from "./receipts.ts";
+import { APPS, type App } from "./places.ts";
 
 export const SUBPROTOCOL = "10and2.mcp.1";
 export const MCP_VERSION = "2025-06-18";
@@ -14,8 +16,15 @@ export const PONG = '{"type":"pong"}';
 export const WORK_URI = "tenandtwo://work";
 export const CLOSE = { revoked: 4001, replaced: 4002, protocol: 4003 } as const;
 const REQUEST_MS = 25_000;
+/**
+ * A send or a start may take longer than a read to answer: a start in a large repository makes its git worktree first.
+ * Timed out, it's "outcome unknown", so it gets this long.
+ */
+export const WRITE_MS = 90_000;
+/** The actions that wait for `WRITE_MS`; every other request waits `REQUEST_MS`. */
+const WRITES: ReadonlySet<string> = new Set(["follow_up", "start_work"]);
 /** A link the connector hasn't pinged for this long is treated as down, so a half-open one fails at once. */
-const STALE_MS = 75_000;
+export const STALE_MS = 75_000;
 const MAX_PENDING = 128;
 const ACTIONS: ActionKind[] = ["follow_up", "settle", "snooze", "archive", "start_work", "unsnooze", "unsettle"];
 /** JSON-RPC errors that mean the connector did nothing: bad arguments, no such tool, too busy. */
@@ -33,9 +42,15 @@ const MODES: Mode[] = ["approval-required", "auto-accept-edits", "auto", "full-a
  * `serverInfo` said it (0.10.0 on), when that's a zone this runtime knows. `models`: its start_work takes a `model`
  * (its schema lists one, after 0.10.0); absent (a view saved before) or false, a start on a chosen model is refused here.
  * `catalogs`: the models its places offer, by the key each place names (`WirePlace.catalog`), as its last view said
- * them; absent from a connector that sends none (0.10.0 and before), so its places have no `models`.
+ * them; absent from a connector that sends none (0.10.0 and before), so its places have no `models`. `asks`: its
+ * follow_up takes the `questionId` an answer to one question carries (a tap), and refuses it unless the thread asks that
+ * question then. Absent or false, the field is left out (a connector refuses fields it doesn't know), and only the
+ * brain's own look guards the answer.
+ * `schedules`: it lists `set_schedules` (stage 4a's connector on); `rules` and `held`: its view's `rules` and
+ * `schedules` (null and none from a connector without them), what sends and starts for later may do there and what it
+ * holds (stage 4b).
  */
-export type Saved = { rev: string | null; items: WorkItem[]; places: WirePlace[]; connections: Connection[]; refusals: Refusals; ceiling: Mode; actions: ActionKind[]; names?: boolean; firstAsks?: boolean; timeZone?: string | null; models?: boolean; catalogs?: Record<string, CodingModel[]> };
+export type Saved = { rev: string | null; items: WorkItem[]; places: WirePlace[]; connections: Connection[]; refusals: Refusals; ceiling: Mode; actions: ActionKind[]; names?: boolean; firstAsks?: boolean; documents?: boolean; timeZone?: string | null; models?: boolean; catalogs?: Record<string, CodingModel[]>; asks?: boolean; schedules?: boolean; rules?: LaterRules | null; held?: Held[]; holds?: boolean };
 /** The socket, as the host carries it. `lastSeen`: when the connector was last heard from (a frame or a ping). */
 export type Wire = { send(text: string): void; close(code: number, reason: string): void; lastSeen(): number };
 
@@ -79,10 +94,17 @@ function catalogsOf(v: unknown): Record<string, CodingModel[]> | undefined {
     return [key, models.slice(0, MODELS_MAX).map((m: any) => ({ id: m.id, name: m.name.trim(), ...(provider(m) ? { provider: provider(m) } : {}) }))];
   }));
 }
+const RULES: LaterRules[] = ["off", "send", "start"];
+const HELD_STATES = ["waiting", "firing", "sent", "not_sent", "missed", "cancelled", "unknown", "refused"];
+const optStr = (v: unknown) => v === undefined || (typeof v === "string" && v.length <= 2000);
+/** A held row the brain can read: its id and state, and every field it has of the shape it should be; others are left out. */
+const validHeld = (h: any): h is Held => h && str(h.id) && h.id.length <= 200 && HELD_STATES.includes(h.state) && optStr(h.code) && optStr(h.why) && optStr(h.app) && optStr(h.at) && optStr(h.firedAt) &&
+  (h.receipt === undefined || validReceipt(h.receipt)) && (h.after === undefined || (h.after && (h.after.lastRunAt === null || str(h.after.lastRunAt)) && (h.after.questionId === null || str(h.after.questionId))));
 const validFirstAsk = (f: any): f is FirstAsk | null => f === null || (f && str(f.text) && str(f.at) && typeof f.complete === "boolean");
+const validDocument = (d: any): d is DocumentText => d && str(d.id) && str(d.name) && typeof d.text === "string" && str(d.contentHash);
 const validReceipt = (r: any): r is Receipt => r && (r.ok === true ? r.itemId === undefined || str(r.itemId) : r.ok === false && str(r.error));
-/** The fields the briefing diffs on; an updatedAt-only change means nothing to it. */
-const briefed = (i: WorkItem) => JSON.stringify([i.status, i.title, i.settled, i.snoozedUntil, i.pendingQuestion, i.questionId ?? null, i.lastRunAt ?? null, i.group, i.parentId, i.visitedAt ?? null]);
+/** The fields the briefing diffs on, and what a question waits on; an updatedAt-only change means nothing to it. */
+const briefed = (i: WorkItem) => JSON.stringify([i.status, i.title, i.settled, i.snoozedUntil, i.pendingQuestion, i.questionId ?? null, i.questionKind ?? null, i.lastRunAt ?? null, i.group, i.parentId, i.visitedAt ?? null]);
 const spoken = (name: string) => name.charAt(0).toUpperCase() + name.slice(1);
 const targetOf = (a: Action) => (a.kind === "start_work" ? a.placeId : a.itemId);
 
@@ -96,16 +118,17 @@ export class RemoteAdapter implements Adapter {
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
   private readonly listeners = new Set<(ids: string[], urgent: boolean) => void>();
+  private readonly laterListeners = new Set<(why: "linked" | "report") => void>();
   private reading: Promise<void> | null = null;
   private readAgain = false;
   private readonly ready: Promise<void>;
   private markReady!: () => void;
   private firstList: Promise<void> | null = null;
-  private readonly opts: { timeoutMs: number; listTimeoutMs: number; staleMs: number; now: () => number; onSaved?: (s: Saved) => void; log: (m: string) => void };
+  private readonly opts: { timeoutMs: number; writeTimeoutMs: number; listTimeoutMs: number; staleMs: number; now: () => number; onSaved?: (s: Saved) => void; log: (m: string) => void };
 
-  constructor(name: string, opts: { timeoutMs?: number; listTimeoutMs?: number; staleMs?: number; now?: () => number; onSaved?: (s: Saved) => void; log?: (m: string) => void } = {}) {
+  constructor(name: string, opts: { timeoutMs?: number; writeTimeoutMs?: number; listTimeoutMs?: number; staleMs?: number; now?: () => number; onSaved?: (s: Saved) => void; log?: (m: string) => void } = {}) {
     this.name = name;
-    this.opts = { timeoutMs: opts.timeoutMs ?? REQUEST_MS, listTimeoutMs: opts.listTimeoutMs ?? 15_000, staleMs: opts.staleMs ?? STALE_MS, now: opts.now ?? (() => Date.now()), onSaved: opts.onSaved, log: opts.log ?? (() => {}) };
+    this.opts = { timeoutMs: opts.timeoutMs ?? REQUEST_MS, writeTimeoutMs: opts.writeTimeoutMs ?? opts.timeoutMs ?? WRITE_MS, listTimeoutMs: opts.listTimeoutMs ?? 15_000, staleMs: opts.staleMs ?? STALE_MS, now: opts.now ?? (() => Date.now()), onSaved: opts.onSaved, log: opts.log ?? (() => {}) };
     this.ready = new Promise((r) => { this.markReady = r; });
   }
 
@@ -144,6 +167,9 @@ export class RemoteAdapter implements Adapter {
       await this.listTools(wire);
       await this.request("resources/subscribe", { uri: WORK_URI }, wire);
       await this.read(wire);
+      // The handshake ends with the first set of sends and starts for later (stage 4b), sent even when it's empty: until
+      // one is applied on this link, the computer fires none (Stop always wins).
+      if (this.wire === wire) this.emitLater("linked");
     } catch (e) {
       if (this.wire !== wire) return;
       this.opts.log(`${this.name}: connector handshake failed (${e instanceof Error ? e.message : e})`);
@@ -203,6 +229,11 @@ export class RemoteAdapter implements Adapter {
     // A start on a chosen model goes only to a connector that takes one: an older one refuses the field.
     this.state.models = !!schema?.properties && typeof schema.properties === "object" && Object.hasOwn(schema.properties, "model");
     this.state.firstAsks = names.includes("first_ask");
+    this.state.asks = !!tools.find((t) => t?.name === "follow_up")?.inputSchema?.properties?.questionId;
+    this.state.schedules = names.includes("set_schedules");
+    // Commands that wait: it holds them (its list isn't empty), and lets one run or stops it with `answer_hold`.
+    this.state.holds = names.includes("answer_hold");
+    this.state.documents = names.includes("read_document");
     this.opts.onSaved?.(this.saved);
   }
 
@@ -224,7 +255,7 @@ export class RemoteAdapter implements Adapter {
     return this.reading;
   }
 
-  private apply(f: { rev: string; full: boolean; items: WorkItem[]; removed: string[]; places: WirePlace[]; catalogs?: unknown; connections: Connection[]; refusals: Refusals; ceiling: Mode }) {
+  private apply(f: { rev: string; full: boolean; items: WorkItem[]; removed: string[]; places: WirePlace[]; catalogs?: unknown; connections: Connection[]; refusals: Refusals; ceiling: Mode; rules?: unknown; schedules?: unknown }) {
     const before = new Map(this.state.items.map((i) => [i.id, i]));
     const wasLive = this.live;
     let next: Map<string, WorkItem>;
@@ -240,19 +271,24 @@ export class RemoteAdapter implements Adapter {
       changed = [...f.items.map((i) => i.id), ...f.removed.filter((id) => before.has(id))];
     }
     const urgent = f.items.some((i) => i.pendingQuestion && (!before.get(i.id)?.pendingQuestion || (before.get(i.id)?.questionId ?? null) !== (i.questionId ?? null)));
+    // What it holds for later and lets them do (stage 4a's connector on; an older one has neither): whole each time.
+    const rules = RULES.includes(f.rules as LaterRules) ? (f.rules as LaterRules) : null;
+    const held = Array.isArray(f.schedules) ? f.schedules.filter(validHeld) : [];
     // The catalogs come whole with every read, as the places do.
-    this.state = { ...this.state, rev: f.rev, items: [...next.values()], places: f.places, catalogs: catalogsOf(f.catalogs), connections: f.connections, refusals: f.refusals, ceiling: f.ceiling };
+    this.state = { ...this.state, rev: f.rev, items: [...next.values()], places: f.places, catalogs: catalogsOf(f.catalogs), connections: f.connections, refusals: f.refusals, ceiling: f.ceiling, rules, held };
     this.loaded = true; this.live = true; this.markReady();
     this.opts.onSaved?.(this.saved);
     if (changed.length) this.emit(changed, urgent || !wasLive);
+    // The handshake's own first read says it's linked once it's done; any later one is a report.
+    if (wasLive) this.emitLater("report");
   }
 
-  private request(method: string, params: object, wire = this.wire): Promise<any> {
+  private request(method: string, params: object, wire = this.wire, timeoutMs = this.opts.timeoutMs): Promise<any> {
     if (!wire || wire !== this.wire) return Promise.reject(new LinkLost(`${spoken(this.name)} isn't connected right now.`));
     if (this.pending.size >= MAX_PENDING) return Promise.reject(new RpcFailure(-32000, `${spoken(this.name)} has too many requests waiting.`));
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new LinkLost(`${spoken(this.name)} didn't answer in time; the outcome may be unknown.`)); }, this.opts.timeoutMs);
+      const timer = setTimeout(() => { this.pending.delete(id); reject(new LinkLost(`${spoken(this.name)} didn't answer in time; the outcome may be unknown.`)); }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
       try { wire.send(JSON.stringify({ jsonrpc: "2.0", id, method, params })); }
       catch { clearTimeout(timer); this.pending.delete(id); reject(new LinkLost(`${spoken(this.name)} isn't connected right now.`)); }
@@ -264,13 +300,28 @@ export class RemoteAdapter implements Adapter {
 
   get isLoaded() { return this.loaded; }
   get actions(): readonly ActionKind[] { return this.state.actions; }
-  private up(): boolean { return this.live && !!this.wire && this.opts.now() - this.wire.lastSeen() <= this.opts.staleMs; }
+  /**
+   * The machine itself is reporting: its link is up and heard from within `staleMs`, whatever its agent apps say (a
+   * computer offline, docs/launch/engine.md §11 item 7, is this false, never T3 Code down on a live computer).
+   */
+  linked(): boolean { return this.live && !!this.wire && this.opts.now() - this.wire.lastSeen() <= this.opts.staleMs; }
+  /** When the current link last heard from the machine (a frame, a ping, its opening); null with none (the host knows when the last one closed). */
+  heardAt(): number | null { return this.wire ? this.wire.lastSeen() : null; }
   connected(itemId?: string): boolean {
-    if (!this.up()) return false;
+    if (!this.linked()) return false;
     const conns = this.state.connections;
     if (itemId === undefined) return conns.some((c) => c.connected);
+    return this.connectionOf(itemId)?.connected ?? false;
+  }
+  /** The work system holding `itemId` by its own name ("T3 Code"), as this machine's view last listed it, or null. */
+  appOf(itemId: string): string | null {
+    const c = this.connectionOf(itemId);
+    return c ? (Object.hasOwn(APPS, c.name) ? APPS[c.name as App] : c.name) : null;
+  }
+  private connectionOf(itemId: string): Connection | undefined {
+    const conns = this.state.connections;
     const prefix = itemId.includes(":") ? itemId.slice(0, itemId.indexOf(":")) : "";
-    return (conns.find((c) => c.prefix === prefix) ?? conns.find((c) => c.prefix === ""))?.connected ?? false;
+    return conns.find((c) => c.prefix === prefix) ?? conns.find((c) => c.prefix === "");
   }
   async list(): Promise<WorkItem[]> {
     this.firstList ??= new Promise<void>((resolve) => {
@@ -289,7 +340,15 @@ export class RemoteAdapter implements Adapter {
     return this.state.places.map(({ catalog, models: _, ...p }: WirePlace & { models?: unknown }) =>
       catalogs ? { ...p, models: typeof catalog === "string" && Object.hasOwn(catalogs, catalog) ? catalogs[catalog].map((m) => ({ ...m })) : [] } : p);
   }
-  async report(id: string): Promise<Report> { return (await this.tool("read_report", { id })) as Report; }
+  async report(id: string): Promise<Report> {
+    const { checks, checksUnread, running, runningSince, runningId, ...r } = (await this.tool("read_report", { id })) as Report;
+    // Tests passed or failed (docs/launch/engine.md §11 stage 3.10): only what a receipt may carry, whatever the machine
+    // sent (an older connector sends none).
+    const clean = cleanChecks(checks), now = cleanChecks(running);
+    const since = now && typeof runningSince === "string" && Number.isFinite(Date.parse(runningSince)) ? runningSince : null;
+    const run = now && typeof runningId === "string" && runningId.length > 0 && runningId.length <= 200 ? runningId : null;
+    return { ...r, ...(clean ? { checks: clean } : checksUnread === true ? { checksUnread: true as const } : {}), ...(now ? { running: now, ...(since ? { runningSince: since } : {}), ...(run ? { runningId: run } : {}) } : {}) };
+  }
   async replies(id: string): Promise<PastReply[]> { return ((await this.tool("past_replies", { id })) as { replies: PastReply[] }).replies; }
   /** Null from a connector before 0.10.0, which has no `first_ask`. */
   async firstAsk(id: string): Promise<FirstAsk | null> {
@@ -298,13 +357,25 @@ export class RemoteAdapter implements Adapter {
     if (!validFirstAsk(first)) throw new Error(`${spoken(this.name)} answered with a first message the app doesn't understand.`);
     return first;
   }
+  /** Null from a connector that hasn't opted into linked documents or predates `read_document`. */
+  async readDocument(id: string, docId: string): Promise<DocumentText | null> {
+    if (!this.state.documents) return null;
+    const doc = await this.tool("read_document", { id, docId });
+    if (!validDocument(doc)) throw new Error(`${spoken(this.name)} answered with a document the app doesn't understand.`);
+    return doc;
+  }
   /** Every item here is on this one machine. */
   timeZone(): string | null { return this.state.timeZone ?? null; }
 
   /** From what the machine last said: no round trip, so a proposal never waits on the link. Execute checks again. */
   async check(action: Action): Promise<string | null> {
+    if (!this.connected(targetOf(action))) return `${spoken(this.name)} isn't connected right now, so the app can't change anything there.`;
+    return this.allows(action);
+  }
+
+  /** The machine's own saved word on `action` (its tools, its ceiling, its refusals), whether or not it's connected now. */
+  allows(action: Action): string | null {
     const target = targetOf(action);
-    if (!this.connected(target)) return `${spoken(this.name)} isn't connected right now, so the app can't change anything there.`;
     if (!this.state.actions.includes(action.kind)) return `The app isn't allowed to ${action.kind.replaceAll("_", " ")} on ${spoken(this.name)}.`;
     if (action.kind === "start_work" && MODES.indexOf(action.profile.runtimeMode) > MODES.indexOf(this.state.ceiling)) return `The ${action.profile.name} profile asks for more access than ${spoken(this.name)} allows.`;
     if (action.kind === "start_work" && action.model !== undefined) {
@@ -317,11 +388,71 @@ export class RemoteAdapter implements Adapter {
     return this.state.refusals[target]?.[action.kind] ?? null;
   }
 
+  // --- sends and starts for later (docs/launch/engine.md §5; contracts §2; stage 4b) ---
+
+  /**
+   * This machine as the brain hands it sends and starts for later (`LaterLink`, without its name and prefix, which the
+   * adapter spanning it adds): what it last said, read when asked.
+   */
+  laterLink(): Omit<LaterLink, "machine" | "prefix"> {
+    const self = this;
+    return {
+      get tool() { return !!self.state.schedules; },
+      get rules() { return self.state.rules ?? null; },
+      get ceiling() { return self.state.ceiling; },
+      get held() { return (self.state.held ?? []).map((h) => ({ ...h })); },
+      linked: () => this.linked(),
+      allows: (action) => this.allows(action),
+      set: (seq, schedules, now) => this.setSchedules(seq, schedules, now),
+    };
+  }
+
+  /**
+   * Hands the machine its whole set (`set_schedules`), with the brain's clock for its check: what it holds now, or a
+   * refusal of the whole set. A set that times out, or fails on the wire, closes the wire (`CLOSE.protocol`): the
+   * computer may never have seen it, and an older set mustn't stay in force; the reconnect's first set decides.
+   */
+  async setSchedules(seq: number, schedules: Schedule[], now: number): Promise<SetAnswer> {
+    const wire = this.wire;
+    if (!wire || !this.live || !this.state.schedules) return { lost: true };
+    const closing = (why: string): SetAnswer => {
+      this.opts.log(`${this.name}: set_schedules ${why}; closing the link`);
+      if (this.wire === wire) {
+        wire.close(CLOSE.protocol, "set_schedules failed");
+        this.detach(wire);
+      }
+      return { lost: true };
+    };
+    let r: any;
+    try {
+      r = await this.request("tools/call", { name: "set_schedules", arguments: { seq, schedules }, _meta: { "tenandtwo/now": now } }, wire);
+    } catch (e) {
+      return closing(`failed (${e instanceof Error ? e.message : e})`);
+    }
+    const v = r?.structuredContent;
+    if (r?.isError && (v?.refused === "stale" || v?.refused === "clock") && str(v.error)) {
+      return { refused: v.refused, error: v.error, ...(typeof v.minutes === "number" && Number.isFinite(v.minutes) ? { minutes: v.minutes } : {}) };
+    }
+    if (r?.isError || !Array.isArray(v?.held)) return closing("answered with something the app doesn't understand");
+    const held = (v.held as unknown[]).filter(validHeld);
+    if (this.wire === wire) {
+      this.state.held = held;
+      this.opts.onSaved?.(this.saved);
+    }
+    return { held };
+  }
+
+  onLater(l: (why: "linked" | "report") => void) { this.laterListeners.add(l); return () => { this.laterListeners.delete(l); }; }
+  private emitLater(why: "linked" | "report") { for (const l of [...this.laterListeners]) l(why); }
+
   async execute(action: Action, key: string): Promise<Receipt> {
     if (!this.connected(targetOf(action))) return { ok: false, error: `${spoken(this.name)} isn't connected right now, so nothing was sent.` };
-    const { kind, ...args } = action.kind === "start_work" && !action.title && !this.state.names ? { ...action, title: titleFrom(action.message) } : action;
+    const sent = action.kind === "start_work" && !action.title && !this.state.names ? { ...action, title: titleFrom(action.message) }
+      : action.kind === "follow_up" && action.questionId !== undefined && !this.state.asks ? { kind: action.kind, itemId: action.itemId, message: action.message } : action;
+    const { kind, ...args } = sent;
     try {
-      const r = await this.request("tools/call", { name: kind, arguments: args, _meta: { "tenandtwo/key": key, "tenandtwo/ttlMs": this.opts.timeoutMs } });
+      const ms = WRITES.has(kind) ? this.opts.writeTimeoutMs : this.opts.timeoutMs;
+      const r = await this.request("tools/call", { name: kind, arguments: args, _meta: { "tenandtwo/key": key, "tenandtwo/ttlMs": ms } }, this.wire, ms);
       if (!validReceipt(r?.structuredContent)) return { ok: false, unknown: true, error: `${spoken(this.name)} answered with something the app doesn't understand; the outcome may be unknown.` };
       const receipt: Receipt = r.structuredContent;
       // The connector answers a start once its own view has the thread; read that view now, rather than on its notice,
@@ -335,6 +466,21 @@ export class RemoteAdapter implements Adapter {
     if (!this.connected(id)) return { ok: false, error: `${spoken(this.name)} isn't connected right now.` };
     try {
       const r = await this.request("tools/call", { name: "mark_read", arguments: { id, watermark }, _meta: { "tenandtwo/key": key } });
+      const v = r?.structuredContent;
+      if (v?.unsupported === true) return "unsupported";
+      return validReceipt(v) ? v : { ok: false, unknown: true, error: "The connector's answer wasn't a receipt." };
+    } catch (e) { return this.failed(e); }
+  }
+
+  /**
+   * Answers a held command (Commands that wait; connector/src/gate.ts): lets it run, or stops it, for that hold only.
+   * "unsupported": this computer's 10and2 holds no commands (no `answer_hold`).
+   */
+  async answerHold(id: string, questionId: string, run: boolean): Promise<Receipt | "unsupported"> {
+    if (!this.state.holds) return "unsupported";
+    if (!this.connected(id)) return { ok: false, error: `${spoken(this.name)} isn't connected right now, so nothing was sent.` };
+    try {
+      const r = await this.request("tools/call", { name: "answer_hold", arguments: { itemId: id, questionId, run } });
       const v = r?.structuredContent;
       if (v?.unsupported === true) return "unsupported";
       return validReceipt(v) ? v : { ok: false, unknown: true, error: "The connector's answer wasn't a receipt." };

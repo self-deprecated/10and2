@@ -12,7 +12,7 @@ import { FORBIDDEN } from "./user-text.ts";
  * The eval suite a pass was measured with: part of the template hash, so a pass from an older suite doesn't count for
  * this one. Raise it whenever the scenarios in eval/run.ts, or how they're judged, change.
  */
-export const EVAL_SUITE_VERSION = 9;
+export const EVAL_SUITE_VERSION = 17;
 
 /** Free seconds a day (UTC) for each allowance label (Clerk `public_metadata.driver.allowance`): testers, and the stage account. */
 export const ALLOWANCES = { tester: 600, presenter: 3 * 3600 } as const;

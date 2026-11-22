@@ -83,6 +83,10 @@ export class FakeDb {
     this.touch(sessionId, at);
     return { id, partId };
   }
+  /** A tool part in assistant message `messageId`, as OpenCode stores it: `state` is its status, input, output and metadata. */
+  tool(sessionId: string, messageId: string, tool: string, state: object, at = Date.now()) {
+    return this.part(sessionId, messageId, { type: "tool", tool, callID: `call_${newId("c")}`, state }, at);
+  }
   /** A session with one finished turn. */
   finished(directory: string, prompt = "Add a lap counter", reply = "Added the lap counter.", o: { title?: string; at?: number } = {}): string {
     const at = o.at ?? Date.now() - 60_000;

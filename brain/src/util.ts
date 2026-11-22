@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Store } from "./store.ts";
+import { validZone } from "./zone.ts";
 
 /**
  * Which brain this is: the revision Nix baked into the package (`revision`, next to `src/`), or else the commit of the
@@ -64,6 +66,76 @@ export const realClock: Clock = {
   clear: (t) => clearTimeout(t as NodeJS.Timeout),
 };
 
+/** The first try again after a timed step threw (docs/launch/engine.md §7, "No hot loops"). */
+export const BACKOFF_MS = 5_000;
+/** The longest wait between tries of a step that keeps throwing. */
+export const BACKOFF_MAX_MS = 5 * 60_000;
+/** The backoff after another failed try, from the one before (0 for none): 5 s doubling to 5 minutes. */
+export const backoffAfter = (prev: number) => (prev > 0 ? Math.min(prev * 2, BACKOFF_MAX_MS) : BACKOFF_MS);
+
+/**
+ * Due times a wake left due (docs/launch/engine.md §7, "No hot loops", for every due time at once): one still due after
+ * a wake at or after it (nothing delivered, dropped, deferred or moved later) wakes nothing again before a backoff, 5 s
+ * doubling to 5 minutes, and is logged once; one that moves or goes is progress, and its backoff goes with it. The
+ * engine's and the Ringer's `due()` hold their times to it, so neither their timers nor the cloud's alarm can spin on a
+ * time nothing moves, whatever the reason. A wake still looks at everything due; only when to wake is held. The held
+ * times (each due time, its next wake and its backoff) are kept in the store (`stuck_<who>`) and read back when it's
+ * made, as the alarm keeps its own backoff, so a restart, or the cloud's object evicted between alarms, goes on with the
+ * backoff instead of starting it over at 5 s.
+ */
+export class Stuck {
+  private readonly held = new Map<number, { backoff: number; until: number }>();
+  private readonly who: string;
+  private readonly log: (m: string) => void;
+  private readonly kv: Pick<Store, "get" | "set">;
+  private readonly key: string;
+  /** The row as last read or written: an unchanged one isn't written again. */
+  private saved: string;
+
+  /** `now`: when it's built, so a row read back holds nothing longer than the longest backoff from then (a damaged row, or a
+   * clock gone back since it was written, can't hold a due time for longer). */
+  constructor(who: string, log: (m: string) => void, kv: Pick<Store, "get" | "set">, now: number) {
+    this.who = who;
+    this.log = log;
+    this.kv = kv;
+    this.key = `stuck_${who}`;
+    this.saved = "[]";
+    try {
+      this.saved = kv.get(this.key) ?? "[]";
+      const rows: unknown = JSON.parse(this.saved);
+      for (const r of Array.isArray(rows) ? rows : []) {
+        if (r && [r.at, r.backoff, r.until].every(Number.isFinite)) {
+          this.held.set(r.at, { backoff: Math.min(r.backoff, BACKOFF_MAX_MS), until: Math.min(r.until, now + BACKOFF_MAX_MS) });
+        }
+      }
+    } catch (e) {
+      // Unreadable, nothing is held: each time a wake leaves due starts at 5 s again, and the next wake writes the row anew.
+      this.log(`${who}: couldn't read what was held (${describe(e)})`);
+    }
+  }
+
+  /** A wake at `woke` is over: `times`, every due time as it left them (before any backoff), read at `now`. */
+  woke(times: readonly number[], woke: number, now: number) {
+    const left = new Set(times.filter((t) => t <= woke));
+    for (const t of [...this.held.keys()]) if (!left.has(t)) this.held.delete(t);
+    for (const t of left) {
+      const had = this.held.get(t);
+      const backoff = backoffAfter(had?.backoff ?? 0);
+      if (!had) this.log(`${this.who}: what was due at ${new Date(t).toISOString()} is still due after a look; looked at again in ${backoff / 1000} s, then less often`);
+      this.held.set(t, { backoff, until: now + backoff });
+    }
+    const row = JSON.stringify([...this.held].map(([at, { backoff, until }]) => ({ at, backoff, until })));
+    if (row === this.saved) return;
+    this.kv.set(this.key, row);
+    this.saved = row;
+  }
+
+  /** `times`, each one a wake left due no sooner than its backoff. */
+  hold(times: readonly number[]): number[] {
+    return times.map((t) => Math.max(t, this.held.get(t)?.until ?? t));
+  }
+}
+
 /** How long ago, for the ear: "just now", "12 minutes ago", "3 hours ago", "2 days ago". */
 /** This machine as it's said: its host name, capitalized ("Lattice"). */
 export function spokenHost(): string {
@@ -77,17 +149,6 @@ export function ago(at: string | number, now: number): string {
   if (m < 60) return `${m} minutes ago`;
   const h = Math.round(m / 60);
   return h < 36 ? `${h} ${h === 1 ? "hour" : "hours"} ago` : `${Math.round(h / 24)} days ago`;
-}
-
-/** `zone` when it's a time zone this runtime knows (an IANA name, "Europe/Copenhagen"); else null. */
-export function validZone(zone: unknown): string | null {
-  if (typeof zone !== "string" || !zone || zone.length > 64) return null;
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: zone });
-    return zone;
-  } catch {
-    return null;
-  }
 }
 
 const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
@@ -239,8 +300,8 @@ export function truncate(text: string): string {
 export const copied = (text: string) => Buffer.from(text, "utf8").toString("utf8");
 
 /**
- * Masks credentials a text may quote: URL userinfo, secret query parameters, keyed values (see `valueEnd`), bearer and
- * OpenAI keys. Text past `REDACT_MAX` is cut first. Every rule is linear in the text's length.
+ * Masks credentials a text may quote: URL userinfo, secret query parameters, keyed values (see `valueEnd`), bearer,
+ * OpenAI and Stripe keys. Text past `REDACT_MAX` is cut first. Every rule is linear in the text's length.
  */
 export function redact(text: string): string {
   return redactWhole(truncate(text));
@@ -259,6 +320,9 @@ export function redactWhole(text: string): string {
       .replace(/\b(Bearer\s+)[^\s"']+/gi, "$1***"),
   )
     .replace(/\bsk-[\w-]{8,}/g, "sk-***")
+    // Stripe's secret, restricted and webhook signing keys.
+    .replace(/\b(sk|rk)_(live|test)_\w{8,}/g, "$1_$2_***")
+    .replace(/\bwhsec_\w{8,}/g, "whsec_***")
     // OpenAI's ephemeral client secrets.
     .replace(/\bek_[\w-]{8,}/g, "ek_***");
 }

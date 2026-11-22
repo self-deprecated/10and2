@@ -26,7 +26,9 @@ export type EndReason =
   /** The anonymous demo drive reached its cap (`capMs`, the cloud's 2 minutes): Driver said so and goodbye. */
   | { kind: "demo_over" }
   /** Staff ended it from 10 & 2 Ops (docs/launch/ops-app.md §3): no call-back, and nothing counts as heard. */
-  | { kind: "ended_by_staff" };
+  | { kind: "ended_by_staff" }
+  /** The provider refused the backend's tools, so nothing could be done: Driver said so, and the call failed. */
+  | { kind: "tools_refused" };
 
 export function reasonText(reason: EndReason): string {
   switch (reason.kind) {
@@ -50,6 +52,7 @@ export function reasonText(reason: EndReason): string {
     case "restarted": return "the brain restarted while it was open";
     case "out_of_credits": return "out of credits";
     case "demo_over": return "the demo's time was up";
+    case "tools_refused": return "failed: the backend's tools were refused";
   }
 }
 
@@ -67,6 +70,21 @@ export function handsOff(reason: EndReason): boolean {
 export function holdsAfter(reason: EndReason): boolean {
   return reason.kind === "paused" || reason.kind === "goodbye" || reason.kind === "idle" || reason.kind === "max_duration";
 }
+
+/**
+ * The call is over with no live session for the phone's stop to end, so its stop, when it comes, ends nothing: the brain
+ * ended it itself (the time limit, a dropped connection, the server closing it, a goodbye, idling, the minutes or the
+ * demo's time up, staff, the brain shutting down, its tools refused), or the phone's stop came while its session was
+ * being made. Not the phone's stop of a live session, which ends the call's proposals itself, nor a rollover, a new
+ * session, a hand-off to the phone or a hold, which carry the conversation on (as does a restarted brain taking its live
+ * session back).
+ */
+export function endsCall(kind: string): boolean {
+  return ENDS_CALL.has(kind);
+}
+const ENDS_CALL: ReadonlySet<string> = new Set<EndReason["kind"]>([
+  "max_duration", "connection_closed", "closed", "goodbye", "idle", "out_of_credits", "demo_over", "ended_by_staff", "shutdown", "stopped_before_start", "tools_refused",
+]);
 
 /** The user was on the line for these endings, so what Driver had said counts as heard. */
 export function deliberate(reason: EndReason): boolean {

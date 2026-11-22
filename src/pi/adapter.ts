@@ -9,16 +9,19 @@ import { spawn, type ChildProcess } from "node:child_process";
 import type { Action, ActionKind, Adapter, FirstAsk, PastReply, Place, Receipt, Report, WorkItem } from "../contract.ts";
 import { allows, answers, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy } from "../policy.ts";
+import type { ThreadDocContext } from "../documents.ts";
 import { addWorktree, firstAsk, folderOf, gitRoot, group } from "../work.ts";
 import { Store } from "../claude/store.ts";
 import { pidState, procStart } from "../claude/registry.ts";
 import { answersFor } from "../claude/adapter.ts";
+import { ANSWERED, choicesOf } from "../util.ts";
 import { PiSession, textOf } from "./session.ts";
 import { piSessionId, readRegistry, talk } from "./bridge.ts";
 import type { Live } from "./bridge.ts";
 import { MARKER, installedPath, piAgentDir, piPath } from "./extension.ts";
 import { NOT_STARTED } from "./turn.ts";
 import type { Turn } from "./turn.ts";
+import type { Write } from "../typed.ts";
 
 export type Options = {
   policy: Policy; db: string; stateDir: string; log: (m: string) => void; now?: () => number;
@@ -99,6 +102,8 @@ export class PiAdapter implements Adapter {
   private rescan: NodeJS.Timeout | null = null;
   private debounce: NodeJS.Timeout | null = null;
   private writes = new Set<Promise<Receipt>>();
+  /** Sends that answered a question, which is no message at all (`sendLeftOut`). */
+  private answered = new Set<string>();
   private extension = false;
   private scannedAt = 0;
 
@@ -238,6 +243,9 @@ export class PiAdapter implements Adapter {
         updatedAt, settled: !!overlay.settledAt && !newer(overlay.settledAt),
         snoozedUntil: overlay.snoozedUntil && Date.parse(overlay.snoozedUntil) > this.now() && !pending && !newer(overlay.snoozedAt) ? overlay.snoozedUntil : null,
         parentId: null, pendingQuestion: pending, questionId, lastRunAt, wroteAt: p?.wroteAt ?? null, createdAt: session?.createdAt ?? null,
+        // The extension's question is the user's to answer; another extension's yes-or-no dialog ("Allow rm -rf build?")
+        // is an approval, answered in Pi; any other dialog can't be told.
+        ...(!pending ? {} : l!.questions.length ? { questionKind: "input" as const } : l!.prompt?.kind === "confirm" ? { questionKind: "approval" as const } : {}),
       };
       next.set(id, { session, cwd, live: l, item });
     }
@@ -290,10 +298,23 @@ export class PiAdapter implements Adapter {
       activeAt: [...this.rows.values()].filter((r) => gitRoot(r.cwd) === root).map((r) => r.item.updatedAt).sort().at(-1) ?? null, models: [] }));
   }
   async list(): Promise<WorkItem[]> { this.fresh(); return [...this.rows.values()].map((r) => ({ ...r.item })); }
+  /** What a person typed in a session (session.ts's `writes`): `WorkItem.typed`. */
+  personWrites(id: string): Write[] { return this.rows.get(id)?.session?.projection.writes ?? []; }
+  /**
+   * Whether send `key` answered Pi's question (its extension's dialog), which is no message at all (the Ledger then drops
+   * its row, so it can't claim your same words later); asked once, after it went. A steer, a turn or new work is written
+   * as the user's, which the row takes.
+   */
+  sendLeftOut(_action: Action, key: string): boolean { return this.answered.delete(key); }
   private row(id: string): Row {
     const row = this.rows.get(id);
     if (!row || !visible(this.opts.policy, row.cwd)) throw new Error("That session isn't visible to 10 & 2.");
     return row;
+  }
+  docContext(id: string): ThreadDocContext | null {
+    const row = this.rows.get(id);
+    if (!row || !visible(this.opts.policy, row.cwd)) return null;
+    return { agent: "pi", cwd: row.cwd, projectRoot: gitRoot(row.cwd) ?? row.cwd };
   }
   async report(id: string): Promise<Report> {
     this.fresh();
@@ -301,7 +322,9 @@ export class PiAdapter implements Adapter {
     const question = !r.item.pendingQuestion ? null
       : q ? `${q.title}${q.options.length ? ` Options: ${q.options.join(" / ")}.` : ""}`
       : r.live?.prompt?.title ?? "Pi needs your input in its terminal.";
+    // Pi asks one question at a time, each with its own id: a tap answers the one asked now.
     return { text: last?.text ?? "", progress: r.item.status === "running" ? p?.progress ?? null : null, question,
+      choices: r.item.pendingQuestion && q ? choicesOf([q]) : null,
       reply: last ? { runId: last.runId, messageId: last.messageId, at: last.at } : null };
   }
   async replies(id: string): Promise<PastReply[]> { this.fresh(); return (this.row(id).session?.projection.replies ?? []).map((r) => ({ ...r })); }
@@ -386,6 +409,9 @@ export class PiAdapter implements Adapter {
     }
     if (action.kind === "follow_up") {
       const live = this.rows.get(action.itemId)?.live;
+      // A tap answers the question it was for, as this scan sees it, or nothing: one Pi asks instead, or none, sends
+      // nothing, never a steer or a turn in its place (Local looked before the adapter's own check yielded).
+      if (action.questionId !== undefined && live?.questions[0]?.questionId !== action.questionId) return { ok: false, error: ANSWERED };
       if (live) {
         if (!live.socket) return { ok: false, error: UNREACHABLE };
         const q = live.questions[0];
@@ -426,6 +452,7 @@ export class PiAdapter implements Adapter {
   /** The answer to a question the extension asked: the option the user named, else their own words. */
   private async answer(action: Extract<Action, { kind: "follow_up" }>, key: string, digest: string, socket: string, q: Live["questions"][number]): Promise<Receipt> {
     if (!this.store.begin(key, digest)) return this.repeat(key, digest) ?? UNKNOWN;
+    this.answered.add(key);
     const value = answersFor([{ question: q.title, options: q.options, multiSelect: false }], action.message)[q.title]!;
     const r = await talk(socket, { id: randomUUID(), type: "answer", questionId: q.questionId, value }, this.opts.acceptanceTimeoutMs ?? 5000);
     this.schedule();

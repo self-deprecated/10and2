@@ -21,9 +21,13 @@
 //   contains GASKQ     (Gemini, with its ask_user tool offered) calls ask_user with the same question
 //   contains TOUCH=<f> (Chat Completions with a bash or powershell tool, or Gemini with run_shell_command) runs
 //                      `echo made > <f>` (the same in bash, PowerShell and cmd) in the session's folder: the file is there only if the agent ran it, which a refused permission stops
+//   contains RUNCMD[<command>]
+//                      (each API, with a shell tool offered: Claude Code's Bash, OpenCode's bash, Codex's shell_command,
+//                      exec_command or shell) runs the command with it; its result then comes back as "ACK RESULT <it>",
+//                      over n seconds when the RUNCMD prompt also says SLOW<n> (stage 3.10's checks, read mid-run)
 //   otherwise          answers at once
 // and is always "ACK <the user's text>", so a test can see exactly what reached the model. Every request is appended
-// to $MOCK_MODEL_LOG (JSON lines: path, the model asked for, the user texts it saw), when set.
+// to $MOCK_MODEL_LOG (JSON lines: path, the model asked for, the user texts it saw, the tools it was offered), when set.
 import { createServer } from "node:http";
 import { appendFileSync } from "node:fs";
 
@@ -52,6 +56,8 @@ function userTexts(body) {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** The gap between a reply's words for the SLOW<n> its prompt asked for (none: at once). */
+const slowFor = (prompt, words) => { const n = Number(/SLOW(\d+)/.exec(prompt)?.[1] ?? 0); return n ? (n * 1000) / Math.max(1, words.length) : 0; };
 
 createServer(async (req, res) => {
   let raw = "";
@@ -66,11 +72,14 @@ createServer(async (req, res) => {
   const texts = userTexts(body);
   // A harness's own housekeeping requests (titles, summaries) also arrive here; they're answered the same way.
   const last = texts.at(-1) ?? "";
-  if (log) appendFileSync(log, JSON.stringify({ at: new Date().toISOString(), path, model: body.model ?? null, stream: !!body.stream, texts }) + "\n");
+  if (log) appendFileSync(log, JSON.stringify({ at: new Date().toISOString(), path, model: body.model ?? null, stream: !!body.stream, texts, tools: (body.tools ?? []).map((t) => t?.name ?? t?.function?.name ?? t?.type) }) + "\n");
   const reply = `ACK ${last.replace(/\s+/g, " ").trim().slice(0, 400)}`;
+  // A command to run (RUNCMD[…]), and the prompt that asked for it: a tool's result answering it is as slow as it says.
+  const asked = [...texts].reverse().find((t) => /RUNCMD\[/.test(t)) ?? "";
+  const command = /RUNCMD\[([^\]]+)\]/.exec(last)?.[1] ?? null;
   const seconds = Number(/SLOW(\d+)/.exec(last)?.[1] ?? 0);
   const words = reply.split(/(?<= )/);
-  const gap = seconds ? (seconds * 1000) / Math.max(1, words.length) : 0;
+  let gap = seconds ? (seconds * 1000) / Math.max(1, words.length) : 0;
   const id = `mock-${Date.now().toString(36)}`, created = Math.floor(Date.now() / 1000), model = body.model ?? "mock-model";
 
   // Gemini's API: the path keeps its model and method (`/v1beta/models/gemini-2.5-flash:streamGenerateContent`).
@@ -106,9 +115,26 @@ createServer(async (req, res) => {
     // A tool's result as the newest message: echo it. The OCASKQ prompt, with OpenCode's question tool offered (its own
     // title requests offer no tools): ask one question with it.
     const lastMsg = (body.messages ?? []).at(-1);
+    const bash = command && lastMsg?.role !== "tool" && (body.tools ?? []).some((t) => t?.function?.name === "bash");
     if (lastMsg?.role === "tool") {
       const said = typeof lastMsg.content === "string" ? lastMsg.content : (lastMsg.content ?? []).map((p) => p?.text ?? "").join(" ");
       words.splice(0, words.length, ...`ACK RESULT ${said.replace(/\s+/g, " ").trim().slice(0, 400)}`.split(/(?<= )/));
+      gap = slowFor(asked, words);
+    } else if (bash) {
+      const args = JSON.stringify({ command, description: "Runs the check" });
+      const call = { index: 0, id: `call_${id}`, type: "function", function: { name: "bash", arguments: args } };
+      const usage = { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 };
+      if (!body.stream) {
+        res.writeHead(200, { "content-type": "application/json" });
+        return res.end(JSON.stringify({ id, object: "chat.completion", created, model, choices: [{ index: 0, message: { role: "assistant", content: null, tool_calls: [{ id: call.id, type: "function", function: call.function }] }, finish_reason: "tool_calls" }], usage }));
+      }
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+      const send = (o) => res.write(`data: ${JSON.stringify(o)}\n\n`);
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { role: "assistant", tool_calls: [{ ...call, function: { name: "bash", arguments: "" } }] }, finish_reason: null }] });
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: { tool_calls: [{ index: 0, function: { arguments: args } }] }, finish_reason: null }] });
+      send({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage });
+      res.write("data: [DONE]\n\n");
+      return res.end();
     } else if ((/OCASKQ/.test(last) && (body.tools ?? []).some((t) => t?.function?.name === "question"))
       || (/CPASKQ/.test(last) && (body.tools ?? []).some((t) => t?.function?.name === "ask_user"))
       || (/TOUCH=\S+/.test(last) && (body.tools ?? []).some((t) => ["bash", "powershell"].includes(t?.function?.name)))) {
@@ -152,18 +178,22 @@ createServer(async (req, res) => {
     const lastMsg = (body.messages ?? []).at(-1);
     const result = Array.isArray(lastMsg?.content) ? lastMsg.content.find((b) => b?.type === "tool_result") : null;
     const asking = !result && /ASKQ/.test(last) && (body.tools ?? []).some((t) => t?.name === "AskUserQuestion");
+    const running = !result && !asking && command && (body.tools ?? []).some((t) => t?.name === "Bash");
     if (result) {
       const said = typeof result.content === "string" ? result.content : (result.content ?? []).map((b) => b?.text ?? "").join(" ");
       words.splice(0, words.length, ...`ACK RESULT ${said.replace(/\s+/g, " ").trim().slice(0, 400)}`.split(/(?<= )/));
+      gap = slowFor(asked, words);
     }
-    if (asking) {
-      const input = { questions: [{ question: "Which one?", header: "Pick", multiSelect: false, options: [{ label: "Alpha", description: "the first" }, { label: "Beta", description: "the second" }] }] };
-      const toolMsg = { id: `msg_${id}`, type: "message", role: "assistant", model, content: [{ type: "tool_use", id: `toolu_${id}`, name: "AskUserQuestion", input }], stop_reason: "tool_use", stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } };
+    if (asking || running) {
+      const [name, input] = asking
+        ? ["AskUserQuestion", { questions: [{ question: "Which one?", header: "Pick", multiSelect: false, options: [{ label: "Alpha", description: "the first" }, { label: "Beta", description: "the second" }] }] }]
+        : ["Bash", { command, description: "Runs the check" }];
+      const toolMsg = { id: `msg_${id}`, type: "message", role: "assistant", model, content: [{ type: "tool_use", id: `toolu_${id}`, name, input }], stop_reason: "tool_use", stop_sequence: null, usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } };
       if (!body.stream) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify(toolMsg)); }
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
       const send = (type, o) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...o })}\n\n`);
       send("message_start", { message: { ...toolMsg, content: [], stop_reason: null } });
-      send("content_block_start", { index: 0, content_block: { type: "tool_use", id: `toolu_${id}`, name: "AskUserQuestion", input: {} } });
+      send("content_block_start", { index: 0, content_block: { type: "tool_use", id: `toolu_${id}`, name, input: {} } });
       send("content_block_delta", { index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } });
       send("content_block_stop", { index: 0 });
       send("message_delta", { delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 1 } });
@@ -192,12 +222,18 @@ createServer(async (req, res) => {
     // A tool's result as the newest input: echo it. The ASKQ prompt, with Codex's request_user_input tool offered (its
     // own title requests offer no tools): ask one question with it.
     const lastInput = Array.isArray(body.input) ? body.input.at(-1) : null;
+    // Codex's shell tool, by whichever name this Codex offers it: a command as a string, or an argv for `shell`.
+    const shell = ["shell_command", "exec_command", "shell"].find((n) => (body.tools ?? []).some((t) => t?.name === n));
     if (lastInput?.type === "function_call_output") {
       const said = typeof lastInput.output === "string" ? lastInput.output : JSON.stringify(lastInput.output ?? "");
       words.splice(0, words.length, ...`ACK RESULT ${said.replace(/\s+/g, " ").trim().slice(0, 400)}`.split(/(?<= )/));
-    } else if (/ASKQ/.test(last) && (body.tools ?? []).some((t) => t?.name === "request_user_input")) {
-      const args = JSON.stringify({ questions: [{ id: "pick", header: "Pick", question: "Which one?", options: [{ label: "Alpha", description: "the first" }, { label: "Beta", description: "the second" }] }] });
-      const call = { id: `fc_${id}`, type: "function_call", status: "completed", name: "request_user_input", arguments: args, call_id: `call_${id}` };
+      gap = slowFor(asked, words);
+    } else if ((/ASKQ/.test(last) && (body.tools ?? []).some((t) => t?.name === "request_user_input")) || (command && shell)) {
+      const asking = /ASKQ/.test(last);
+      const name = asking ? "request_user_input" : shell;
+      const args = JSON.stringify(asking ? { questions: [{ id: "pick", header: "Pick", question: "Which one?", options: [{ label: "Alpha", description: "the first" }, { label: "Beta", description: "the second" }] }] }
+        : shell === "exec_command" ? { cmd: command } : shell === "shell" ? { command: ["bash", "-lc", command] } : { command });
+      const call = { id: `fc_${id}`, type: "function_call", status: "completed", name, arguments: args, call_id: `call_${id}` };
       const done = { id: `resp_${id}`, object: "response", created_at: created, status: "completed", model, output: [call], usage: { input_tokens: 1, input_tokens_details: { cached_tokens: 0 }, output_tokens: 1, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 2 } };
       if (!body.stream) { res.writeHead(200, { "content-type": "application/json" }); return res.end(JSON.stringify(done)); }
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });

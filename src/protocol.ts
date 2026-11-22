@@ -1,13 +1,14 @@
 // The connector protocol (docs/launch/contracts.md §2): an MCP server over the WebSocket the connector opens to its
 // brain. It accepts only the voice-shaped contract: a request can't smuggle backend RPCs, paths or shell text.
-import type { Action, ActionKind } from "./contract.ts";
+import type { Action, ActionKind, Report } from "./contract.ts";
+import { cleanChecks } from "../brain/src/receipts.ts";
 
 /** The WebSocket subprotocol; the brain refuses any other with HTTP 426. */
 export const SUBPROTOCOL = "10and2.mcp.1";
 /** The MCP revision whose message shapes both ends speak. */
 export const MCP_VERSION = "2025-06-18";
 /** This connector's version, as `serverInfo.version` (kept equal to package.json's). */
-export const VERSION = "0.12.0";
+export const VERSION = "0.13.0";
 export const MAX_FRAME = 8 << 20;
 /** The keep-alive frames, outside JSON-RPC, so the brain's auto-response answers them without waking. */
 export const PING = '{"type":"ping"}';
@@ -56,13 +57,28 @@ export function actionOf(v: any): Action {
       onlyFields(v, ["kind", "itemId"]);
       return { kind: v.kind, itemId: v.itemId };
     case "follow_up":
-      onlyFields(v, ["kind", "itemId", "message"]);
-      if (text(v.message)) return { kind: v.kind, itemId: v.itemId, message: v.message }; break;
+      // `questionId`: an answer to that question only (a tap); Local refuses it once the thread no longer asks it.
+      onlyFields(v, ["kind", "itemId", "message", "questionId"]);
+      if (v.questionId !== undefined && !(text(v.questionId) && v.questionId.length <= 200)) break;
+      if (text(v.message)) return { kind: v.kind, itemId: v.itemId, message: v.message, ...(v.questionId !== undefined ? { questionId: v.questionId } : {}) }; break;
     case "snooze":
       onlyFields(v, ["kind", "itemId", "until"]);
       if (text(v.until) && Number.isFinite(Date.parse(v.until))) return { kind: v.kind, itemId: v.itemId, until: v.until }; break;
   }
   throw new Error("That action isn't supported.");
+}
+
+/**
+ * A report as it leaves the machine (docs/launch/engine.md §11 stage 3.10): its `checks` and `running` carry only kinds,
+ * pass or fail, counts, `stale`, `edited` and a label of at most two words (`cleanChecks`), whatever an adapter put in
+ * them; none, none sent. `runningSince` and `runningId` (the run's id, as its reply carries it) only with `running`.
+ */
+export function reportOut(r: Report): Report {
+  const { checks, checksUnread, running, runningSince, runningId, ...rest } = r;
+  const clean = cleanChecks(checks), now = cleanChecks(running);
+  const since = now && typeof runningSince === "string" && Number.isFinite(Date.parse(runningSince)) ? new Date(runningSince).toISOString() : null;
+  const run = now && typeof runningId === "string" && runningId.length > 0 && runningId.length <= 200 ? runningId : null;
+  return { ...rest, ...(clean ? { checks: clean } : checksUnread === true ? { checksUnread: true as const } : {}), ...(now ? { running: now, ...(since ? { runningSince: since } : {}), ...(run ? { runningId: run } : {}) } : {}) };
 }
 
 const str = { type: "string", minLength: 1 } as const;
@@ -76,8 +92,14 @@ const READING: Tool[] = [
   { name: "first_ask", description: "The user's first message to a thread or session and when they wrote it; null when it has none yet.", inputSchema: obj({ id: str }) },
   { name: "mark_read", description: "Marks a thread as seen up to a watermark, where the work system tracks that. Key in _meta.", inputSchema: obj({ id: str, watermark: str }) },
 ];
+const READ_DOCUMENT: Tool = {
+  name: "read_document",
+  description: "The redacted text of a prose document linked by a thread's reply, by opaque doc id.",
+  inputSchema: obj({ id: str, docId: str }),
+};
 const ACTING: Record<ActionKind, Tool> = {
-  follow_up: { name: "follow_up", description: "Sends the user's message to a thread or session.", inputSchema: obj({ itemId: str, message: str }) },
+  // `questionId` isn't required: a brain that sees it listed sends a tapped answer with it (brain/src/connector-client.ts).
+  follow_up: { name: "follow_up", description: "Sends the user's message to a thread or session; with questionId, only as the answer to that question while it's asked.", inputSchema: obj({ itemId: str, message: str, questionId: str }, ["itemId", "message"]) },
   settle: { name: "settle", description: "Marks a thread as dealt with.", inputSchema: obj({ itemId: str }) },
   snooze: { name: "snooze", description: "Hides a thread until a time.", inputSchema: obj({ itemId: str, until: str }) },
   archive: { name: "archive", description: "Archives a thread.", inputSchema: obj({ itemId: str }) },
@@ -88,7 +110,31 @@ const ACTING: Record<ActionKind, Tool> = {
   start_work: { name: "start_work", description: "Starts new work in a place, with a named launch profile, on one of the place's models if given one; named by the work system from its message unless given a title.", inputSchema: obj({ placeId: str, title: str, message: str, profile, model: { ...str, maxLength: 200 } }, ["placeId", "message", "profile"]) },
 };
 
-/** The tools this machine offers: reading always, acting only as its local policy allows. */
-export function tools(allowed: readonly ActionKind[]): Tool[] {
-  return [...READING, ...TOOL_ACTIONS.filter((a) => allowed.includes(a)).map((a) => ACTING[a])];
+/**
+ * Sends and starts held here for later (docs/launch/engine.md §5; schedules.ts): listed whatever the policy, so the brain
+ * tells a connector too old for them (no tool) from one whose policy doesn't allow them (the view's `rules`).
+ */
+const SET_SCHEDULES: Tool = {
+  name: "set_schedules",
+  description: "Replaces this computer's sends and starts set up for later with the brain's full set; `seq` only goes up, and `_meta` carries the brain's clock.",
+  inputSchema: obj({ seq: { type: "integer", minimum: 1 }, schedules: { type: "array", items: { type: "object" } } }),
+};
+
+/**
+ * Commands that wait (docs/launch/engine.md §11 stage 4; connector/src/gate.ts): the one path that lets a held command
+ * run, or stops it, for that hold's own `questionId` while it's held. Listed while this computer has a list of them (a
+ * hold is only ever made then), whatever else the policy allows.
+ */
+const ANSWER_HOLD: Tool = {
+  name: "answer_hold",
+  description: "Lets a command this computer holds for the user run (run: true), or stops it; only for that hold's questionId while it's held. Never a message to the thread.",
+  inputSchema: obj({ itemId: str, questionId: str, run: { type: "boolean" } }),
+};
+
+/**
+ * The tools this machine offers: reading always, linked documents when opted in, acting only as its local policy allows;
+ * `set_schedules` when it holds them; `answer_hold` when it has commands that wait.
+ */
+export function tools(allowed: readonly ActionKind[], schedules = false, holds = false, documents = false): Tool[] {
+  return [...READING, ...(documents ? [READ_DOCUMENT] : []), ...TOOL_ACTIONS.filter((a) => allowed.includes(a)).map((a) => ACTING[a]), ...(schedules ? [SET_SCHEDULES] : []), ...(holds ? [ANSWER_HOLD] : [])];
 }

@@ -91,17 +91,35 @@ export const asksToHangUp = (said: string, wake = STANDARD_WAKE_WORD) =>
     HANG_UP_COMMAND.test(withoutWakeWord(sentence.trim(), wake).replace(LEAD, "").replace(/[\s,]+$/, "")),
   );
 
-/** One sentence that only tells Driver to stop talking: "Stop", "okay, stop", "stop it", "please stop talking", "shh". */
+/**
+ * One sentence that only tells Driver to stop talking: "Stop", "okay, stop", "stop it", "please stop talking", "shh",
+ * "stop that, please", "stop that now" (a comma and "please" or "now" after it: the skeptic's should on the second review
+ * of 4-E, where "Stop that, please." got past the guard).
+ */
 const STOP_ONLY =
-  /^(?:(?:ok(?:ay)?|alright|all right|no|wait|hey|oh|um|uh|please|just)\b[\s,.!]*)*(?:stop(?: (?:it|that|there|now|please|talking|speaking))?|sh+|shush|be quiet)(?: please)?$/i;
+  /^(?:(?:ok(?:ay)?|alright|all right|no|wait|hey|oh|um|uh|please|just)\b[\s,.!]*)*(?:stop(?: (?:(?:it|that)(?:,? now)?|there|now|please|talking|speaking))?|sh+|shush|be quiet)(?:,? please)?$/i;
 /**
  * The turn is only "stop" (said again, with filler or the wake word in front): stop talking, not hang up. On 15 November
  * a bare "Stop" over Driver's opener got `hold` from the backend, and the user's next words ("Start a new…") were cut off.
  */
 export const asksOnlyToStop = (said: string, wake = STANDARD_WAKE_WORD) => {
-  const sentences = said.split(/[.!?;]+/).map((s) => withoutWakeWord(s.trim(), wake).replace(/[\s,]+$/, "")).filter(Boolean);
+  const sentences = stopSentences(said, wake);
   return sentences.length > 0 && sentences.every((s) => STOP_ONLY.test(s));
 };
+const stopSentences = (said: string, wake: string) => said.split(/[.!?;]+/).map((s) => withoutWakeWord(s.trim(), wake).replace(/[\s,]+$/, "")).filter(Boolean);
+
+/**
+ * "Stop that" or "stop it", with the same filler, "now" and "please": never "stop", "stop talking", "stop there", "stop
+ * now", "shh" or "be quiet".
+ */
+const STOP_THAT = /^(?:(?:ok(?:ay)?|alright|all right|no|wait|hey|oh|um|uh|please|just)\b[\s,.!]*)*stop (?:it|that)(?:,? now)?(?:,? please)?$/i;
+/**
+ * The turn is only "stop", and says "stop that" or "stop it" ("No, stop that."): straight after a line about a send or a
+ * start set up for later, that one is what it stops (Fable's ruling on stage 4's 4-E review; the session decides when).
+ * Any other "stop" only cuts Driver off.
+ */
+export const asksToStopThat = (said: string, wake = STANDARD_WAKE_WORD) =>
+  asksOnlyToStop(said, wake) && stopSentences(said, wake).some((s) => STOP_THAT.test(s));
 
 /** A greeting, or asking whether Driver's there: "Hello", "Hi there", "Are you there", "Can you hear me". */
 const HELLO = String.raw`(?:(?:hello|hallo|hullo|hi|hiya|hey|howdy|good (?:morning|afternoon|evening))(?: there| again)?|(?:(?:are|is) )?(?:you|anyone|anybody|someone|somebody) (?:still )?(?:there|here|with me|listening|on the line)|(?:can|could|do) you (?:still )?hear me(?: now)?|testing)`;

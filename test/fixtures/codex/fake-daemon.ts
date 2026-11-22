@@ -9,7 +9,9 @@ import { join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { WebSocketServer, type WebSocket } from "ws";
 
-export type FakeItem = { type: string; id: string; text?: string; clientId?: string | null; content?: any[]; phase?: string | null; startedAtMs?: number };
+export type FakeItem = { type: string; id: string; text?: string; clientId?: string | null; content?: any[]; phase?: string | null; startedAtMs?: number;
+  /** A `commandExecution`'s, or a `fileChange`'s status, as Codex gives them in the full view. */
+  command?: string; exitCode?: number | null; status?: string; aggregatedOutput?: string | null; changes?: any[] };
 export type FakeTurn = { id: string; status: "completed" | "interrupted" | "failed" | "inProgress"; items: FakeItem[]; startedAt: number | null; completedAt: number | null };
 export type FakeThread = {
   id: string; name: string | null; preview: string; cwd: string; updatedAt: number; createdAt: number; ephemeral: boolean;
@@ -220,7 +222,10 @@ export class FakeCodex {
       case "thread/turns/list": {
         const t = this.get(p.threadId);
         if (!t.turns.length) this.fail(`thread ${t.id} is not materialized yet`);
-        return { data: (p.sortDirection === "asc" ? [...t.turns] : [...t.turns].reverse()).slice(0, p.limit ?? 25), nextCursor: null };
+        // "summary" (the default) has only a turn's messages, as Codex's own description says ("only a display summary");
+        // "full" has every item, commands and file changes too (stage 3.10).
+        const turns = (p.sortDirection === "asc" ? [...t.turns] : [...t.turns].reverse()).slice(0, p.limit ?? 25);
+        return { data: (p.itemsView ?? "summary") === "full" ? turns : turns.map((x) => ({ ...x, items: x.items.filter((i) => i.type === "userMessage" || i.type === "agentMessage") })), nextCursor: null };
       }
       case "thread/resume": {
         const t = this.get(p.threadId);

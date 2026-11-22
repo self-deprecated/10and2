@@ -8,7 +8,7 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { addMachine, machines, readBrainEnv, removeMachine, writeBrainEnv } from "../src/brain.ts";
 import { BRAIN, launchAgent, systemdUnit } from "../src/service.ts";
-import { assertPrivate, removeDir, WINDOWS } from "./fixtures/platform.ts";
+import { assertPrivate, NODE, removeDir, WINDOWS } from "./fixtures/platform.ts";
 
 const main = fileURLToPath(new URL("../src/main.ts", import.meta.url));
 const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -43,7 +43,7 @@ function home(dir: string): NodeJS.ProcessEnv {
 
 function cli(args: string[], env: NodeJS.ProcessEnv): Promise<{ status: number | null; out: string }> {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [main, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(NODE, [main, ...args], { env, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     child.stdout.on("data", (d) => { out += d; });
     child.stderr.on("data", (d) => { out += d; });

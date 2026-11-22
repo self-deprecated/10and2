@@ -2,8 +2,9 @@
 // kept, so the phone can fetch each one's audio, a restart loses nothing, and reading it again costs nothing.
 import { createHash } from "node:crypto";
 import type { AnalyticsSink } from "./analytics.ts";
-import type { PastReply, WorkItem } from "./adapter.ts";
+import type { DocSummary, PastReply, WorkItem } from "./adapter.ts";
 import type { ReadDeps } from "./reads.ts";
+import type { Store } from "./store.ts";
 import { headTail, isNew } from "./briefing.ts";
 import { isReadingOff, type Speech } from "./voice/speech.ts";
 import { describe, limiter, mapLimit, redactWhole } from "./util.ts";
@@ -13,8 +14,10 @@ import { describe, limiter, mapLimit, redactWhole } from "./util.ts";
  * of a thread the user has been away from starts with what they asked. `announce`: it starts with whose reply it is,
  * for one of several read in a row.
  */
+/** How linked documents are handled with readings: offer (closing line), read right after the reply, or off. */
+export type DocumentsReading = "offer" | "after" | "off";
 /** `fast`: the rewrite goes through Fast mode (the user's choice); it changes how soon a reading is ready, not what it says. */
-export type ReadingStyle = { skipCode: boolean; adapted?: boolean; leadIn?: "none" | "prompt"; announce?: boolean; fast?: boolean };
+export type ReadingStyle = { skipCode: boolean; adapted?: boolean; leadIn?: "none" | "prompt"; announce?: boolean; fast?: boolean; documents?: DocumentsReading };
 /**
  * Rewrites a reply, already made speakable and with credentials masked, for listening; or (`prompt`) condenses the
  * user's message that started it into a sentence or two.
@@ -30,7 +33,11 @@ export type ReadingDeps = ReadDeps & { rewrite?: Rewriter; rewriteChunkChars?: n
  * lead-in, what the user asked, is paragraph -1; the title, whose reply it is, paragraph -2. In a briefing
  * (briefing-reading.ts) each thread's part is a paragraph, and its segments carry the thread's id (`itemId`).
  */
-export type Segment = { text: string; paragraph: number; lead?: true; title?: true; itemId?: string };
+export type Segment = {
+  text: string; paragraph: number; lead?: true; title?: true; itemId?: string;
+  /** Its number in the briefing's reading, for its audio, once that's split into one reading per thread (`briefingPieces`). */
+  number?: number;
+};
 export type Reading = {
   id: string;
   itemId: string;
@@ -45,8 +52,26 @@ export type Reading = {
   latest: boolean;
   /** The replies it reads, oldest first, when it's several in a row; its last is `messageId`. */
   messageIds?: string[];
+  /** One thread's part of a briefing (`briefingPieces`): never marked read, quoted, or told to a conversation as a reply heard. */
+  briefing?: true;
+  /** Prose documents linked by this reply (when the connector opted in). */
+  docs?: DocSummary[];
+  /** Present when this reading is of a linked document rather than a reply. */
+  doc?: { id: string; name: string };
   segments: Segment[];
 };
+
+/** Prefix on `messageId` for a linked-document reading (so existing phones pass it straight back to `/api/readings`). */
+export const DOC_MESSAGE_PREFIX = "doc:";
+export const docMessageId = (docId: string) => `${DOC_MESSAGE_PREFIX}${docId}`;
+export const docIdOf = (messageId: string): string | null =>
+  messageId.startsWith(DOC_MESSAGE_PREFIX) && messageId.length > DOC_MESSAGE_PREFIX.length ? messageId.slice(DOC_MESSAGE_PREFIX.length) : null;
+
+/** Short closing line appended to a reply reading when it has a primary linked doc and `documents` is `"offer"`. */
+export function docOfferLine(doc: Pick<DocSummary, "name" | "minutes">): string {
+  const mins = doc.minutes === 1 ? "about a minute" : `about ${doc.minutes} minutes`;
+  return `It also wrote ${doc.name}, ${mins}. Ask to hear it.`;
+}
 
 /** About 25 s of speech: short enough that the first one is ready quickly, long enough to sound continuous. */
 const SEGMENT_MAX = 400;
@@ -142,8 +167,11 @@ export function masked(text: string): string {
  */
 const rewriting = limiter(8);
 const PARTS_AT_ONCE = 4;
-/** Readings being made, so asking for one twice at once makes it once. */
-const making = new Map<string, Promise<Segment[] | null>>();
+/**
+ * Readings being made, so asking for one twice at once makes it once: per store, since a reading's id is only its
+ * thread, reply and style, and two accounts (two demo objects in one isolate) can share those but never a reading.
+ */
+const making = new WeakMap<Store, Map<string, Promise<Segment[] | null>>>();
 
 /**
  * A reading's id, by thread, reply (or several in a row, as their range: `rangeOf`) and style; one without a lead-in or
@@ -271,9 +299,14 @@ export function chunksOf(text: string, size: number): string[] {
  * parts at once (a whole one took Luna 10 s and more); each part is checked on its own, and one whose rewrite fails or
  * doesn't hold up is read as written while the others are kept. `parts`: how many were sent to be rewritten.
  */
+/**
+ * A reply as written, for speech: `speakable`, with credentials masked before anything leaves the brain, a paragraph at a
+ * time (redact reads 16 KB at most).
+ */
+export const asWritten = (text: string, style: ReadingStyle) => speakable(text, style).split("\n\n").map(masked).join("\n\n");
+
 async function spoken(deps: ReadingDeps, text: string, style: ReadingStyle, itemId: string): Promise<{ text: string; parts: number; fallbacks: number }> {
-  // Credentials are masked before anything leaves the brain, a paragraph at a time (redact reads 16 KB at most).
-  const written = speakable(text, style).split("\n\n").map(masked).join("\n\n");
+  const written = asWritten(text, style);
   if (!style.adapted || !deps.rewrite || written.length < REWRITE_MIN) return { text: written, parts: 0, fallbacks: 0 };
   const size = deps.rewriteChunkChars ?? REWRITE_CHUNK;
   const parts = size > 0 ? chunksOf(written, size) : [written];
@@ -396,10 +429,13 @@ export async function prepare(deps: ReadingDeps, ids: string[] | null, asked: Re
       const intro = several.length > 1 ? introFor(several, all!, readAt, visitedAt) : null;
       const { style, prompt } = await withLead(deps, card.itemId, asked, live, async () =>
         (all ?? (await deps.adapter.replies?.(card.itemId)))?.find((r) => r.messageId === parts[0].messageId)?.prompt);
-      const id = readingId(card.itemId, keyOf(parts, intro), style);
-      const segments = await segmentsOf(deps, id, { itemId: card.itemId, parts, intro, name: card.handle, group: card.group }, style, prompt);
+      const docs = rep.docs?.length ? rep.docs : undefined;
+      const primary = docs?.find((d) => d.offer === "primary");
+      const offer = primary && style.documents !== "off" && style.documents !== "after" ? docOfferLine(primary) : null;
+      const id = readingId(card.itemId, keyOf(parts, intro, offer), style);
+      const segments = await segmentsOf(deps, id, { itemId: card.itemId, parts, intro, name: card.handle, group: card.group, offer }, style, prompt);
       if (!segments) return;
-      out[i] = { id, itemId: card.itemId, name: card.handle, group: card.group, messageId: reply.messageId, finishedAt: reply.at, latest: true, ...idsOf(parts), segments };
+      out[i] = { id, itemId: card.itemId, name: card.handle, group: card.group, messageId: reply.messageId, finishedAt: reply.at, latest: true, ...idsOf(parts), ...(docs ? { docs } : {}), segments };
     } catch (e) {
       deps.log(`reading: couldn't read ${card.itemId} (${describe(e)})`);
     }
@@ -416,9 +452,12 @@ type Part = Pick<PastReply, "messageId" | "text" | "byAgent">;
  * The replies a reading is of, oldest first (one, but for several read in a row), their thread, and the thread's name and
  * project for its title.
  */
-type Source = { itemId: string; parts: Part[]; intro: string | null; name: string; group: string };
+type Source = { itemId: string; parts: Part[]; intro: string | null; name: string; group: string; offer?: string | null };
 /** What a reading's id is made from: its reply, or its range and what it starts with (which can change as they're heard). */
-const keyOf = (parts: Part[], intro: string | null) => (parts.length > 1 ? `${rangeOf(parts)} ${intro ?? ""}` : parts[0].messageId);
+const keyOf = (parts: Part[], intro: string | null, offer: string | null = null) => {
+  const base = parts.length > 1 ? `${rangeOf(parts)} ${intro ?? ""}` : parts[0].messageId;
+  return offer ? `${base} offer:${offer}` : base;
+};
 
 /**
  * A reading's segments: kept ones, or made from the reply (and `prompt`, its lead-in) and kept. Asked for again while
@@ -427,10 +466,13 @@ const keyOf = (parts: Part[], intro: string | null) => (parts.length > 1 ? `${ra
 function segmentsOf(deps: ReadingDeps, id: string, src: Source, style: ReadingStyle, prompt: string | null): Promise<Segment[] | null> {
   const kept = deps.store.readingSegments(id);
   if (kept) return Promise.resolve(kept);
-  let made = making.get(id);
+  let mine = making.get(deps.store);
+  if (!mine) making.set(deps.store, (mine = new Map()));
+  let made = mine.get(id);
   if (!made) {
-    made = makeSegments(deps, id, src, style, prompt).finally(() => making.delete(id));
-    making.set(id, made);
+    const own = mine;
+    made = makeSegments(deps, id, src, style, prompt).finally(() => own.delete(id));
+    own.set(id, made);
   }
   return made;
 }
@@ -448,6 +490,10 @@ async function makeSegments(deps: ReadingDeps, id: string, src: Source, style: R
   const segments = togetherSegments(spokenParts.map((b) => b.text), src.parts, src.intro);
   const body = { text: spokenParts.map((b) => b.text).join("\n\n"), parts: spokenParts.reduce((n, b) => n + b.parts, 0), fallbacks: spokenParts.reduce((n, b) => n + b.fallbacks, 0) };
   if (!segments.length) return null;
+  if (src.offer) {
+    const nextPara = (segments.at(-1)?.paragraph ?? -1) + 1;
+    segments.push({ text: src.offer, paragraph: nextPara });
+  }
   if (lead) segments.unshift({ text: lead, paragraph: -1, lead: true });
   if (style.announce) segments.unshift({ text: titleOf(src.name, src.group), paragraph: -2, title: true });
   // Kept by its range, so what was read can be told to the voice model afterwards, every reply of it.
@@ -518,11 +564,47 @@ const shownWhole = (text: string) => (text.length > SHOWN_MAX ? `${text.slice(0,
 const firstSentence = (text: string) => headTail(segment(text, 1000)[0]?.text ?? "", 200);
 
 /**
+ * One of a thread's linked prose documents, prepared as a standalone reading keyed on its content hash (so edits
+ * invalidate cached segments). Finishing it never marks the thread's reply read (`latest: false`).
+ */
+export async function prepareDocument(deps: ReadingDeps, itemId: string, docId: string, asked: ReadingStyle): Promise<Reading | null> {
+  const doc = await deps.adapter.readDocument?.(itemId, docId).catch(() => null);
+  if (!doc || !doc.text.trim()) return null;
+  const item = deps.briefing.allItems().find((i) => i.id === itemId);
+  const handle = deps.briefing.names().get(itemId) ?? item?.title ?? "that thread";
+  const group = item?.group ?? "";
+  const style: ReadingStyle = { ...asked, leadIn: "none" };
+  const id = readingId(itemId, `doc:${doc.id}:${doc.contentHash}`, style);
+  const segments = await segmentsOf(deps, id, {
+    itemId,
+    parts: [{ messageId: docMessageId(doc.id), text: doc.text }],
+    intro: null,
+    name: `${handle}, ${doc.name}`,
+    group,
+  }, style, null);
+  if (!segments) return null;
+  // Store under `doc:<docId>` (the stable doc key) while the reading id itself is content-hash keyed.
+  return {
+    id,
+    itemId,
+    messageId: docMessageId(doc.id),
+    finishedAt: item?.updatedAt ?? new Date().toISOString(),
+    latest: false,
+    name: `${handle} · ${doc.name}`,
+    group,
+    doc: { id: doc.id, name: doc.name },
+    segments,
+  };
+}
+
+/**
  * One of a thread's replies, any of them (an earlier one when asked for by voice or from the phone), or several in a row
- * (`messageId` a range, `rangeOf`: `read_aloud` of the new or the last few), as a reading. A range's reading is of its
- * newest reply, which hearing it marks read.
+ * (`messageId` a range, `rangeOf`: `read_aloud` of the new or the last few), as a reading. A `doc:<docId>` message id
+ * reads that linked document instead (`prepareDocument`). A range's reading is of its newest reply, which hearing it marks read.
  */
 export async function prepareReply(deps: ReadingDeps, itemId: string, messageId: string, asked: ReadingStyle): Promise<Reading | null> {
+  const docId = docIdOf(messageId);
+  if (docId) return prepareDocument(deps, itemId, docId, asked);
   const replies = await deps.adapter.replies?.(itemId) ?? [];
   const parts = inRange(replies, messageId);
   if (!parts.length) return null;
@@ -533,11 +615,16 @@ export async function prepareReply(deps: ReadingDeps, itemId: string, messageId:
   const live = parts.length > 1 ? (await deps.adapter.list().catch(() => null))?.find((i) => i.id === itemId) : null;
   const intro = introFor(parts, replies, deps.store.reads().get(itemId), (live ?? item)?.visitedAt);
   const { style, prompt } = await withLead(deps, itemId, asked, undefined, async () => parts[0].prompt);
-  const id = readingId(itemId, keyOf(parts, intro), style);
-  const segments = await segmentsOf(deps, id, { itemId, parts, intro, name, group }, style, prompt);
+  const isLatest = replies[0].messageId === reply.messageId;
+  const repDocs = isLatest ? (await deps.adapter.report(itemId).catch(() => null))?.docs : undefined;
+  const docs = repDocs?.length ? repDocs : undefined;
+  const primary = docs?.find((d) => d.offer === "primary");
+  const offer = primary && style.documents !== "off" && style.documents !== "after" ? docOfferLine(primary) : null;
+  const id = readingId(itemId, keyOf(parts, intro, offer), style);
+  const segments = await segmentsOf(deps, id, { itemId, parts, intro, name, group, offer }, style, prompt);
   if (!segments) return null;
   // Latest by the live list, not the briefing, which may not have caught up with a reply just in.
-  return { id, itemId, messageId: reply.messageId, finishedAt: reply.at, latest: replies[0].messageId === reply.messageId, ...idsOf(parts), name, group, segments };
+  return { id, itemId, messageId: reply.messageId, finishedAt: reply.at, latest: isLatest, ...idsOf(parts), ...(docs ? { docs } : {}), name, group, segments };
 }
 
 /**

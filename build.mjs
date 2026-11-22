@@ -23,6 +23,8 @@ const common = {
 };
 rmSync(dist, { recursive: true, force: true });
 await build({ ...common, entryPoints: [join(here, "src", "main.ts")], outfile: join(dist, "10and2.js") });
+// `10and2 hook` alone (bin/10and2.js): Claude Code starts it for every Bash call once a computer has commands that wait.
+await build({ ...common, entryPoints: [join(here, "src", "hook.ts")], outfile: join(dist, "hook.js") });
 // A bundled module is never the program Node started (and flags.ts's command line isn't wanted here).
 await build({ ...common, entryPoints: [join(brain, "src", "main.ts")], outfile: join(dist, "brain", "main.js"), define: { "import.meta.main": "false" } });
 // Each file the brain reads beside its code (`new URL("…", import.meta.url)`), put where the bundle looks for it: the
@@ -41,4 +43,4 @@ for (const [, path] of readFileSync(bundle, "utf8").matchAll(/new URL\("([^"]+)"
 }
 // Which build it is, read from its root (../revision).
 writeFileSync(join(dist, "revision"), `10and2-${version}`);
-console.log(`build: dist/10and2.js and dist/brain/main.js (10and2 ${version})`);
+console.log(`build: dist/10and2.js, dist/hook.js and dist/brain/main.js (10and2 ${version})`);

@@ -8,7 +8,7 @@ import { PiAdapter, sessionFolder } from "../../../src/pi/adapter.ts";
 import type { Options } from "../../../src/pi/adapter.ts";
 import { MARKER } from "../../../src/pi/extension.ts";
 import type { Policy } from "../../../src/policy.ts";
-import { nodeCommand, removeDir, SLOW, WINDOWS } from "../platform.ts";
+import { nodeBin, nodeCommand, removeDir, SLOW, WINDOWS } from "../platform.ts";
 
 export const fakePi = resolve(import.meta.dirname, "pi.mjs");
 export const runner = resolve(import.meta.dirname, "turn.ts");
@@ -35,7 +35,7 @@ export function harness(t: TestContext, opts: Opts = {}) {
   const logs: string[] = [], clock = { now: Date.now() };
   const policy: Policy = { brain: "wss://brain.invalid/connector", projects: [cwd], actions: ["follow_up", "settle", "snooze", "archive", "start_work"], maxRuntimeMode: "full-access", claude: false, t3: false, codex: false, opencode: false, pi: true, steer: true, answer: true, limits: {}, worktreeBase: "HEAD", ...opts.policy };
   // A headless turn starts two Nodes (the runner, then the fake Pi), several times slower on Windows.
-  const options = { agentDir: agent, policy, db: join(root, "pi.db"), stateDir: join(root, "state"), piCommand: nodeCommand(fakePi), entryScript: runner, readCacheMs: 0,
+  const options = { agentDir: agent, policy, db: join(root, "pi.db"), stateDir: join(root, "state"), piCommand: nodeCommand(fakePi), nodeBin, entryScript: runner, readCacheMs: 0,
     now: () => clock.now, log: (s: string) => logs.push(s), acceptanceTimeoutMs: opts.acceptanceTimeoutMs ?? 3000 * SLOW, days: opts.days };
   const adapter = new PiAdapter(options);
   const all = [adapter];

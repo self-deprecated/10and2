@@ -6,6 +6,7 @@ import type { WorkItem } from "./adapter.ts";
 import type { BriefingView } from "./briefing.ts";
 import { KEPT, spokenDate } from "./proposals.ts";
 import type { Proposal, Store } from "./store.ts";
+import { toldHandle } from "./waits.ts";
 
 export const DRIVE_GAP_MS = 30 * 60_000;
 export const CARRY_ON_MS = 90 * 60_000;
@@ -57,8 +58,11 @@ function drivesChanges(store: Store, drive: Drive): Proposal[] {
     .sort((a, b) => a.createdAt - b.createdAt);
 }
 
-/** What a drive did, from the ledger: `names` says threads as they're named now; one not named any more is left out. */
-export function summarize(store: Store, drive: Drive, names: Map<string, string>): DriveSummary {
+/**
+ * What a drive did, from the ledger: `names` says threads as they're named now; one not named any more is left out.
+ * `told`: for the voice, each wait as it's told (`toldHandle`: "2 threads the user follows"), not as the phone shows it.
+ */
+export function summarize(store: Store, drive: Drive, names: Map<string, string>, told = false): DriveSummary {
   const changes = drivesChanges(store, drive).map((p) => p.result!);
   const heardIds = new Set([...store.heardBetween(drive.conversations, drive.start, drive.end + 60_000), ...store.readsBetween(drive.start, drive.end + 60_000)]);
   const waits = store.waits().filter((w) => drive.conversations.includes(w.conversationId) && !w.ready);
@@ -68,7 +72,7 @@ export function summarize(store: Store, drive: Drive, names: Map<string, string>
     changes,
     heard: [...heardIds].map((id) => names.get(id)).filter((n): n is string => !!n),
     notes: store.notesBetween(drive.start, drive.end + 60_000),
-    waiting: waits.map((w) => w.handle),
+    waiting: waits.map((w) => (told ? toldHandle(w) : w.handle)),
   };
 }
 
@@ -84,7 +88,7 @@ export function historyLine(p: Proposal): string {
   const what = p.action === "follow_up" ? `reply to ${names}`
     : p.action === "start_work" ? (p.fields.title ? `new thread “${p.fields.title}” in ${p.fields.place ?? "a project"}` : `new thread in ${p.fields.place ?? "a project"}`)
     : p.action === "settle_subagents" ? `${p.targets.length} finished subagent threads`
-    : p.action === "snooze" && p.fields.until ? `${names} until ${spokenDate(new Date(p.fields.until), p.createdAt).text}`
+    : p.action === "snooze" && p.fields.until ? `${names} until ${spokenDate(new Date(p.fields.until), p.createdAt, p.fields.tz).text}`
     : names;
   const done = DONE_AS[p.action] ?? "done";
   const outcome = p.state === "executed" ? done
@@ -159,7 +163,7 @@ export function driveBlock(store: Store, conversationId: string, now: number, me
   const last = all.at(-1);
   if (!last || last.end < memoryStart) return null;
   if (continues(last, conversationId, now)) {
-    const s = summarize(store, last, live.names);
+    const s = summarize(store, last, live.names, true);
     const done = drivesChanges(store, last).map((p) => datedLine(store, p));
     const text = summaryText(s, done.length ? [`Changes: ${done.join("; ")}.`] : []);
     return text

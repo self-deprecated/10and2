@@ -5,6 +5,21 @@ import { renameSync, rmSync } from "node:fs";
 export const describe = (e: unknown): string => e instanceof Error ? e.message : String(e);
 
 /**
+ * A report's `choices` (docs/launch/engine.md, stage 2): the labels of the one question asked, exactly as listed, when
+ * it lists two or more; null for several questions at once (one tap can't answer them all) or one with no options.
+ */
+export const choicesOf = (questions: { options: string[] }[]): string[] | null =>
+  questions.length === 1 && questions[0]!.options.length >= 2 ? [...questions[0]!.options] : null;
+
+/** An answer to a question its thread no longer asks (a tap after it was answered, or asked again since): nothing goes. */
+export const ANSWERED = "Already answered, so nothing was sent.";
+
+/** Words that let a plan go ahead as it is: a short yes, with nothing asking for a change. */
+export const goAhead = (words: string) => words.trim().length <= 60
+  && /^(yes|yeah|yep|yup|sure|ok|okay|go|go ahead|do it|approve|approved|proceed|sounds good|looks good|ship it|that works|go for it|let's go|start)\b/i.test(words.trim())
+  && !/\b(but|except|change|instead|first|wait|don't|not)\b/i.test(words);
+
+/**
  * A model's name as compared for "one per name": without case, spaces or punctuation, as the brain compares and says
  * them (brain/src/thread-models.ts), so "GPT-6.1 Sol" and "GPT-6.1-Sol" are one.
  */

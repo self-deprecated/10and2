@@ -2,23 +2,34 @@
 // demo so every one starts alike. Real GPT-Live, real readings; nothing it does reaches the user's own threads, memory
 // or history. What it shares with the real brain is passed in: the OpenAI-facing pieces (speech, rewrites), billing
 // safety (its own `Hangups`, on a store that outlives demos), and where recordings and the phone's logs go.
+//
+// It has an engine of its own (stage 5, the review's finding: Apple's reviewer is always in demo mode): a watch on a
+// demo thread is made, shown, changed and stopped as on the real brain (`/api/rules`), and a call-back asked for in a
+// demo call outlives the End. Both call the account's phone, as the account's brain has it (`Ringer.mirror`), through
+// the host's push key (`ringSend`, `noteSend`); without one (Lattice, an anonymous demo) nothing rings, as there.
 import type { BriefingView, Classifier, OpenerWriter } from "../briefing.ts";
+import { Engine, questionReader } from "../engine.ts";
 import type { Llm } from "../llm.ts";
+import type { NoteSend } from "../reach.ts";
+import { Ringer, type RingSend } from "../ring.ts";
 import type { ServerDeps } from "../server.ts";
 import { Store } from "../store.ts";
 import { realClock, type Clock } from "../util.ts";
-import { wire } from "../world.ts";
+import { wake, wire } from "../world.ts";
 import { DemoAdapter, type Writer } from "./adapter.ts";
 import { DEMO_MACHINE, OPENER, THREADS, type DemoCard } from "./workspace.ts";
 
 /** What every demo world shares with the brain it runs in. */
-export type DemoShared = Omit<ServerDeps, "adapter" | "briefing" | "proposals" | "store" | "waits" | "conversations" | "refresh" | "flags"> & {
+export type DemoShared = Omit<ServerDeps, "adapter" | "briefing" | "proposals" | "store" | "waits" | "conversations" | "refresh" | "flags" | "ringer" | "engine" | "boards"> & {
   /** Where flags said in a demo ("debug this") are written: apart from the real ones, which agents review. */
   flags?: (store: Store) => ServerDeps["flags"];
   write?: Writer;
   clock?: Clock;
   /** Each demo's empty store: in memory on Lattice; the cloud's demo object passes its own SQLite, emptied. */
   newStore?: () => Store;
+  /** The host's push key, as a VoIP push and an alert push to the account's phone: without them nothing rings or notifies. */
+  ringSend?: RingSend;
+  noteSend?: NoteSend;
 };
 
 const list = (xs: string[]) => (xs.length <= 1 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs.at(-1)}`);
@@ -50,24 +61,32 @@ export function demoClassifier(adapter: DemoAdapter): Classifier {
 }
 
 /** A fresh demo, briefed and ready to talk about. `close` stops its runs. */
-export async function demoWorld(shared: DemoShared): Promise<ServerDeps & { close(): Promise<void> }> {
+export async function demoWorld(shared: DemoShared): Promise<ServerDeps & { ringer: Ringer; engine: Engine; close(): Promise<void> }> {
   const log = (m: string) => shared.log(`demo: ${m.replace(/^demo: /, "")}`);
   const adapter = new DemoAdapter({ clock: shared.clock ?? realClock, write: shared.write, log });
   const store = shared.newStore?.() ?? new Store(":memory:");
   // Each thread's purpose as the workspace wrote it: demo worlds use no model for them.
   for (const t of THREADS) store.savePurpose(t.id, t.purpose, t.about);
-  const { briefing, conversations, proposals, waits } = wire({ adapter, store, classify: demoClassifier(adapter), writeOpener: demoOpener(), profiles: shared.profiles ?? [], log, track: shared.analytics?.track });
-  adapter.watch((ids, urgent) => briefing.onChange(ids, urgent));
+  const track = shared.analytics?.track;
+  const { briefing, conversations, proposals, waits } = wire({ adapter, store, classify: demoClassifier(adapter), writeOpener: demoOpener(), profiles: shared.profiles ?? [], log, track });
+  // The account's phone (`Ringer.mirror`, from the host) and the demo's own engine, on Long Haul's limits (the review
+  // account's), as main.ts and the cloud wire the real brain's.
+  const ringer = new Ringer({ waits, store, send: shared.ringSend, log, track, clock: shared.clock });
+  const engine = new Engine({ adapter, store, waits, ringer, notify: shared.noteSend, name: (i) => briefing.names().get(i.id) ?? i.title, read: questionReader(briefing, adapter, store), log, track, clock: shared.clock });
+  // A demo thread's reply ends a demo call-back's wait as a machine's report would, and wakes the engine.
+  wake(adapter, briefing, waits, engine);
   await briefing.refresh();
-  const { flags, write: _, clock: __, newStore: ___, ...rest } = shared;
+  const { flags, write: _, clock: __, newStore: ___, ringSend: ____, noteSend: _____, ...rest } = shared;
   return {
     ...rest,
     log,
-    adapter, store, briefing, conversations, proposals, waits,
+    adapter, store, briefing, conversations, proposals, waits, ringer, engine,
     refresh: () => briefing.refresh(),
     flags: flags?.(store),
     demo: { machine: DEMO_MACHINE },
     close: async () => {
+      engine.close();
+      ringer.close();
       waits.cancelAll();
       await adapter.close();
     },

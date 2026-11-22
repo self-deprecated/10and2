@@ -11,9 +11,12 @@ import type { Action, ActionKind, Adapter, FirstAsk, PastReply, Place, Receipt, 
 import { allows, answers, ceilingFor, steers, visible, withinCeiling } from "../policy.ts";
 import type { Policy, RuntimeMode } from "../policy.ts";
 import { Store } from "../claude/store.ts";
+import { Tested } from "../checks.ts";
 import { t3Cwd } from "../claude/transcript.ts";
+import type { ThreadDocContext } from "../documents.ts";
 import { addWorktree, firstAsk, folderOf, gitRoot, group } from "../work.ts";
-import { dbPathFor, iso, isRunSession, messages, newUserMessages, projectRoots, questionsOf, sessions, userMessageIds, view, withDb } from "./db.ts";
+import { ANSWERED, choicesOf } from "../util.ts";
+import { childAncestors, dbPathFor, iso, isRunSession, messages, newUserMessages, projectRoots, questionsOf, runSteps, sessions, userMessageIds, view, withDb } from "./db.ts";
 import type { Asked, SessionRow, View } from "./db.ts";
 import { alive, call, CallError, defaultLiveDir, endpointKey, events, healthy, pluginEndpoints, processes } from "./live.ts";
 import type { Endpoint, Proc } from "./live.ts";
@@ -21,6 +24,7 @@ import { atMost, isRules, reach, serveCeiling, sessionRules } from "./rules.ts";
 import type { Rule } from "./rules.ts";
 import { Serve } from "./serve.ts";
 import { defaultConfigDir, openCodePluginStatus } from "./plugin.ts";
+import type { Write } from "../typed.ts";
 
 export type Options = {
   policy: Policy; db: string; stateDir: string; log: (m: string) => void;
@@ -56,7 +60,7 @@ type Live = {
   /** OpenCode terminal UIs Driver can't reach (no plugin, no --port), by folder. */
   unreachable: Proc[];
 };
-type Row = { s: SessionRow; v: View; item: WorkItem; holder: Endpoint | null; runner: Endpoint | null; pending: Pending | null; unreachable: boolean };
+type Row = { s: SessionRow; v: View; item: WorkItem; holder: Endpoint | null; runner: Endpoint | null; pending: Pending | null; unreachable: boolean; subagents: string[] };
 
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const UNKNOWN: Receipt = { ok: false, unknown: true, error: "I can't tell whether OpenCode received that. 10 & 2 won't send it again." };
@@ -79,7 +83,8 @@ export function answersFor(questions: Asked[], words: string): string[][] {
   const plain = (s: string) => ` ${s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim()} `;
   const said = plain(words);
   return questions.map((q) => {
-    const exact = q.options.find((o) => plain(o) === said);
+    // An option's own label first (a tap sends one), so "C#" isn't taken for "C++".
+    const exact = q.options.find((o) => o === words.trim()) ?? q.options.find((o) => plain(o) === said);
     if (exact) return [exact];
     const named = q.options.filter((o) => plain(o).trim() !== "" && said.includes(plain(o)));
     return q.multiple && named.length ? named : named.length === 1 ? [named[0]!] : [words];
@@ -87,6 +92,11 @@ export function answersFor(questions: Asked[], words: string): string[][] {
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const untitled = (t: string) => !t.trim() || /^New session - \d{4}-\d\d-\d\dT/.test(t);
+function subagentProgress(titles: string[]): string {
+  const labels = titles.map((t) => untitled(t) ? "" : t.trim()).filter(Boolean);
+  if (titles.length === 1) return labels[0] ? `Waiting on subagent: ${labels[0]}.` : "Waiting on a subagent.";
+  return labels.length ? `Waiting on ${titles.length} subagents: ${labels.slice(0, 3).join("; ")}.` : `Waiting on ${titles.length} subagents.`;
+}
 /**
  * Whether two folders are one. On Windows case is ignored and either slash separates: OpenCode's database, the plugin
  * and the user may each spell a folder differently there (`C:/Users/Me/proj`, `c:\users\me\proj`).
@@ -98,6 +108,8 @@ export function sameFolder(a: string | null, b: string | null, platform: NodeJS.
 
 export class OpenCodeAdapter implements Adapter {
   readonly name = "opencode";
+  /** It reads its threads' test runs (`Report.checks`, docs/launch/engine.md §11 stage 3.10). */
+  readonly readsChecks = true;
   readonly actions = ["follow_up", "settle", "snooze", "archive", "start_work", "unsnooze", "unsettle"] as const;
   readonly dbPath: string;
   readonly liveDir: string;
@@ -131,12 +143,17 @@ export class OpenCodeAdapter implements Adapter {
   private liveAt = 0;
   private scannedAt = 0;
   private writes = new Set<Promise<Receipt>>();
+  /** Sends that answered a question, which is no message at all (`sendLeftOut`). */
+  private answered = new Set<string>();
+  /** Each session's test runs across its turns (`Tested`), in this adapter's store. */
+  private readonly tested: Tested;
 
   constructor(opts: Options) {
     this.opts = opts; this.now = opts.now ?? Date.now;
     this.dbPath = dbPathFor(opts.dataDir);
     this.liveDir = opts.liveDir ?? defaultLiveDir();
     this.store = new Store(opts.db);
+    this.tested = new Tested(this.store.db);
     this.serve = new Serve({ command: opts.opencodeCommand ?? ["opencode"], stateDir: opts.stateDir, log: opts.log, permission: serveCeiling(ceilingFor(opts.policy, "opencode")) });
   }
 
@@ -237,10 +254,14 @@ export class OpenCodeAdapter implements Adapter {
     if (this.closed) return;
     const cutoff = this.now() - (this.opts.days ?? 14) * 86_400_000;
     let rows: SessionRow[];
+    let ancestors = new Map<string, { rootId: string; title: string }>();
     const views = new Map<string, View>();
     try {
       rows = withDb(this.dbPath, (db) => {
-        const found = sessions(db, cutoff, [...live.busy.keys(), ...live.pending.map((p) => p.sessionId)]);
+        const liveIds = [...new Set([...live.busy.keys(), ...live.pending.map((p) => p.sessionId)])];
+        ancestors = childAncestors(db, liveIds);
+        const rootIds = [...new Set([...liveIds, ...[...ancestors.values()].map((a) => a.rootId)])];
+        const found = sessions(db, cutoff, rootIds);
         for (const s of found) {
           const cached = this.cache.get(s.id);
           if (cached?.signature === s.signature) { views.set(s.id, cached.v); continue; }
@@ -264,6 +285,19 @@ export class OpenCodeAdapter implements Adapter {
     this.scannedAt = Date.now();
     this.dbError = null;
     this.live = live;
+    const subBusyByRoot = new Map<string, { ep: Endpoint; titles: string[] }>();
+    for (const [id, ep] of live.busy) {
+      const anc = ancestors.get(id);
+      if (!anc) continue;
+      const entry = subBusyByRoot.get(anc.rootId) ?? { ep, titles: [] };
+      entry.titles.push(anc.title);
+      subBusyByRoot.set(anc.rootId, entry);
+    }
+    const subPendingByRoot = new Map<string, Pending>();
+    for (const p of live.pending) {
+      const anc = ancestors.get(p.sessionId);
+      if (anc && !subPendingByRoot.has(anc.rootId)) subPendingByRoot.set(anc.rootId, p);
+    }
     const next = new Map<string, Row>();
     const linux = process.platform === "linux" && this.opts.scanProcesses !== false;
     for (const s of rows) {
@@ -273,19 +307,21 @@ export class OpenCodeAdapter implements Adapter {
       const overlay = this.store.overlay(s.id);
       if (overlay.archived) continue;
       const v = views.get(s.id)!;
-      const pending = live.pending.find((p) => p.sessionId === s.id) ?? null;
+      const pending = live.pending.find((p) => p.sessionId === s.id) ?? subPendingByRoot.get(s.id) ?? null;
+      const subBusy = subBusyByRoot.get(s.id) ?? null;
       const busyIn = live.busy.get(s.id) ?? null;
-      const runner = busyIn?.kind === "run" ? busyIn : null;
+      const activeIn = busyIn ?? subBusy?.ep ?? null;
+      const runner = activeIn?.kind === "run" ? activeIn : null;
       // The process that has it: one running it, else a terminal UI in its folder (one that ran it lately first).
       const tuis = live.endpoints.filter((e) => e.kind === "tui" && (sameFolder(e.directory, s.directory) || e.sessions[s.id]))
         .sort((a, b) => (b.sessions[s.id] ?? 0) - (a.sessions[s.id] ?? 0) || b.startedAt - a.startedAt);
-      const holder = busyIn && !runner ? busyIn : pending?.ep ?? tuis[0] ?? null;
+      const holder = activeIn && !runner ? activeIn : pending?.ep ?? tuis[0] ?? null;
       const unreachable = !holder && !runner && live.unreachable.some((p) => sameFolder(p.directory, s.directory));
       // Unfinished in the database with nothing reachable running it: running in an OpenCode Driver can't reach, or its
       // process died mid-turn (the database then says so forever). Where folders can't be told, a recent write decides.
-      const elsewhere = v.outcome === "incomplete" && !busyIn && (unreachable || (!linux && this.now() - s.updatedAt < 10 * 60_000));
+      const elsewhere = v.outcome === "incomplete" && !activeIn && (unreachable || (!linux && this.now() - s.updatedAt < 10 * 60_000));
       const waiting = !!pending || (elsewhere && !!v.asking);
-      const status: WorkItem["status"] = waiting ? "waiting" : busyIn || elsewhere ? "running" : v.outcome === "incomplete" ? "idle" : v.outcome;
+      const status: WorkItem["status"] = waiting ? "waiting" : activeIn || elsewhere ? "running" : v.outcome === "incomplete" ? "idle" : v.outcome;
       const updatedAt = new Date(s.updatedAt).toISOString();
       const newer = (at: string | null) => !!at && !!v.lastRunAt && v.lastRunAt > at;
       const item: WorkItem = {
@@ -294,10 +330,12 @@ export class OpenCodeAdapter implements Adapter {
         snoozedUntil: overlay.snoozedUntil && Date.parse(overlay.snoozedUntil) > this.now() && !waiting && !newer(overlay.snoozedAt) ? overlay.snoozedUntil : null,
         parentId: null, pendingQuestion: waiting, questionId: pending?.id ?? (waiting ? v.asking?.partId ?? null : null), lastRunAt: v.lastRunAt, wroteAt: v.wroteAt,
         createdAt: iso(s.createdAt),
+        // A tool's permission is never given from 10 & 2: it waits for the user in OpenCode.
+        ...(!waiting ? {} : { questionKind: pending?.kind === "permission" ? "approval" as const : "input" as const }),
       };
-      next.set(s.id, { s, v, item, holder, runner, pending, unreachable });
+      next.set(s.id, { s, v, item, holder, runner, pending, unreachable, subagents: subBusy?.titles ?? [] });
     }
-    for (const id of this.cache.keys()) if (!rows.some((s) => s.id === id)) this.cache.delete(id);
+    for (const id of this.cache.keys()) if (!rows.some((s) => s.id === id)) { this.cache.delete(id); this.tested.forget(id); }
     this.rows = next; this.refreshPlaces();
     const changed: string[] = []; let urgent = false;
     for (const [id, row] of next) {
@@ -370,18 +408,44 @@ export class OpenCodeAdapter implements Adapter {
   }
 
   async list(): Promise<WorkItem[]> { await this.fresh(); return [...this.rows.values()].map((r) => ({ ...r.item })); }
+  /** What a person typed in a session (db.ts `view`'s `writes`): `WorkItem.typed`. */
+  personWrites(id: string): Write[] { return this.rows.get(id)?.v.writes ?? []; }
+  /**
+   * Whether send `key` answered OpenCode's question, which is no message at all (the Ledger then drops its row, so it
+   * can't claim your same words later); asked once, after it went. A message or new work is written as the user's, which
+   * the row takes.
+   */
+  sendLeftOut(_action: Action, key: string): boolean { return this.answered.delete(key); }
   private row(id: string): Row {
     const row = this.rows.get(id);
     if (!row || !visible(this.opts.policy, row.s.directory)) throw new Error("That session isn't visible to 10 & 2.");
     return row;
+  }
+  docContext(id: string): ThreadDocContext | null {
+    const row = this.rows.get(id);
+    if (!row || !visible(this.opts.policy, row.s.directory)) return null;
+    return { agent: "opencode", cwd: row.s.directory, projectRoot: gitRoot(row.s.directory) ?? row.s.directory };
   }
   async report(id: string): Promise<Report> {
     await this.fresh();
     const r = this.row(id), p = r.pending;
     const question = p?.kind === "question" ? ask(p.questions) : p?.kind === "permission" ? `OpenCode wants to ${wants(p)}.`
       : r.item.pendingQuestion && r.v.asking ? ask(r.v.asking.questions) : null;
-    return { text: r.v.reply?.text ?? "", progress: r.item.status === "running" ? r.v.progress : null, question,
-      reply: r.v.reply ? { runId: r.v.reply.runId, messageId: r.v.reply.messageId, at: r.v.reply.at } : null };
+    // Choices only for a question a reachable OpenCode holds (answered through it): one only read from the database
+    // would take a tap as a message, and leave the question open.
+    // Stage 3.10: the checks of the turn the reply ended, and of the turn still going so far (a locked database: none this
+    // time, which the report says, `checksUnread`, never "no check ran").
+    let checks, running, unread = false;
+    try {
+      [checks, running] = withDb(this.dbPath, (db) => [r.v.reply?.runId ? this.tested.receipts(id, r.v.reply.runId, runSteps(db, id, r.v.reply.runId, this.opts.policy.checks)) : undefined,
+        r.item.status === "running" && r.v.going ? this.tested.receipts(id, r.v.going, runSteps(db, id, r.v.going, this.opts.policy.checks)) : undefined]);
+    } catch { checks = running = undefined; unread = !!r.v.reply?.runId; }
+    const progress = r.item.status === "running"
+      ? r.v.progress ?? (r.subagents.length ? subagentProgress(r.subagents) : null)
+      : null;
+    return { text: r.v.reply?.text ?? "", progress, question, choices: p?.kind === "question" ? choicesOf(p.questions) : null,
+      reply: r.v.reply ? { runId: r.v.reply.runId, messageId: r.v.reply.messageId, at: r.v.reply.at } : null,
+      ...(checks ? { checks } : unread ? { checksUnread: true as const } : {}), ...(running ? { running, ...(r.v.going ? { runningId: r.v.going } : {}), ...(r.v.wroteAt ? { runningSince: r.v.wroteAt } : {}) } : {}) };
   }
   async replies(id: string): Promise<PastReply[]> { await this.fresh(); return this.row(id).v.replies.map((r) => ({ ...r })); }
   /** Every message is read, so it's complete. */
@@ -443,6 +507,12 @@ export class OpenCodeAdapter implements Adapter {
     if (prior) return prior;
     const why = await this.check(action);
     if (why) return { ok: false, error: why };
+    // A tap answers the question it was for, as the check's scan just now sees it, or nothing: one OpenCode asks instead,
+    // or none, sends nothing, never a message in its place (Local looked before that scan).
+    if (action.kind === "follow_up" && action.questionId !== undefined) {
+      const p = this.rows.get(action.itemId)?.pending;
+      if (p?.kind !== "question" || p.id !== action.questionId) return { ok: false, error: ANSWERED };
+    }
     if (action.kind !== "follow_up" && action.kind !== "start_work") {
       const receipt = this.store.completeOverlay(key, digest, action.itemId, action.kind, new Date(this.now()).toISOString(), action.kind === "snooze" ? action.until : undefined);
       if (!receipt) return this.repeat(key, digest) ?? UNKNOWN;
@@ -510,6 +580,7 @@ export class OpenCodeAdapter implements Adapter {
 
   /** The answer to OpenCode's question, to the process asking it; whichever answers first (there, or here) wins. */
   private async answer(action: Extract<Action, { kind: "follow_up" }>, key: string, p: Extract<Pending, { kind: "question" }>): Promise<Receipt> {
+    this.answered.add(key);
     let r;
     try { r = await call(p.ep, "POST", `/question/${encodeURIComponent(p.id)}/reply`, { directory: p.directory, body: { answers: answersFor(p.questions, action.message) } }); }
     catch (e) { return this.failed(key, e); }
