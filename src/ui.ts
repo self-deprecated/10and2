@@ -1,7 +1,7 @@
 // What the person at the terminal sees: marks, colour, a spinner and prompts. Colour and motion only on a terminal
 // (and never with NO_COLOR); piped or under a service manager, it's plain lines.
 import { createInterface } from "node:readline";
-import { styleText } from "node:util";
+import { stripVTControlCharacters, styleText } from "node:util";
 
 const tty = () => Boolean(process.stdout.isTTY);
 type Style = Parameters<typeof styleText>[0];
@@ -140,7 +140,10 @@ export function listStep(s: ListState, key: ListKey): ListOutcome {
   switch (key) {
     case "up": s.at = (s.at + s.rows.length - 1) % s.rows.length; break;
     case "down": s.at = (s.at + 1) % s.rows.length; break;
-    case "space": if (row.kind === "box" && !row.disabled) row.on = !row.on; break;
+    case "space":
+      if (row.kind === "box" && !row.disabled) row.on = !row.on;
+      else if (row.kind === "choice") row.index = (row.index + 1) % row.options.length;
+      break;
     case "right":
       if (row.kind === "choice") row.index = (row.index + 1) % row.options.length;
       else if (row.open && !row.disabled && row.on) return { done: true, open: s.at };
@@ -172,6 +175,12 @@ export function drawList(title: string, s: ListState, hint: string): string[] {
   return lines;
 }
 
+/** How many terminal rows `lines` occupy when wrapped to `columns`, ignoring ANSI colour escapes. */
+export function wrappedRows(lines: string[], columns: number): number {
+  const cols = Math.max(20, columns || 80);
+  return lines.reduce((sum, l) => sum + Math.max(1, Math.ceil(stripVTControlCharacters(l).length / cols)), 0);
+}
+
 /**
  * A checklist at the terminal, redrawn in place, until Enter (or → on a row that opens). Off a terminal it returns at
  * once with the rows as given: the defaults apply.
@@ -186,9 +195,9 @@ export async function checklist(title: string, rows: Row[], hint: string, opts: 
   let drawn = 0;
   const render = () => {
     const lines = drawList(title, s, hint);
-    if (drawn) process.stdout.write(`\x1b[${drawn}A`);
-    for (const l of lines) process.stdout.write(`\r\x1b[2K${l}\n`);
-    drawn = lines.length;
+    if (drawn) process.stdout.write(`\x1b[${drawn}A\r\x1b[J`);
+    for (const l of lines) process.stdout.write(`${l}\n`);
+    drawn = wrappedRows(lines, process.stdout.columns ?? 80);
   };
   render();
   try {

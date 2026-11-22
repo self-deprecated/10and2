@@ -55,6 +55,7 @@ const usage = () => `${bold("10and2")} ${VERSION} ${dim("·")} connects this com
   ${cmd("10and2 setup")}     connect this computer (opens your browser to approve it)
   ${cmd("10and2 status")}    whether it's connected, and what 10 & 2 can see and do here
   ${cmd("10and2 agents")}    choose which coding agents to connect, and what 10 & 2 may do
+  ${cmd("10and2 features")}  turn opt-in features on or off (e.g. ${cmd("10and2 features documents on")})
   ${cmd("10and2 revoke")}    disconnect this computer
   ${cmd("10and2 uninstall")} remove everything 10and2 added to this computer
 
@@ -106,6 +107,7 @@ const CHOOSING = ["agents", "off", "no-steer", "no-answer", "no-start", "no-foll
 const TAKES: Record<string, { words: number; flags: string[] }> = {
   setup: { words: 0, flags: ["brain", "token", "name", "worktree-base", "yes", "no-autostart", ...CHOOSING] },
   agents: { words: 0, flags: ["yes", "worktree-base", ...CHOOSING] },
+  features: { words: 2, flags: ["yes"] },
   run: { words: 0, flags: ["wait-for-credential", "fatal-exit"] },
   status: { words: 0, flags: ["verbose"] },
   revoke: { words: 0, flags: ["yes"] },
@@ -147,6 +149,7 @@ try {
   switch (wantsHelp ? "help" : command) {
     case "setup": await setup(); break;
     case "agents": await agentsCommand(); break;
+    case "features": await featuresCommand(); break;
     case "run": await runConnector(); break;
     case "status": await status(); break;
     case "revoke": await revoke(); break;
@@ -230,7 +233,7 @@ async function setup() {
   if (had) {
     say(`This computer is already connected to ${account(origin, had.secret)}.\n`);
     await status();
-    say(`\n${cmd("10and2 revoke")} disconnects it, if you want to connect it again.`);
+    say(`\n${cmd("10and2 agents")} changes agents and permissions; ${cmd("10and2 features")} toggles opt-in features; ${cmd("10and2 revoke")} disconnects it.`);
     return;
   }
 
@@ -417,6 +420,46 @@ async function agentsCommand() {
   say();
   for (const line of summary(choice, found)) say(`  ${line}`);
   if (next.documents && next.documents !== "off") say(`  Linked documents: ${DOCUMENTS_LABEL[next.documents as DocumentAccess]}.`);
+  const service = new Service();
+  if (service.supported && (await service.state()).running) { await service.restart(); ok("The connector restarted with it"); }
+  else note(dim(`It applies when the connector next starts (${cmd("10and2 run")}, or ${cmd("10and2 autostart on")}).`));
+}
+
+/**
+ * `10and2 features [list | <feature> [on|off|<mode>]]`: inspect or toggle opt-in connector features without re-running
+ * full setup, so users can be given a one-line command (e.g. `10and2 features documents on`) as new features ship.
+ */
+async function featuresCommand() {
+  const raw = readPolicyFile();
+  if (!raw) throw new Error(`This computer isn't set up yet: ${cmd("10and2 setup")} connects it.`);
+  const policy = parsePolicy(JSON.stringify(raw));
+  const [, feat, val] = positional;
+  const showList = () => {
+    const mode = policy.documents ?? "off";
+    say("Features");
+    note(`${"documents".padEnd(12)} ${mode === "off" ? dim("off") : `on (${DOCUMENTS_LABEL[mode]})`}  Read prose docs linked by agent replies (plans, design docs)`);
+    say(`\n  Enable with ${cmd("10and2 features documents on")} ${dim("(or project / all / off)")}.`);
+  };
+  if (feat === "list") { showList(); return; }
+  if (feat !== undefined && feat !== "documents") {
+    throw new Error(`Unknown feature "${feat}". Available features: documents.`);
+  }
+  let nextMode: DocumentAccess;
+  if (val !== undefined) {
+    if (val === "on") nextMode = "all";
+    else if (DOCUMENT_MODES.includes(val as DocumentAccess)) nextMode = val as DocumentAccess;
+    else throw new Error(`${cmd("10and2 features documents")} takes on, off, project or all.`);
+  } else if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    showList();
+    return;
+  } else {
+    const current: DocumentAccess | null = DOCUMENT_MODES.includes(raw.documents) ? raw.documents : null;
+    nextMode = await chooseDocuments(current);
+  }
+  const next = withDocuments(raw, nextMode);
+  parsePolicy(JSON.stringify(next));
+  writePrivate(defaultPolicyPath(), JSON.stringify(next, null, 2) + "\n");
+  ok(`Linked documents: ${DOCUMENTS_LABEL[nextMode]} ${dim(`· saved ${defaultPolicyPath()}`)}`);
   const service = new Service();
   if (service.supported && (await service.state()).running) { await service.restart(); ok("The connector restarted with it"); }
   else note(dim(`It applies when the connector next starts (${cmd("10and2 run")}, or ${cmd("10and2 autostart on")}).`));

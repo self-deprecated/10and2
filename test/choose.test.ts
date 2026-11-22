@@ -8,7 +8,7 @@ import { stripVTControlCharacters } from "node:util";
 import { applyChoice, applyFlags, capsFor, choiceOf, chooseDocuments, defaultChoice, DOCS_WORDS, policyFields, startingChoice, summary, type Choice } from "../src/choose.ts";
 import { describeFound, detect, type Found } from "../src/agents.ts";
 import { allows, answers, ceilingFor, parsePolicy, steers } from "../src/policy.ts";
-import { drawList, listStep, marks, type ListState } from "../src/ui.ts";
+import { drawList, listStep, marks, wrappedRows, type ListState } from "../src/ui.ts";
 import { NODE, removeDir, SLOW, WINDOWS } from "./fixtures/platform.ts";
 
 const found = (installed: Partial<Record<Found["agent"], boolean>>): Found[] =>
@@ -129,8 +129,13 @@ test("the checklist moves, switches, opens an agent and cycles a choice", () => 
   listStep(s, "down");
   listStep(s, "right");
   assert.equal((s.rows[2] as { index: number }).index, 0);
+  listStep(s, "space");
+  assert.equal((s.rows[2] as { index: number }).index, 1, "space cycles choice rows too");
+  listStep(s, "left");
+  assert.equal((s.rows[2] as { index: number }).index, 0);
   listStep(s, "left");
   assert.equal((s.rows[2] as { index: number }).index, 2);
+  assert.equal(wrappedRows(["short", "a".repeat(85), "\x1b[32mgreen\x1b[0m"], 40), 1 + 3 + 1);
   listStep(s, "down");
   assert.equal(s.at, 0, "moving wraps");
   assert.deepEqual(listStep(s, "enter"), { done: true });
@@ -282,12 +287,15 @@ test("linked documents screen explains the feature with an example and maps the 
         };
       },
     });
-  // First time (null): both start ticked with the pitch, example and privacy note.
+  // First time (null): both start ticked with the pitch, example and privacy note printed cleanly above the list.
   assert.equal(await run(null, null), "all");
-  assert.match(seenTitle, /plan\.md/);
-  assert.match(seenTitle, /Read the plan/);
-  assert.match(seenHint, /redacted/i);
-  assert.ok(said.some((s) => s.includes(DOCS_WORDS.heading)));
+  assert.equal(seenTitle, DOCS_WORDS.prompt);
+  assert.match(seenHint, /space switch/);
+  const prose = said.join("\n");
+  assert.ok(prose.includes(DOCS_WORDS.heading));
+  assert.match(prose, /plan\.md/);
+  assert.match(prose, /Read the plan/);
+  assert.match(prose, /redacted/i);
   // Respects saved state when unchanged.
   assert.equal(await run("off", null), "off");
   assert.equal(await run("project", null), "project");

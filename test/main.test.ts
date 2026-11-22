@@ -223,6 +223,19 @@ test("status says what this computer may do for later, and lists what it holds, 
   assert.equal(JSON.parse(readFileSync(join(config, "connector.json"), "utf8")).documents, "project");
   const after = spawnSync(process.execPath, [main, "status"], { env, encoding: "utf8", timeout: 10_000 * SLOW });
   assert.match(after.stdout, /Documents +project folders\n/);
+
+  const featOn = spawnSync(process.execPath, [main, "features", "documents", "on"], { env, encoding: "utf8", timeout: 10_000 * SLOW });
+  assert.equal(featOn.status, 0, featOn.stderr);
+  assert.equal(JSON.parse(readFileSync(join(config, "connector.json"), "utf8")).documents, "all");
+  const featList = spawnSync(process.execPath, [main, "features", "list"], { env, encoding: "utf8", timeout: 10_000 * SLOW });
+  assert.equal(featList.status, 0, featList.stderr);
+  assert.match(featList.stdout, /documents +on \(project and plan folders\)/);
+  const featOff = spawnSync(process.execPath, [main, "features", "documents", "off"], { env, encoding: "utf8", timeout: 10_000 * SLOW });
+  assert.equal(featOff.status, 0, featOff.stderr);
+  assert.equal(JSON.parse(readFileSync(join(config, "connector.json"), "utf8")).documents, "off");
+  const badFeat = spawnSync(process.execPath, [main, "features", "nope", "on"], { env, encoding: "utf8", timeout: 10_000 * SLOW });
+  assert.notEqual(badFeat.status, 0);
+  assert.match(badFeat.stderr, /Unknown feature "nope"/);
 });
 
 /** A computer of the test's own: nothing of this one's agents, settings or login services is read or changed. */

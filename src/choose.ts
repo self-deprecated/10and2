@@ -336,19 +336,22 @@ export async function chooseWaiting(current: readonly string[] | null, agents: R
   }
 }
 
-/** The words the Linked documents screen shows in `10and2 setup` and `10and2 agents`. */
+/** The words the Linked documents screen shows in `10and2 setup`, `10and2 agents`, and `10and2 features`. */
 export const DOCS_WORDS = {
   heading: "Linked documents",
-  intro: 'Coding agents often finish with "I wrote the plan to plan.md" or link a design doc. Turn this on so 10 & 2 can offer to read those docs aloud and answer questions about them while you drive — e.g. "Read the plan" or "What does the rollout section say?".',
+  intro: 'Coding agents often finish with "I wrote the plan to plan.md" or link a design doc.',
+  pitch: 'Turn this on so 10 & 2 can offer to read those docs aloud and answer questions while you drive — e.g. "Read the plan" or "What does the rollout section say?".',
   privacy: "Only markdown and text files linked by a reply are read, redacted before leaving this computer; code and .env files are never sent.",
-  project: { label: "Read linked documents in your projects", detail: "markdown & text files inside visible projects and worktrees" },
-  plans: { label: "Include coding apps' plan folders", detail: "e.g. ~/.claude/plans, T3 artifacts, Copilot session plans (needs the first on)" },
+  prompt: "Choose what 10 & 2 may read",
+  project: { label: "Read linked documents", detail: "markdown & text files inside visible projects and worktrees" },
+  plans: { label: "Include plan folders", detail: "~/.claude/plans, T3 artifacts, Copilot session plans" },
 } as const;
 
 /**
- * The Linked documents screen, at a terminal (`10and2 setup` and `10and2 agents`): explains the feature with an
- * example and offers two toggles. `current` null (never chosen yet): both start ticked so pressing Enter opts in,
- * while unticking the first turns it off (`"off"`). Headless / `--yes` never runs this and stays `"off"`.
+ * The Linked documents screen, at a terminal (`10and2 setup`, `10and2 agents`, `10and2 features`): prints the
+ * explanation, spoken example and privacy note once above the checklist, then offers two toggles. `current` null
+ * (never chosen yet): both start ticked so pressing Enter opts in, while unticking the first turns it off (`"off"`).
+ * Headless / `--yes` never runs this and stays `"off"`.
  */
 export async function chooseDocuments(
   current: DocumentAccess | null,
@@ -359,7 +362,10 @@ export async function chooseDocuments(
     { kind: "box", label: DOCS_WORDS.plans.label, detail: DOCS_WORDS.plans.detail, on: current === null ? true : current === "all" },
   ];
   io.say(`\n  ${DOCS_WORDS.heading}`);
-  const got = await io.checklist(DOCS_WORDS.intro, rows, `space switch · enter continue · q quit · ${DOCS_WORDS.privacy}`);
+  io.say(`  ${DOCS_WORDS.intro}`);
+  io.say(`  ${DOCS_WORDS.pitch}`);
+  io.say(`  ${DOCS_WORDS.privacy}\n`);
+  const got = await io.checklist(DOCS_WORDS.prompt, rows, "space switch · enter continue · q quit");
   const project = got.rows[0]!.kind === "box" && got.rows[0]!.on;
   const plans = got.rows[1]!.kind === "box" && got.rows[1]!.on;
   return !project ? "off" : plans ? "all" : "project";

@@ -1,7 +1,7 @@
 {
   "name": "10and2",
   "type": "module",
-  "version": "0.13.2",
+  "version": "0.13.3",
   "description": "The connector for 10 & 2: lets you talk to the coding agents on your computer (Claude Code, Codex, Copilot CLI, Gemini CLI, Cursor, OpenCode, Pi, T3 Code) from the 10 & 2 iPhone app.",
   "keywords": [
     "10and2",
